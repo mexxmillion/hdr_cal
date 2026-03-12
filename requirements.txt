@@ -1,29 +1,32 @@
-# hdri_cal — HDRI calibration pipeline for VFX / IBL compositing
-# Python 3.9+
-#
-# Core (required)
+# ── Core ──────────────────────────────────────────────────────────────────────
 numpy>=1.24
-opencv-python>=4.8
-imageio>=2.31
-scipy>=1.11
+opencv-python>=4.7
+imageio>=2.28          # EXR read/write — requires OpenEXR system library (see below)
+scipy>=1.10
 
-# EXR I/O (required for .exr input/output)
-# Try pyexr first; if it fails to build, OpenEXR is the fallback
-pyexr>=0.4.0
-# OpenEXR>=3.1.0   # fallback if pyexr unavailable
-
-# ColorChecker detection (required for --colorchecker / --colorchecker-in-hdri)
-colour-science>=0.4.3
+# ── ColorChecker detection ────────────────────────────────────────────────────
 colour-checker-detection>=0.1.5
+colour-science>=0.4.3  # pulled in by colour-checker-detection, listed for clarity
 
-# ── Windows notes ──────────────────────────────────────────────────────────────
-# If pyexr fails to install on Windows, try:
-#   pip install openexr-python
-# or install via conda:
-#   conda install -c conda-forge openexr
+# ── YOLOv8 inference (optional but recommended for better swatch extraction) ──
+ultralytics>=8.0       # downloads model (~88 MB) automatically on first run
+click>=8.0             # required by colour-checker-detection CLI internals
 
-# ── Conda environment (recommended) ───────────────────────────────────────────
-# conda create -n hdri_cal python=3.11
-# conda activate hdri_cal
-# conda install -c conda-forge numpy opencv scipy imageio openexr
-# pip install pyexr colour-science colour-checker-detection
+# ── GUI (optional — only needed for hdri_cal_gui.py) ─────────────────────────
+PySide6>=6.5
+
+# ── OpenEXR system dependency (NOT a pip package) ────────────────────────────
+# imageio uses OpenEXR under the hood.  Install the system library first:
+#
+#   Windows : pip install openexr-python   (or install OpenEXR via vcpkg)
+#             OR use: pip install imageio[openexr]
+#
+#   macOS   : brew install openexr
+#             pip install openexr
+#
+#   Linux   : sudo apt install libopenexr-dev
+#             pip install openexr
+#
+# Alternatively imageio can use OpenCV as an EXR backend automatically
+# if opencv-python is installed (which it is above) — no extra steps needed
+# on most platforms.
