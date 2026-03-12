@@ -525,12 +525,7 @@ def robust_stat(values, stat="median"):
     return float(np.mean(values) if stat == "mean" else np.median(values))
 
 def meter_image(env_linear, mode="bottom_dome", stat="median",
-                swatch_xy=None, swatch_size=5,
-                dominant_dir=None):
-    """
-    dominant_dir: (3,) unit vector — required for mode='dominant_dir'.
-                  Typically hot["center_dir"] from extract_hot_lobe_key.
-    """
+                swatch_xy=None, swatch_size=5):
     h, w = env_linear.shape[:2]
     dirs, dOmega = latlong_dirs(h, w)
     lum = luminance(env_linear)
@@ -550,44 +545,12 @@ def meter_image(env_linear, mode="bottom_dome", stat="median",
             np.sum(lum * mask * dOmega) / (np.sum(mask * dOmega) + 1e-8))
 
     elif mode == "upper_hemi_irradiance":
-        # Cosine-weighted irradiance integral over the upper hemisphere.
-        # E = Σ L(ω) · cos(θ) · dΩ  where cos(θ) = dirs[...,1] (y-up)
-        # Scale so E = meter_target (default 1.0).
         cos_theta = np.clip(dirs[..., 1], 0.0, None)
-        weights   = cos_theta * dOmega
-        E_upper   = float(np.sum(lum * weights))
+        E_upper   = float(np.sum(lum * cos_theta * dOmega))
         out["meter_value"] = E_upper
         out["pixel_count"] = int((cos_theta > 0).sum())
         out["E_upper"]     = E_upper
         log(f"Upper-hemi irradiance E = {E_upper:.6f}")
-
-    elif mode == "dominant_dir_irradiance":
-        # Cosine-weighted irradiance integral over the hemisphere facing the
-        # dominant light direction D (sun centroid from hot lobe).
-        # E = Σ L(ω) · max(dot(ω, D), 0) · dΩ
-        # This is the irradiance on a flat surface pointing directly at the sun.
-        # Scale so E = meter_target (default 1.0).
-        if dominant_dir is None:
-            raise ValueError(
-                "dominant_dir_irradiance requires dominant_dir — "
-                "run extract_hot_lobe_key first and pass hot['center_dir']")
-        D = np.asarray(dominant_dir, dtype=np.float32)
-        D = D / (np.linalg.norm(D) + 1e-8)
-        # dot product of every pixel direction with D
-        cos_to_sun = np.clip(
-            (dirs * D[None, None, :]).sum(axis=-1), 0.0, None)   # (H,W)
-        weights    = cos_to_sun * dOmega
-        E_dominant = float(np.sum(lum * weights))
-        theta_d = float(np.degrees(np.arccos(np.clip(D[1], -1, 1))))
-        phi_d   = float(np.degrees(np.arctan2(D[0], D[2])))
-        out["meter_value"]   = E_dominant
-        out["pixel_count"]   = int((cos_to_sun > 0).sum())
-        out["E_dominant"]    = E_dominant
-        out["dominant_dir"]  = D.tolist()
-        out["dominant_theta_deg"] = theta_d
-        out["dominant_phi_deg"]   = phi_d
-        log(f"Dominant-dir irradiance: D=(θ={theta_d:.1f}°, φ={phi_d:.1f}°)  "
-            f"E = {E_dominant:.6f}")
 
     elif mode == "swatch":
         if swatch_xy is None:
@@ -843,67 +806,6 @@ def render_gray_ball_vectorized(env_linear, albedo=0.18, res=96, chunk=512,
     out[~mask] = 0.0
     return out, mask
 
-def sphere_metrics(sphere_img, mask):
-    lum  = luminance(sphere_img)
-    vals = lum[mask]
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return {"mean": 0.0, "median": 0.0, "p95": 0.0, "max": 0.0}
-    return {
-        "mean":   float(np.mean(vals)),
-        "median": float(np.median(vals)),
-        "p95":    float(np.percentile(vals, 95)),
-        "max":    float(np.max(vals)),
-    }
-
-def gray_ball_from_split(env_linear, lobe_mask, albedo=0.18, res=96,
-                         lobe_neutralise_strength=1.0):
-    """
-    Render full, base, and lobe sphere contributions separately.
-
-    The lobe env is neutralised before rendering so that the gain solve
-    works on the same colour content that will actually be boosted —
-    avoiding a situation where the solve targets a red lobe but the
-    application uses a neutralised (white) lobe.
-    """
-    sphere_full, mask = render_gray_ball_vectorized(env_linear, albedo, res)
-    base_env = env_linear * (1.0 - lobe_mask[..., None])
-    lobe_env = env_linear *        lobe_mask[..., None]
-
-    # Neutralise the lobe before rendering for the gain solve
-    lobe_env_neutral = neutralise_lobe(lobe_env, lobe_mask,
-                                       strength=lobe_neutralise_strength)
-
-    sphere_base, _ = render_gray_ball_vectorized(base_env, albedo, res)
-    sphere_lobe, _ = render_gray_ball_vectorized(lobe_env_neutral, albedo, res)
-    return sphere_full, sphere_base, sphere_lobe, mask
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Sun gain solve — per-channel energy conservation
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The fundamental invariant:
-#   A correctly calibrated HDR, when used to light an 18% grey Lambertian
-#   sphere, should produce a sphere whose mean RGB equals albedo × 0.18 on
-#   every channel independently.
-#
-# The pipeline:
-#   1. Render sphere from WB'd base (no hot lobe) → sphere_base_mean (3,)
-#   2. Render sphere from lobe at gain=1            → sphere_lobe_mean (3,)
-#   3. Per-channel gain = (target_c - base_mean_c) / lobe_mean_c
-#      where target_c = albedo × meter_target  (default 0.18 × 1.0 = 0.18)
-#      This is the gain that, when applied to the lobe, exactly restores
-#      the missing energy on every channel independently.
-#   4. Apply per-channel gain to lobe pixels in the HDR
-#   5. Render final sphere → should be [0.18, 0.18, 0.18] mean — log this
-#
-# Scalar gain (old approach) was wrong because:
-#   - It solved on luminance only → R/G/B gain was equal
-#   - But sun colour ≠ sky colour, so a scalar boost shifts the highlight
-#     colour balance, introducing a colour cast in the final renders
-
-MAX_PHYSICAL_SUN_GAIN = 2000.0   # module default — overridden at runtime by args
 
 def apply_gain_ceiling(raw_gain, ceiling, rolloff_start):
     """
@@ -932,161 +834,6 @@ def apply_gain_ceiling(raw_gain, ceiling, rolloff_start):
     t = (raw_gain - rolloff_start) / (ceiling - rolloff_start + 1e-8)
     t = min(t, 1.0)
     return float(rolloff_start + (ceiling - rolloff_start) * math.sqrt(t))
-
-def solve_sun_gain_per_channel(sphere_base, sphere_lobe, mask,
-                               target_mean=0.18, albedo=0.18,
-                               env_linear=None, lobe_mask_2d=None,
-                               solve_dir=None, use_pi_target=False,
-                               e_target_rgb=None,
-                               gain_ceiling=None, gain_rolloff=None):
-    """
-    Solve per-channel gain to restore clipped/compressed sun energy.
-
-    PRIMARY METHOD (when env_linear + lobe_mask_2d provided):
-      Works directly in irradiance space on the EXR — no sphere render needed.
-      For each channel c:
-        E_base_c  = Σ env_base[c] · cos+ · dΩ   (cosine integral toward solve_dir)
-        E_lobe_c  = Σ env_lobe[c] · cos+ · dΩ   (same, lobe only, at gain=1)
-        E_target  = π  (when use_pi_target=True, for dominant_dir mode)
-                  = target_mean × 4 / albedo     (otherwise, for upper_hemi mode)
-        gain_c    = (E_target - E_base_c) / E_lobe_c
-
-      solve_dir: (3,) unit vector — direction to integrate toward.
-        None → upper hemisphere (y>0, cosine = dirs[...,1])
-        vec  → hemisphere facing vec (cosine = max(dot(dir, vec), 0))
-
-      use_pi_target: bool — when True, sets E_target = π for every channel.
-        Used for dominant_dir mode where the physical assumption is that the
-        sun, after white balance, delivers neutral irradiance = π to a receiver
-        facing it.  This breaks the circular dependency where E_target was
-        derived from E_dom of the existing image.
-
-    FALLBACK (sphere render path, for backward compat):
-      Uses sphere_base / sphere_lobe means — only reliable when the lobe
-      covers many sphere pixels (diffuse sky, not a sharp sun disc).
-
-    Returns per-channel gains (3,) and diagnostics.
-    """
-    if gain_ceiling is None: gain_ceiling = MAX_PHYSICAL_SUN_GAIN
-    if gain_rolloff is None: gain_rolloff = gain_ceiling * 0.25
-    use_irradiance = (env_linear is not None and lobe_mask_2d is not None)
-
-    if use_irradiance:
-        h, w = env_linear.shape[:2]
-        dirs, dOmega = latlong_dirs(h, w)
-
-        if solve_dir is not None:
-            D = np.asarray(solve_dir, dtype=np.float32)
-            D = D / (np.linalg.norm(D) + 1e-8)
-            cos_w = np.clip((dirs * D[None, None, :]).sum(axis=-1), 0.0, None)
-            elev = float(np.degrees(np.arccos(np.clip(D[1], -1, 1))))
-            mode_str = f"dominant_dir θ={elev:.1f}°"
-        else:
-            cos_w = np.clip(dirs[..., 1], 0.0, None)   # upper hemi
-            mode_str = "upper_hemi"
-
-        weights = (cos_w * dOmega)[..., None]           # (H,W,1)
-
-        base_env = env_linear * (1.0 - lobe_mask_2d[..., None])
-        lobe_env = env_linear *        lobe_mask_2d[..., None]
-
-        E_base = (base_env * weights).sum(axis=(0, 1))  # (3,)
-        E_lobe = (lobe_env * weights).sum(axis=(0, 1))  # (3,) at gain=1
-
-        if use_pi_target:
-            # Physical target: π per channel (neutral sun, dominant_dir mode).
-            E_target_rgb = np.array([math.pi, math.pi, math.pi])
-            log(f"Irradiance solve ({mode_str}, E_target=π [physical neutral-sun]):")
-        elif e_target_rgb is not None:
-            # Per-channel upper_hemi targets — each channel solved to its own
-            # measured E_upper. Correct for coloured skies: sun reconstruction
-            # fills only the missing energy per channel, preserving sky colour.
-            E_target_rgb = np.asarray(e_target_rgb, dtype=np.float64)
-            log(f"Irradiance solve ({mode_str}, per-channel E_upper):")
-        else:
-            # Scalar target: invert sphere_mean = albedo × E / 4
-            E_scalar = target_mean * 4.0 / albedo
-            E_target_rgb = np.array([E_scalar, E_scalar, E_scalar])
-            log(f"Irradiance solve ({mode_str}):")
-
-        E_target = float(np.dot(E_target_rgb, [0.2126, 0.7152, 0.0722]))  # luma for logging
-
-        log(f"  E_base  = R:{E_base[0]:.4f}  G:{E_base[1]:.4f}  B:{E_base[2]:.4f}")
-        log(f"  E_lobe  = R:{E_lobe[0]:.6f}  G:{E_lobe[1]:.6f}  B:{E_lobe[2]:.6f}")
-        if e_target_rgb is not None:
-            log(f"  E_target= R:{E_target_rgb[0]:.4f}  G:{E_target_rgb[1]:.4f}  B:{E_target_rgb[2]:.4f}  (per-channel upper_hemi)")
-        else:
-            log(f"  E_target= {E_target:.4f}  "
-                f"({'π each' if use_pi_target else f'from sphere target {target_mean:.4f}, albedo {albedo:.4f}'})")
-
-        gains = np.ones(3, dtype=np.float32)
-        for c, name in enumerate(('R', 'G', 'B')):
-            missing = float(E_target_rgb[c] - E_base[c])
-            lobe_c  = float(E_lobe[c])
-            if lobe_c < 1e-10:
-                log(f"WARNING: Lobe irradiance channel {name} near zero — no sun in mask?")
-                gains[c] = 1.0
-            elif missing <= 0:
-                log(f"  {name}: base irradiance already meets/exceeds target — gain=1.0")
-                gains[c] = 1.0
-            else:
-                g = missing / lobe_c
-                g_raw = g
-                g = apply_gain_ceiling(g, gain_ceiling, gain_rolloff)
-                if g_raw > gain_ceiling:
-                    warn(f"Sun gain channel {name}: raw gain {g_raw:.0f}× exceeds ceiling "
-                         f"{gain_ceiling:.0f}× — clamped to {g:.1f}×. "
-                         f"Input is severely clipped. Raise --sun-gain-ceiling for more reconstruction.")
-                    log(f"  {name}: missing_E={missing:.4f} lobe_E={lobe_c:.6f} → raw={g_raw:.1f}× → ceiling={g:.1f}×")
-                elif g_raw > gain_rolloff:
-                    log(f"  {name}: missing_E={missing:.4f} lobe_E={lobe_c:.6f} → raw={g_raw:.1f}× → rolloff→{g:.1f}×")
-                else:
-                    log(f"  {name}: missing_E={missing:.4f} lobe_E={lobe_c:.6f} → gain={g:.2f}×")
-                gains[c] = float(g)
-
-        diag = {
-            "method":   "irradiance",
-            "E_base":   E_base.tolist(),
-            "E_lobe":   E_lobe.tolist(),
-            "E_target": float(E_target),
-            "mode":     mode_str,
-        }
-
-    else:
-        # Fallback: sphere-render-based solve (unreliable for sharp sun discs)
-        valid_base = sphere_base[mask]
-        valid_lobe = sphere_lobe[mask]
-        base_mean  = valid_base.mean(axis=0)
-        lobe_mean  = valid_lobe.mean(axis=0)
-
-        log(f"Energy solve (sphere): base_mean={base_mean.tolist()}")
-        log(f"Energy solve (sphere): lobe_mean={lobe_mean.tolist()}")
-        log(f"Energy solve (sphere): target_mean={target_mean:.4f} per channel")
-
-        gains = np.ones(3, dtype=np.float32)
-        for c, name in enumerate(('R', 'G', 'B')):
-            missing = target_mean - float(base_mean[c])
-            lobe_c  = float(lobe_mean[c])
-            if lobe_c < 1e-8:
-                log(f"WARNING: Lobe sphere mean channel {name} near zero — no sun in mask?")
-                gains[c] = 1.0
-            elif missing <= 0:
-                gains[c] = 1.0
-            else:
-                g = missing / lobe_c
-                g_raw = g
-                g = apply_gain_ceiling(g, gain_ceiling, gain_rolloff)
-                if g_raw > gain_ceiling:
-                    warn(f"Sun gain channel {name}: raw {g_raw:.0f}× exceeds ceiling {gain_ceiling:.0f}×")
-                gains[c] = float(g)
-
-        diag = {"method": "sphere_render",
-                "base_mean": base_mean.tolist(),
-                "lobe_mean": lobe_mean.tolist()}
-
-    log(f"Per-channel gains: R={gains[0]:.3f} G={gains[1]:.3f} B={gains[2]:.3f}")
-    return gains, diag
-
 
 def neutralise_lobe(env, lobe_mask, strength=1.0):
     """
@@ -1146,118 +893,6 @@ def apply_sun_gain_per_channel(env, lobe_mask, gains,
     lobe_gained = lobe * gains[None, None, :]
     return np.clip(base + lobe_gained, 0.0, None).astype(np.float32)
 
-
-def verify_sphere_neutrality(env, albedo=0.18, target=0.18, label="final"):
-    """
-    Render a sphere from env and check if its mean RGB is neutral.
-    Logs per-channel mean and deviation from target.
-    Returns the mean RGB (3,) for the report.
-    """
-    sphere, mask = render_gray_ball_vectorized(env, albedo=albedo, res=96)
-    valid = sphere[mask]
-    if valid.shape[0] == 0:
-        warn("verify_sphere_neutrality: no valid sphere pixels")
-        return np.array([0.0, 0.0, 0.0])
-    mean_rgb = valid.mean(axis=0)
-    luma     = float(0.2126*mean_rgb[0] + 0.7152*mean_rgb[1] + 0.0722*mean_rgb[2])
-    dev_r    = (mean_rgb[0] - mean_rgb[1]) / (luma + 1e-8)
-    dev_b    = (mean_rgb[2] - mean_rgb[1]) / (luma + 1e-8)
-    log(f"Sphere verify [{label}]: mean RGB={mean_rgb.tolist()}")
-    log(f"  luma={luma:.4f}  target={target:.4f}  "
-        f"R-G={dev_r:+.4f}  B-G={dev_b:+.4f} (should be ~0)")
-    if abs(dev_r) > 0.05 or abs(dev_b) > 0.05:
-        warn(f"Sphere [{label}] is not neutral: R-G={dev_r:+.3f} B-G={dev_b:+.3f}. "
-             f"Check WB or gain solve.")
-    if abs(luma - target) / (target + 1e-8) > 0.1:
-        warn(f"Sphere [{label}] mean luma {luma:.4f} deviates >10% from "
-             f"target {target:.4f}. Check exposure metering.")
-    return mean_rgb
-
-
-# Keep old scalar solve for --sphere-solve=direct_highlight / iterative_peak_ratio
-# compatibility, but they are no longer the default path.
-def solve_sun_gain_direct(sphere_base, sphere_lobe, mask,
-                          target_highlight_mean=0.32):
-    lum_ref = luminance(sphere_base + sphere_lobe)
-    thr     = np.percentile(lum_ref[mask], 97.0)
-    hi_mask = (lum_ref >= thr) & mask
-    b = float(np.mean(luminance(sphere_base)[hi_mask]))
-    s = float(np.mean(luminance(sphere_lobe)[hi_mask]))
-    if s < 1e-8:
-        gain = 1.0
-    else:
-        gain = max(1.0, (target_highlight_mean - b) / s)
-    gain   = apply_gain_ceiling(max(1.0, gain), gain_ceiling if gain_ceiling else MAX_PHYSICAL_SUN_GAIN, gain_rolloff if gain_rolloff else MAX_PHYSICAL_SUN_GAIN*0.25)
-    sphere = sphere_base + gain * sphere_lobe
-    met    = sphere_metrics(sphere, mask)
-    log(f"Direct solve (legacy scalar): b={b:.6f} s={s:.6f} → gain={gain:.4f}")
-    return {"gain": gain, "gains_per_channel": np.array([gain,gain,gain]),
-            "sphere": sphere, "metrics": met,
-            "ratio": float(met["p95"] / max(1e-6, met["mean"]))}
-
-def solve_sun_gain_iterative(sphere_base, sphere_lobe, mask,
-                             target_peak_ratio=2.5, max_iters=20):
-    gain = 1.0
-    best = None
-    for i in range(max_iters):
-        sphere = sphere_base + gain * sphere_lobe
-        met    = sphere_metrics(sphere, mask)
-        ratio  = met["p95"] / max(1e-6, met["mean"])
-        best   = {"gain": gain, "gains_per_channel": np.array([gain,gain,gain]),
-                  "sphere": sphere.copy(), "metrics": met, "ratio": ratio}
-        log(f"Sun gain iter {i:02d}: gain={gain:.4f} p95/mean={ratio:.4f}")
-        if abs(ratio - target_peak_ratio) < 0.03:
-            break
-        gain = float(np.clip(gain * (1.6 if ratio < target_peak_ratio else 0.8),
-                             1.0, MAX_PHYSICAL_SUN_GAIN))  # iterative legacy
-    return best
-
-def solve_sphere_gain(sphere_base, sphere_lobe, mask, mode="energy_conservation",
-                      target_peak_ratio=2.5, direct_highlight_target=0.32,
-                      target_mean=0.18, albedo=0.18,
-                      env_linear=None, lobe_mask_2d=None, solve_dir=None,
-                      use_pi_target=False,
-                      e_target_rgb=None,
-                      gain_ceiling=None, gain_rolloff=None):
-    if mode == "none":
-        sphere = sphere_base + sphere_lobe
-        met    = sphere_metrics(sphere, mask)
-        log("Sphere solve disabled (gains=1.0)")
-        return {"gain": 1.0, "gains_per_channel": np.ones(3),
-                "sphere": sphere, "metrics": met,
-                "ratio": float(met["p95"] / max(1e-6, met["mean"]))}
-    if mode == "energy_conservation":
-        gains, gain_diag = solve_sun_gain_per_channel(
-            sphere_base, sphere_lobe, mask,
-            target_mean=target_mean, albedo=albedo,
-            env_linear=env_linear, lobe_mask_2d=lobe_mask_2d,
-            solve_dir=solve_dir, use_pi_target=use_pi_target,
-            e_target_rgb=e_target_rgb,
-            gain_ceiling=gain_ceiling, gain_rolloff=gain_rolloff)
-        sphere = sphere_base + sphere_lobe * gains[None, None, :]
-        met    = sphere_metrics(sphere, mask)
-        return {"gain": float(gains.mean()), "gains_per_channel": gains,
-                "sphere": sphere, "metrics": met,
-                "ratio": float(met["p95"] / max(1e-6, met["mean"])),
-                "gain_diag": gain_diag}
-    if mode == "direct_highlight":
-        return solve_sun_gain_direct(sphere_base, sphere_lobe, mask,
-                                     direct_highlight_target)
-    if mode == "iterative_peak_ratio":
-        return solve_sun_gain_iterative(sphere_base, sphere_lobe, mask,
-                                        target_peak_ratio)
-    raise ValueError(f"Unknown sphere solve mode: {mode}")
-
-def apply_sun_gain(env_scaled, lobe_mask, gain):
-    """Legacy scalar apply — kept for compatibility with old solve modes."""
-    base = env_scaled * (1.0 - lobe_mask[..., None])
-    sun  = env_scaled *        lobe_mask[..., None]
-    return np.clip(base + sun * gain, 0.0, None).astype(np.float32)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HDRI orientation check
-# ══════════════════════════════════════════════════════════════════════════════
 
 def validate_hdri_orientation(env_linear):
     dirs, dOmega = latlong_dirs(*env_linear.shape[:2])
@@ -1606,16 +1241,14 @@ def main():
 
     # ── Metering ──────────────────────────────────────────────────────────
     ap.add_argument("--metering-mode", default="bottom_dome",
-                    choices=["whole_scene", "bottom_dome", "swatch",
-                             "upper_hemi_irradiance", "dominant_dir_irradiance"],
-                    help="Exposure metering mode (no-chart path only). "
+                    choices=["whole_scene", "bottom_dome", "swatch", "upper_hemi_irradiance"],
+                    help="Exposure metering mode (used when --exposure-source metering). "
                          "'bottom_dome': median luma of lower hemisphere (default). "
                          "'whole_scene': median of all pixels. "
                          "'swatch': sample a specific pixel (requires --swatch). "
                          "'upper_hemi_irradiance': cosine-weighted integral of upper "
                          "hemisphere onto a flat upward surface. Set --meter-target 1.0 "
                          "for a normalised IBL. Good for overcast/diffuse skies. "
-                         "'dominant_dir_irradiance': cosine-weighted integral onto a "
                          "surface facing the dominant light (sun). Finds the hot-lobe "
                          "direction first, then integrates the hemisphere around it. "
                          "Set --meter-target 1.0 for normalised direct illumination. "
@@ -1688,20 +1321,6 @@ def main():
                          "0.8 = allow a hint of warmth. 0.0 = no neutralisation. "
                          "Physical basis: after white balance the sun should be "
                          "near-neutral; remaining colour is clipping artefact.")
-    ap.add_argument("--solve-target", default="auto",
-                    choices=["auto", "patch22", "upper_hemi", "dominant_dir"],
-                    help="How to compute the target for the sun gain solve. "
-                         "'auto' (default): upper_hemi always, except patch22 when chart found "
-                         "and sun is high (≥45°). "
-                         "'patch22': absolute from chart (chart must be clean, sun high). "
-                         "'upper_hemi': E from sky hemisphere — matches grey ball on ground. "
-                         "  sphere target = albedo × E_upper / 4. "
-                         "  Good for diffuse/overcast normalisation. "
-                         "'dominant_dir': integrate hemisphere facing the sun, "
-                         "  sphere target = albedo × E_dominant / 4. "
-                         "  Good for sunny-day normalisation. "
-                         "These only affect the highlight reconstruction target — "
-                         "WB and exposure are always unchanged.")
     ap.add_argument("--direct-highlight-target", type=float, default=0.32,
                     help="Target bright-side mean for direct_highlight solve")
     ap.add_argument("--target-peak-ratio", type=float, default=2.5,
@@ -1792,7 +1411,7 @@ def _run_validate_only(args, img, meta):
         warnings.append(
             f"Upper-hemi chroma imbalance {chroma_imbal:.3f} > 0.12 "
             f"— coloured illuminant (golden hour / overcast coloured sky). "
-            f"Use --solve-target dominant_dir for energy reconstruction.")
+            f"")
     if chroma_imbal > 0.05:
         warnings.append(
             f"Upper-hemi chroma imbalance {chroma_imbal:.3f} > 0.05 "
@@ -2661,21 +2280,10 @@ def _run_pipeline(args):
     else:
         # ── Metering fallback (dome / irradiance modes) ───────────────────
         log(f"Exposure from metering (--exposure-source {exp_src!r} → metering mode {args.metering_mode!r}):")
-        _dominant_dir = None
-        if args.metering_mode == "dominant_dir_irradiance":
-            log("Dominant-dir metering: pre-extracting hot lobe to find sun direction ...")
-            _hot_pre = extract_hot_lobe_key(wb_img,
-                                            threshold=args.sun_threshold,
-                                            upper_only=args.sun_upper_only,
-                                            blur_px=0)
-            _dominant_dir = _hot_pre["center_dir"]
-            log(f"  Sun direction: θ={_hot_pre['theta_deg']:.1f}°  "
-                f"φ={_hot_pre['phi_deg']:.1f}°")
         meter_info = meter_image(wb_img, mode=args.metering_mode,
                                  stat=args.meter_stat,
                                  swatch_xy=meter_swatch_xy,
-                                 swatch_size=args.swatch_size,
-                                 dominant_dir=_dominant_dir)
+                                 swatch_size=args.swatch_size)
         exposure_scale = solve_exposure_scale(meter_info, args.meter_target)
         exposed = wb_img * exposure_scale
     save_png_preview(os.path.join(args.debug_dir, "02_exposed_preview.png"), exposed)
@@ -2716,97 +2324,9 @@ def _run_pipeline(args):
     # ── 7. Split render + sun gain solve ──────────────────────────────────
     # Determine sphere solve target — what mean value should a Lambertian
     # sphere render to after the hot-lobe energy is reconstructed.
-    # This is controlled by --solve-target and is independent of WB/exposure.
 
-    solve_target_mode = args.solve_target
-
-    # ── Sun elevation check ───────────────────────────────────────────────
-    # θ in extract_hot_lobe_key is the polar angle from the Y axis (up).
-    # Elevation = 90° - θ  (θ=90° = horizon, θ=0° = zenith)
     sun_elevation_deg = 90.0 - hot["theta_deg"]
-    log(f"Sun elevation: {sun_elevation_deg:.1f}° "
-        f"({'high' if sun_elevation_deg >= 45 else 'low — near horizon'})")
-
-    if solve_target_mode == "auto":
-        # ── Auto selection logic ──────────────────────────────────────────
-        #
-        # Default is always upper_hemi — this matches a grey ball sitting on
-        # the ground, which is the most common on-set reference.
-        #
-        # Chart WB and energy solve are independent:
-        #   - WB:     chart corrects colour cast (always, when chart found)
-        #   - Energy: upper_hemi measures what a flat upward receiver sees
-        #
-        # The only exception is high-sun + chart: patch22 gives absolute
-        # photometric ground truth and is more accurate than measuring E_upper.
-        #
-        # dominant_dir is NOT auto-selected — it is an explicit override for
-        # cases where the sun is the metering reference (card held facing sun).
-        # Use --solve-target dominant_dir to activate.
-        #
-        if wb_from_chart and sun_elevation_deg >= 45.0:
-            log("Auto solve-target: chart found, sun high → patch22 (absolute photometric).")
-            solve_target_mode = "patch22"
-        else:
-            solve_target_mode = "upper_hemi"
-            if wb_from_chart:
-                log(f"Auto solve-target: chart found, sun low ({sun_elevation_deg:.1f}°) → upper_hemi. "
-                    f"Chart corrects WB; energy normalised to sky hemisphere. "
-                    f"Use --solve-target dominant_dir to calibrate toward sun direction instead.")
-            else:
-                log(f"Auto solve-target: no chart, sun {sun_elevation_deg:.1f}° → upper_hemi. "
-                    f"Use --solve-target dominant_dir to calibrate toward sun direction instead.")
-
-    if solve_target_mode == "patch22":
-        # Patch 22 was scaled to read args.albedo in `exposed`.
-        # Physical ground truth: a Lambertian receiver in neutral uniform light
-        # receives E = π (integral of cos over hemisphere × L=1).
-        # Sphere mean: albedo × E / 4 = albedo × π / 4
-        sphere_target = args.albedo * math.pi / 4.0
-        log(f"Solve target (patch22): albedo × π/4 = {sphere_target:.5f}")
-
-    elif solve_target_mode == "upper_hemi":
-        # Measure per-channel E_upper from the exposed image.
-        # The irradiance solve uses E_upper_per_channel as the target for each
-        # channel independently, so a blue-heavy or red-heavy sky is handled
-        # correctly — the sun lobe reconstruction fills the missing energy in
-        # whichever channels are deficient, preserving the sky colour while
-        # correctly reconstructing the sun's contribution.
-        _dirs_s, _dOmega_s = latlong_dirs(exposed.shape[0], exposed.shape[1])
-        cos_up  = np.clip(_dirs_s[..., 1], 0.0, None)
-        _weights_up = (cos_up * _dOmega_s)[..., None]
-        E_upper_rgb = np.array([float(np.sum(exposed[..., c] * cos_up * _dOmega_s))
-                                 for c in range(3)])
-        E_upper     = float(np.sum(luminance(exposed) * cos_up * _dOmega_s))
-        sphere_target = args.albedo * E_upper / 4.0
-        log(f"Solve target (upper_hemi): E_upper luma={E_upper:.5f}  "
-            f"R={E_upper_rgb[0]:.5f}  G={E_upper_rgb[1]:.5f}  B={E_upper_rgb[2]:.5f}  "
-            f"→ sphere_target (luma) = {sphere_target:.5f}")
-
-    elif solve_target_mode == "dominant_dir":
-        # Physical target: π.
-        #
-        # Rationale: after white balance the sun is (by definition) neutral.
-        # A Lambertian receiver facing a neutral hemisphere of unit radiance
-        # receives E = π. This is the correct reconstruction target regardless
-        # of what the existing coloured sky delivers.
-        #
-        # The per-channel irradiance solve then handles the colour difference:
-        #   gain_c = (π - E_dom_base_c) / E_dom_lobe_c
-        # If the base sky has excess blue (red sky → blue WB boost → base looks
-        # blue), the solve gives gain_B < gain_R, correcting the colour balance
-        # while also filling in the missing sun energy.
-        #
-        # Note: the sphere_target here feeds the old sphere-render verify path.
-        # The actual irradiance solve ignores sphere_target and uses π directly.
-        sphere_target = args.albedo * math.pi / 4.0
-        D = hot["center_dir"].astype(np.float32)
-        log(f"Solve target (dominant_dir): θ={hot['theta_deg']:.1f}° "
-            f"φ={hot['phi_deg']:.1f}°  E_target=π (physical neutral-sun assumption)")
-
-    else:  # meter_target (explicit user override)
-        sphere_target = args.meter_target
-        log(f"Solve target (meter_target): {sphere_target:.5f}")
+    log(f"Sun elevation: {sun_elevation_deg:.1f}°")
 
     # ── Save calibrated base dome EXR (WB applied, sun lobe zeroed) ─────
     # Lets you verify chart patch reads ~0.18 and colours are correct
@@ -3143,8 +2663,7 @@ def _run_pipeline(args):
     log(f"")
     log(f"  Sun direction : θ={hot['theta_deg']:.1f}°  elevation={90-hot['theta_deg']:.1f}°  "
         f"φ={hot['phi_deg']:.1f}°")
-    log(f"  Solve mode    : {solve_target_mode}  "
-        f"({'E_target=π' if solve_target_mode == 'dominant_dir' else 'E_target derived from image'})")
+
     log(f"")
     log(f"  ── Incident irradiance (light meter readings) ──────────────────")
     log(f"  {'Direction':<18}  {'E (luma)':<10}  {'R':<8}  {'G':<8}  {'B':<8}  "
@@ -3218,12 +2737,8 @@ def _run_pipeline(args):
 
     # ── Rendered sphere (actual ray integration, ground truth) ────────────
     log(f"  ── Rendered sphere (ray integration) ────────────────────────────")
-    _rend_sphere, _, _, _ = gray_ball_from_split(
-        corrected, hot["mask"], albedo=a, res=args.sphere_res,
-        lobe_neutralise_strength=0.0)
-    _rend_mask  = luminance(_rend_sphere) > 1e-6
-    _rend_rgb   = np.array([float(np.mean(_rend_sphere[..., c][_rend_mask]))
-                             for c in range(3)])
+    _rend_sphere, _rend_mask = render_gray_ball_vectorized(corrected, albedo=a, res=args.sphere_res)
+    _rend_rgb   = np.array([float(np.mean(_rend_sphere[..., c][_rend_mask])) for c in range(3)])
     rendered_sphere_mean = float(np.mean(_rend_rgb))
 
     log(f"  rendered sphere RGB : R={_rend_rgb[0]:.5f}  G={_rend_rgb[1]:.5f}  "
@@ -3327,10 +2842,10 @@ def _run_pipeline(args):
         warn(f"⚠ Rendered sphere ({rendered_sphere_mean:.4f}) deviates "
              f"{energy_err:.1%} from analytical ({pred_sphere_full:.4f}). "
              f"Check lobe neutralisation or gain ceiling hit.")
-    if chroma_upper > 0.05 and solve_target_mode != "dominant_dir":
+    if chroma_upper > 0.05:
         warn(f"⚠ Upper-hemi chroma imbalance {chroma_upper:.3f} — WB may be off, "
-             f"or this is a coloured-sky scene (use --solve-target dominant_dir).")
-    if chroma_sun > 0.10 and solve_target_mode == "dominant_dir":
+             f"")
+    if chroma_sun > 0.10:
         warn(f"⚠ Sun-dir chroma imbalance {chroma_sun:.3f} after solve — "
              f"sky colour cast is large relative to sun energy. "
              f"Rendered output may have residual colour tint.")
@@ -3362,7 +2877,7 @@ def _run_pipeline(args):
         "sun_compression_estimate": compression,
         "chroma_imbalance_upper":   chroma_upper,
         "chroma_imbalance_sun":     chroma_sun,
-        "solve_target_mode":        solve_target_mode,
+        "solve_target_mode":        "card_up_neutral",
         "albedo":                   a,
     }
 

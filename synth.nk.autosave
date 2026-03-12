@@ -15,7 +15,7 @@ define_window_layout_xml {<?xml version="1.0" encoding="UTF-8"?>
                     <page id="Viewer.1"/>
                 </dock>
                 <split size="544"/>
-                <dock id="" activePageId="DAG.1" focus="true">
+                <dock id="" activePageId="DAG.1">
                     <page id="DAG.1"/>
                     <page id="Curve Editor.1"/>
                     <page id="DopeSheet.1"/>
@@ -830,14 +830,6 @@ Read {
  xpos -3124
  ypos 43
 }
-Viewer {
- frame_range 1-100
- colour_sample_bbox {0.4580078125 -0.3046875 0.466796875 -0.2978515625}
- viewerProcess "sRGB (ACES)"
- name Viewer3
- xpos -158
- ypos 166
-}
 Read {
  inputs 0
  file_type exr
@@ -845,7 +837,35 @@ Read {
  format "4096 2048 0 0 4096 2048 1 4K_LatLong"
  origset true
  name Read21
- selected true
  xpos -3008
  ypos 59
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/low_church_sphere.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read23
+ xpos -3089
+ ypos -325
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/input_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read24
+ xpos -3405
+ ypos -82
+}
+Viewer {
+ frame_range 1-100
+ colour_sample_bbox {0 0.0859375 0.00439453125 0.08837890625}
+ viewerProcess "sRGB (ACES)"
+ name Viewer3
+ selected true
+ xpos -158
+ ypos 166
 }
