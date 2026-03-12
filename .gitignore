@@ -7,3 +7,11 @@ outputs/
 __pycache__/
 .venv/
 *.exr 
+*.exr 
+*.hdr 
+*.pyc 
+__pycache__/ 
+.venv/ 
+data/ 
+out/ 
+debug_hdri/ 
