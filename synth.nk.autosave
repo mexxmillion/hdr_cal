@@ -2,29 +2,27 @@
 version 13.2 v2
 define_window_layout_xml {<?xml version="1.0" encoding="UTF-8"?>
 <layout version="1.0">
-    <window x="-1" y="-8" w="2560" h="1369" maximized="1" screen="0">
+    <window x="0" y="0" w="2557" h="1360" screen="0">
         <splitter orientation="1">
             <split size="40"/>
             <dock id="" hideTitles="1" activePageId="Toolbar.1">
                 <page id="Toolbar.1"/>
             </dock>
-            <split size="1897" stretch="1"/>
+            <split size="1894" stretch="1"/>
             <splitter orientation="2">
-                <split size="779"/>
-                <dock id="" activePageId="Viewer.3">
+                <split size="774"/>
+                <dock id="" activePageId="Viewer.1">
                     <page id="Viewer.1"/>
-                    <page id="Viewer.2"/>
-                    <page id="Viewer.3"/>
                 </dock>
-                <split size="548"/>
-                <dock id="" activePageId="DAG.1">
+                <split size="544"/>
+                <dock id="" activePageId="DAG.1" focus="true">
                     <page id="DAG.1"/>
                     <page id="Curve Editor.1"/>
                     <page id="DopeSheet.1"/>
                 </dock>
             </splitter>
             <split size="615"/>
-            <dock id="" activePageId="Properties.1" focus="true">
+            <dock id="" activePageId="Properties.1">
                 <page id="Properties.1"/>
                 <page id="uk.co.thefoundry.backgroundrenderview.1"/>
             </dock>
@@ -102,7 +100,7 @@ Clamp {
  xpos -285
  ypos 255
 }
-set N5776dfe0 [stack 0]
+set N81995d30 [stack 0]
 SphericalTransform2 {
  panTiltRollInput {0 90 0}
  projTypeOutput Rectilinear
@@ -123,31 +121,33 @@ SphericalTransform2 {
  xpos -554
  ypos 441
 }
-push $N5776dfe0
+push $N81995d30
 Merge2 {
  inputs 2
  name Merge6
  xpos -457
  ypos 441
 }
-set N5776d820 [stack 0]
+set N81b82700 [stack 0]
 Grade {
  multiply {1.475000024 1 0.5250000358 1}
  name Grade14
  xpos -438
  ypos 474
 }
-set N3a578040 [stack 0]
+set N81b80040 [stack 0]
 Write {
  file W:/git/hdr_cal/data/input_cloudy_red.exr
  file_type exr
  first_part rgba
  version 13
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write10
  xpos -438
  ypos 681
 }
-push $N3a578040
+push $N81b80040
 Grade {
  multiply {0.5749999881 1 1.424999952 1}
  name Grade15
@@ -159,6 +159,8 @@ Write {
  file_type exr
  first_part rgba
  version 14
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write11
  xpos -345
  ypos 660
@@ -217,7 +219,7 @@ Clamp {
  xpos -964
  ypos 202
 }
-set N7ba61440 [stack 0]
+set N81b82ae0 [stack 0]
 SphericalTransform2 {
  panTiltRollInput {0 90 0}
  projTypeOutput Rectilinear
@@ -245,14 +247,14 @@ SphericalTransform2 {
  xpos -1248
  ypos 365
 }
-push $N7ba61440
+push $N81b82ae0
 Merge2 {
  inputs 2
  name Merge4
  xpos -1136
  ypos 388
 }
-set N7ba61820 [stack 0]
+set N81b84dc0 [stack 0]
 Grade {
  multiply {0.7249999642 1 1.274999976 1}
  name Grade10
@@ -264,11 +266,13 @@ Write {
  file_type exr
  first_part rgba
  version 16
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write5
  xpos -1024
  ypos 683
 }
-push $N5776d820
+push $N81b82700
 Grade {
  multiply 0.2
  name Grade13
@@ -280,6 +284,8 @@ Write {
  file_type exr
  first_part rgba
  version 15
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write9
  xpos -535
  ypos 709
@@ -380,7 +386,7 @@ Clamp {
  xpos -1654
  ypos 238
 }
-set N3a38da60 [stack 0]
+set N870b6d70 [stack 0]
 SphericalTransform2 {
  panTiltRollInput {0 90 0}
  projTypeOutput Rectilinear
@@ -401,29 +407,33 @@ SphericalTransform2 {
  xpos -1923
  ypos 424
 }
-push $N3a38da60
+push $N870b6d70
 Merge2 {
  inputs 2
  name Merge2
  xpos -1826
  ypos 424
 }
-set N35d1d6c0 [stack 0]
+set N870b7910 [stack 0]
 Write {
  file W:/git/hdr_cal/data/input_low_neutral.exr
  file_type exr
  first_part rgba
  version 18
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write6
  xpos -1999
  ypos 646
 }
-push $N5776d820
+push $N81b82700
 Write {
  file W:/git/hdr_cal/data/input_cloudy_neutral.exr
  file_type exr
  first_part rgba
  version 15
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write12
  xpos -630
  ypos 663
@@ -439,7 +449,7 @@ Read {
  xpos -3294
  ypos 358
 }
-push $N35d1d6c0
+push $N870b7910
 Grade {
  multiply 0.2
  name Grade8
@@ -451,21 +461,25 @@ Write {
  file_type exr
  first_part rgba
  version 18
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write7
  xpos -1887
  ypos 690
 }
-push $N7ba61820
+push $N81b84dc0
 Write {
  file W:/git/hdr_cal/data/input_high_neutral.exr
  file_type exr
  first_part rgba
  version 16
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write8
  xpos -1304
  ypos 703
 }
-push $N7ba61820
+push $N81b84dc0
 Grade {
  multiply 0.2
  name Grade5
@@ -477,18 +491,20 @@ Write {
  file_type exr
  first_part rgba
  version 17
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write1
  xpos -1204
  ypos 708
 }
-push $N35d1d6c0
+push $N870b7910
 Grade {
  multiply {1.120000005 1 0.8799999952 1}
  name Grade4
  xpos -1807
  ypos 457
 }
-set N14b110b0 [stack 0]
+set N870bab70 [stack 0]
 Grade {
  multiply {0.5749999881 1 1.424999952 1}
  name Grade6
@@ -500,16 +516,20 @@ Write {
  file_type exr
  first_part rgba
  version 17
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write4
  xpos -1714
  ypos 684
 }
-push $N3a38da60
+push $N870b6d70
 Write {
  file W:/git/hdr_cal/data/autumn_hilly_field_4k._clamped.exr
  file_type exr
  first_part rgba
  version 18
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write13
  xpos -1559
  ypos 333
@@ -589,7 +609,7 @@ Clamp {
  xpos -2267
  ypos 248
 }
-set Nb1e1a0d0 [stack 0]
+set Na183be80 [stack 0]
 SphericalTransform2 {
  panTiltRollInput {0 90 0}
  projTypeOutput Rectilinear
@@ -610,24 +630,26 @@ SphericalTransform2 {
  xpos -2536
  ypos 434
 }
-push $Nb1e1a0d0
+push $Na183be80
 Merge2 {
  inputs 2
  name Merge8
  xpos -2439
  ypos 434
 }
-set Nb1e1b050 [stack 0]
+set Na1839f80 [stack 0]
 Write {
  file W:/git/hdr_cal/data/input_church_neutral.exr
  file_type exr
  first_part rgba
  version 20
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write14
  xpos -2612
  ypos 656
 }
-push $Nb1e1b050
+push $Na1839f80
 Grade {
  multiply 0.2
  name Grade23
@@ -639,11 +661,13 @@ Write {
  file_type exr
  first_part rgba
  version 20
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write15
  xpos -2500
  ypos 699
 }
-push $Nb1e1b050
+push $Na1839f80
 Grade {
  multiply {0.5749999881 1 1.424999952 1}
  name Grade25
@@ -655,16 +679,20 @@ Write {
  file_type exr
  first_part rgba
  version 19
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write16
  xpos -2327
  ypos 694
 }
-push $Nb1e1a0d0
+push $Na183be80
 Write {
  file W:/git/hdr_cal/data/autumn_hilly_field_4k._clamped.exr
  file_type exr
  first_part rgba
  version 18
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write17
  xpos -2175
  ypos 432
@@ -692,17 +720,19 @@ Read {
  xpos -3174
  ypos 358
 }
-push $N14b110b0
+push $N870bab70
 Write {
  file W:/git/hdr_cal/data/input_low_red.exr
  file_type exr
  first_part rgba
  version 17
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write2
  xpos -1807
  ypos 664
 }
-push $N7ba61820
+push $N81b84dc0
 Grade {
  multiply {1.245000124 0.960000217 0.7950001359 1}
  name Grade7
@@ -714,6 +744,8 @@ Write {
  file_type exr
  first_part rgba
  version 15
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write3
  xpos -1117
  ypos 697
@@ -759,7 +791,7 @@ Read {
  xpos -2824
  ypos 475
 }
-push $Nb1e1b050
+push $Na1839f80
 Grade {
  multiply {1.120000005 1 0.8799999952 1}
  name Grade24
@@ -771,6 +803,8 @@ Write {
  file_type exr
  first_part rgba
  version 21
+ in_colorspace scene_linear
+ out_colorspace scene_linear
  name Write18
  xpos -2420
  ypos 674
@@ -786,12 +820,32 @@ Read {
  xpos -2765
  ypos 420
 }
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/low_red_sphere.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read20
+ xpos -3124
+ ypos 43
+}
 Viewer {
  frame_range 1-100
- colour_sample_bbox {0.4877929688 -0.3032226563 0.4965820313 -0.2978515625}
+ colour_sample_bbox {0.4580078125 -0.3046875 0.466796875 -0.2978515625}
  viewerProcess "sRGB (ACES)"
  name Viewer3
- selected true
  xpos -158
  ypos 166
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/high_red_sphere.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read21
+ selected true
+ xpos -3008
+ ypos 59
 }
