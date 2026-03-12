@@ -2221,30 +2221,26 @@ def _run_pipeline(args):
     #   - R-G and B-G deviation tells you the residual colour cast in stops
     # When chart WB was used, also compute sphere WB independently and compare.
     # Large disagreement → chart patch may be misidentified or in shadow.
-    log("── WB sanity check (sphere render) ──")
-    _env_wb_check = _env_for_sphere(wb_img, max_w=256)
-    _sphere_check, _sphere_mask = render_gray_ball_vectorized(
-        _env_wb_check, albedo=args.albedo, res=48, chunk=512)
-    _sp_rgb  = np.mean(_sphere_check[_sphere_mask], axis=0)   # mean over valid pixels only
-    _sp_luma = float(0.2126*_sp_rgb[0] + 0.7152*_sp_rgb[1] + 0.0722*_sp_rgb[2])
-    _rg_dev  = float(_sp_rgb[0] - _sp_rgb[1])
-    _bg_dev  = float(_sp_rgb[2] - _sp_rgb[1])
-    log(f"  sphere mean RGB : R={_sp_rgb[0]:.4f}  G={_sp_rgb[1]:.4f}  B={_sp_rgb[2]:.4f}")
-    log(f"  chroma deviation: R-G={_rg_dev:+.4f}  B-G={_bg_dev:+.4f}  "
-        f"(ideal=0.0, |total|={abs(_rg_dev)+abs(_bg_dev):.4f})")
+    log("── WB sanity check (irradiance) ──")
+    # Use direct upper-hemisphere irradiance instead of sphere renders — faster, same info.
+    _dirs_wb, _dOmega_wb = latlong_dirs(wb_img.shape[0], wb_img.shape[1])
+    _cos_up_wb = np.clip(_dirs_wb[..., 1], 0.0, None)
+    _E_wb_rgb = np.array([
+        float(np.sum(wb_img[..., c] * _cos_up_wb * _dOmega_wb)) for c in range(3)])
+    _E_wb_luma = float(0.2126*_E_wb_rgb[0] + 0.7152*_E_wb_rgb[1] + 0.0722*_E_wb_rgb[2])
+    # Chroma deviation: how far from neutral is the upper-hemi irradiance?
+    _rg_dev = float((_E_wb_rgb[0] - _E_wb_rgb[1]) / (_E_wb_luma + 1e-8))
+    _bg_dev = float((_E_wb_rgb[2] - _E_wb_rgb[1]) / (_E_wb_luma + 1e-8))
+    log(f"  E_upper RGB : R={_E_wb_rgb[0]:.4f}  G={_E_wb_rgb[1]:.4f}  B={_E_wb_rgb[2]:.4f}")
+    log(f"  chroma (R-G)/luma={_rg_dev:+.4f}  (B-G)/luma={_bg_dev:+.4f}  (ideal=0.0)")
     _chroma_total = abs(_rg_dev) + abs(_bg_dev)
 
     if wb_from_chart:
-        # Also compute sphere WB independently for comparison
-        _sphere_wb_scale, _ = estimate_wb_from_sphere_render.__wrapped__(wb_img, args.albedo, 48) \
-            if hasattr(estimate_wb_from_sphere_render, '__wrapped__') \
-            else (None, None)
-        # Simpler: just compute the sphere mean on the raw (pre-WB) image
-        _env_raw_check = _env_for_sphere(img, max_w=256)
-        _sp_raw, _sp_raw_mask = render_gray_ball_vectorized(_env_raw_check, albedo=args.albedo, res=48, chunk=512)
-        _sp_raw_rgb = np.mean(_sp_raw[_sp_raw_mask], axis=0)
-        _sp_raw_luma = float(0.2126*_sp_raw_rgb[0] + 0.7152*_sp_raw_rgb[1] + 0.0722*_sp_raw_rgb[2])
-        _sphere_implied_scale = _sp_raw_luma / np.clip(_sp_raw_rgb, 1e-8, None)
+        # Cross-check: derive WB scale implied by raw upper-hemi irradiance
+        _E_raw_rgb = np.array([
+            float(np.sum(img[..., c] * _cos_up_wb * _dOmega_wb)) for c in range(3)])
+        _E_raw_luma = float(0.2126*_E_raw_rgb[0] + 0.7152*_E_raw_rgb[1] + 0.0722*_E_raw_rgb[2])
+        _sphere_implied_scale = _E_raw_luma / np.clip(_E_raw_rgb, 1e-8, None)
         _sphere_implied_luma  = float(0.2126*_sphere_implied_scale[0]
                                       + 0.7152*_sphere_implied_scale[1]
                                       + 0.0722*_sphere_implied_scale[2])
@@ -2398,9 +2394,9 @@ def _run_pipeline(args):
              f"(R-G={_rg_dev:+.4f} B-G={_bg_dev:+.4f}).")
 
     # Save sphere debug image for this WB check
-    save_png_preview(os.path.join(args.debug_dir, "01_wb_sphere_check.png"), _sphere_check)
+    save_png_preview(os.path.join(args.debug_dir, "01_wb_preview.png"), wb_img)
     meta["white_balance"]["sphere_check"] = {
-        "mean_rgb":   _sp_rgb.tolist(),
+        "mean_rgb":   _E_wb_rgb.tolist(),
         "chroma_rg":  _rg_dev,
         "chroma_bg":  _bg_dev,
     }
@@ -2820,23 +2816,10 @@ def _run_pipeline(args):
     save_exr(base_dome_path, base_dome)
     log(f"Saved calibrated base dome (sun zeroed): {base_dome_path}")
 
-    log("── Pre-solve sphere verify ──")
-    pre_verify_rgb = verify_sphere_neutrality(
-        exposed, albedo=args.albedo, target=sphere_target, label="post-WB")
-    save_png_preview(os.path.join(args.debug_dir, "04a_verify_sphere_pre.png"),
-                     render_gray_ball_vectorized(exposed, albedo=args.albedo,
-                                                 res=args.sphere_res)[0])
-
-    sphere_full, sphere_base, sphere_lobe, sphere_mask = gray_ball_from_split(
-        exposed, hot["mask"], albedo=args.albedo, res=args.sphere_res,
-        lobe_neutralise_strength=args.lobe_neutralise)
-
-    save_png_preview(os.path.join(args.debug_dir, "04_grayball_full.png"),    sphere_full)
-    save_png_preview(os.path.join(args.debug_dir, "05_grayball_base.png"),    sphere_base)
-    save_png_preview(os.path.join(args.debug_dir, "06_grayball_lobe.png"),    sphere_lobe)
-
-    pre_metrics = sphere_metrics(sphere_full, sphere_mask)
-    log(f"Sphere before sun solve: {pre_metrics}")
+    # Pre-solve sphere renders removed — solve uses direct irradiance integration,
+    # no sphere render needed. Single final render after solve for validation.
+    pre_verify_rgb = np.zeros(3, dtype=np.float32)  # placeholder for report
+    pre_metrics    = {}
 
     _gain_ceiling = float(getattr(args, "sun_gain_ceiling", 2000.0))
     _gain_rolloff = float(getattr(args, "sun_gain_rolloff", 500.0))
@@ -2929,10 +2912,7 @@ def _run_pipeline(args):
     solution = {
         "gain":             float(_gains_solve.mean()),
         "gains_per_channel": _gains_solve,
-        "sphere":           sphere_base + sphere_lobe * _gains_solve[None, None, :],
-        "metrics":          sphere_metrics(
-                                sphere_base + sphere_lobe * _gains_solve[None, None, :],
-                                sphere_mask),
+        "metrics":          {},   # filled after final sphere render below
         "gain_diag": {
             "E_base_rgb":   _E_base_rgb.tolist(),
             "E_lobe_rgb":   _E_lobe_rgb.tolist(),
@@ -2949,19 +2929,24 @@ def _run_pipeline(args):
     corrected = apply_sun_gain_per_channel(exposed, hot["mask"], gains_pc,
                                            lobe_neutralise_strength=args.lobe_neutralise)
     save_png_preview(os.path.join(args.debug_dir, "07_corrected_preview.png"), corrected)
-    save_png_preview(os.path.join(args.debug_dir, "08_grayball_after_solve.png"),
-                     solution["sphere"])
 
     # ── Validation render: final HDR → grey sphere ─────────────────────────
     # This is the ground truth check. If the pipeline is correct, the sphere
     # mean RGB must equal meter_target on every channel independently.
     log("── Final validation sphere render ──")
-    final_verify_rgb = verify_sphere_neutrality(
-        corrected, albedo=args.albedo, target=sphere_target, label="final")
-    final_sphere, _ = render_gray_ball_vectorized(
+    final_sphere, final_sphere_mask = render_gray_ball_vectorized(
         corrected, albedo=args.albedo, res=args.sphere_res)
-    save_png_preview(os.path.join(args.debug_dir, "09_verify_sphere_final.png"),
-                     final_sphere)
+    save_png_preview(os.path.join(args.debug_dir, "08_verify_sphere_final.png"), final_sphere)
+    # Compute validation stats from the single render (no second render needed)
+    _fsph_valid = final_sphere[final_sphere_mask]
+    final_verify_rgb = _fsph_valid.mean(axis=0) if len(_fsph_valid) else np.zeros(3)
+    _fv_luma = float(0.2126*final_verify_rgb[0] + 0.7152*final_verify_rgb[1] + 0.0722*final_verify_rgb[2])
+    _fv_rg = float((final_verify_rgb[0]-final_verify_rgb[1]) / (_fv_luma+1e-8))
+    _fv_bg = float((final_verify_rgb[2]-final_verify_rgb[1]) / (_fv_luma+1e-8))
+    log(f"Sphere verify [final]: mean RGB={final_verify_rgb.tolist()}")
+    log(f"  luma={_fv_luma:.4f}  R-G={_fv_rg:+.4f}  B-G={_fv_bg:+.4f} (should be ~0)")
+    if abs(_fv_rg) > 0.05 or abs(_fv_bg) > 0.05:
+        warn(f"Sphere [final] colour cast: R-G={_fv_rg:+.3f} B-G={_fv_bg:+.3f}")
 
     meta["sphere"] = {
         "albedo":                args.albedo,

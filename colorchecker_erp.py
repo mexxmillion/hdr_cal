@@ -382,46 +382,112 @@ def _detect_in_tile(tile_linear: np.ndarray,
     # Reinhard tonemap: maps [0, inf) → [0, 1)
     tile_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
 
-    # ── Detection: inference (YOLOv8) first, segmentation as fallback ────────
-    # Inference handles small, rotated, perspective-distorted charts far better.
-    # Segmentation is kept as fallback for environments without ultralytics.
+    # ── Detection strategy: segmentation locates, YOLO extracts swatches ───
+    #
+    # Segmentation is reliable at FINDING the chart (returns quad corners).
+    # But its swatch sampling on small/tilted/dark charts is poor.
+    #
+    # Strategy:
+    #   1. Run segmentation to get the quad (chart location in tile)
+    #   2. Crop tightly around the quad + padding, upscale to ~800px
+    #   3. If YOLO available: run inference on that clean crop → better swatches
+    #   4. If YOLO unavailable or fails: use segmentation swatches from crop
+    #
+    # This way YOLO only runs once on a tight crop (fast), not on the full
+    # 1024px tile where the chart is tiny and inference fails.
     det = None
     _method_used = "none"
 
-    if HAVE_CCD_INFERENCE:
-        try:
-            # Convert to uint8 sRGB for YOLO (expects 0-255 uint8)
-            _tile_u8 = np.clip(tile_tm * 255, 0, 255).astype(np.uint8)
-            _inf_results = ccd.detect_colour_checkers_inference(
-                _tile_u8,
-                additional_data=True,
-            )
-            if _inf_results:
-                det = _inf_results[0]
-                _method_used = "inference(YOLOv8)"
-                print(f"[cc-erp] Inference detection succeeded on tile yaw={yaw:.0f} pitch={pitch:.0f}")
-            else:
-                print(f"[cc-erp] Inference: no detection on tile — trying segmentation fallback")
-        except Exception as _e:
-            print(f"[cc-erp] Inference failed ({_e}) — trying segmentation fallback")
-
-    if det is None:
-        try:
-            _seg_results = ccd.detect_colour_checkers_segmentation(
-                tile_tm,
-                show=False,
-                additional_data=True,
-                apply_cctf_decoding=False,
-            )
-            if _seg_results:
-                det = _seg_results[0]
-                _method_used = "segmentation"
-                print(f"[cc-erp] Segmentation detection on tile yaw={yaw:.0f} pitch={pitch:.0f}")
-        except Exception:
-            pass
+    # Step 1: segmentation on full tile to locate chart
+    try:
+        _seg_results = ccd.detect_colour_checkers_segmentation(
+            tile_tm,
+            show=False,
+            additional_data=True,
+            apply_cctf_decoding=False,
+        )
+        if _seg_results:
+            det = _seg_results[0]
+            _method_used = "segmentation"
+            print(f"[cc-erp] Segmentation located chart on tile yaw={yaw:.0f} pitch={pitch:.0f}")
+    except Exception:
+        pass
 
     if det is None:
         return None
+
+    # Step 2: crop tightly around detected quad
+    _quad_w = np.array(det.quadrilateral, dtype=np.float32)
+    WORKING_W = 1024.0
+    _qscale_x = out_w / WORKING_W
+    _qscale_y = out_h / WORKING_W
+    _quad_px = _quad_w.copy()
+    _quad_px[:, 0] *= _qscale_x
+    _quad_px[:, 1] *= _qscale_y
+    _qx0 = int(max(0, _quad_px[:, 0].min()))
+    _qx1 = int(min(out_w, _quad_px[:, 0].max()))
+    _qy0 = int(max(0, _quad_px[:, 1].min()))
+    _qy1 = int(min(out_h, _quad_px[:, 1].max()))
+    _qw = _qx1 - _qx0
+    _qh = _qy1 - _qy0
+
+    # Step 3: if YOLO available and chart is not already large, run on crop
+    if HAVE_CCD_INFERENCE and _qw > 10 and _qh > 10:
+        _pad_x = int(_qw * 0.5)
+        _pad_y = int(_qh * 0.5)
+        _cx0 = max(0, _qx0 - _pad_x)
+        _cx1 = min(out_w, _qx1 + _pad_x)
+        _cy0 = max(0, _qy0 - _pad_y)
+        _cy1 = min(out_h, _qy1 + _pad_y)
+        _crop_lin = tile_linear[_cy0:_cy1, _cx0:_cx1]
+        _crop_h, _crop_w = _crop_lin.shape[:2]
+        # Upscale to 800px wide so YOLO sees a large chart
+        _zoom_w = 800
+        _zoom_h = int(_crop_h * _zoom_w / (_crop_w + 1e-8))
+        _crop_up = cv2.resize(_crop_lin, (_zoom_w, _zoom_h), interpolation=cv2.INTER_LINEAR)
+        # YOLO expects uint8 sRGB
+        _crop_tm = (_crop_up / (_crop_up + 1.0)).astype(np.float32)
+        _crop_u8 = np.clip(_crop_tm * 255, 0, 255).astype(np.uint8)
+        try:
+            _inf_results = ccd.detect_colour_checkers_inference(
+                _crop_u8,
+                additional_data=True,
+            )
+            if _inf_results:
+                _idet = _inf_results[0]
+                _isw_tm = np.array(_idet.swatch_colours, dtype=np.float32)
+                if _isw_tm.shape == (24, 3):
+                    # Compare chroma error on neutral ramp
+                    def _cerr(sw, ref):
+                        n = sw[18:24]; r = ref[18:24]
+                        lm = 0.2126*n[:,0]+0.7152*n[:,1]+0.0722*n[:,2]
+                        lr = 0.2126*r[:,0]+0.7152*r[:,1]+0.0722*r[:,2]
+                        sc = np.clip(lr/(lm+1e-8),0,20)[:,None]
+                        return float(np.mean(np.abs(n*sc - r)))
+                    _ref_arr = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
+                    _seg_sw_safe = np.clip(np.array(det.swatch_colours, dtype=np.float32), 0, 0.9999)
+                    _seg_sw_lin  = _seg_sw_safe / (1.0 - _seg_sw_safe)
+                    _seg_err  = _cerr(_seg_sw_lin, _ref_arr)
+                    _isw_safe = np.clip(_isw_tm, 0, 0.9999)
+                    _isw_lin  = _isw_safe / (1.0 - _isw_safe)
+                    _yolo_err = _cerr(_isw_lin, _ref_arr)
+                    print(f"[cc-erp] YOLO on crop: seg_err={_seg_err:.4f}  yolo_err={_yolo_err:.4f}  "
+                          f"crop={_crop_w}×{_crop_h} → {_zoom_w}×{_zoom_h}px")
+                    if _yolo_err < _seg_err:
+                        # Patch the detection's swatch_colours with YOLO's better values
+                        # We keep segmentation's quad/pose, swap only the colour data
+                        import copy
+                        det = copy.copy(det)
+                        object.__setattr__(det, 'swatch_colours',
+                                           _isw_tm.tolist() if hasattr(_isw_tm, 'tolist') else _isw_tm)
+                        _method_used = "segmentation(locate)+YOLO(swatches)"
+                        print(f"[cc-erp] YOLO swatches better — using YOLO colours, segmentation quad")
+                    else:
+                        print(f"[cc-erp] Segmentation swatches better or equal — keeping segmentation")
+            else:
+                print(f"[cc-erp] YOLO: no detection on crop — keeping segmentation swatches")
+        except Exception as _ye:
+            print(f"[cc-erp] YOLO on crop failed ({_ye}) — keeping segmentation swatches")
 
     print(f"[cc-erp] Detection method: {_method_used}")
 
@@ -459,72 +525,6 @@ def _detect_in_tile(tile_linear: np.ndarray,
     quad_tile = quad_w.copy()
     quad_tile[:, 0] *= scale_x
     quad_tile[:, 1] *= scale_y
-
-    # ── Zoom-in re-detection: crop tightly around detected quad, upscale ──
-    # The chart may be small in the tile (e.g. bottom-right corner).
-    # Crop with 40% padding around the bounding box, upscale to 800px wide,
-    # re-run detection. If result has better swatch quality, use it instead.
-    _x0 = int(max(0, quad_tile[:, 0].min()))
-    _x1 = int(min(out_w, quad_tile[:, 0].max()))
-    _y0 = int(max(0, quad_tile[:, 1].min()))
-    _y1 = int(min(out_h, quad_tile[:, 1].max()))
-    _cw = _x1 - _x0
-    _ch = _y1 - _y0
-    _chart_area_frac = (_cw * _ch) / (out_w * out_h + 1e-8)
-
-    # Only zoom if chart occupies less than 25% of tile area
-    if _cw > 10 and _ch > 10 and _chart_area_frac < 0.25:
-        _pad_x = int(_cw * 0.4)
-        _pad_y = int(_ch * 0.4)
-        _cx0 = max(0, _x0 - _pad_x)
-        _cx1 = min(out_w, _x1 + _pad_x)
-        _cy0 = max(0, _y0 - _pad_y)
-        _cy1 = min(out_h, _y1 + _pad_y)
-        _crop = tile_linear[_cy0:_cy1, _cx0:_cx1]
-        _crop_h, _crop_w = _crop.shape[:2]
-        # Upscale to ~800px wide
-        _zoom_w = 800
-        _zoom_h = int(_crop_h * _zoom_w / (_crop_w + 1e-8))
-        _crop_up = cv2.resize(_crop, (_zoom_w, _zoom_h), interpolation=cv2.INTER_LINEAR)
-        _crop_tm = (_crop_up / (_crop_up + 1.0)).astype(np.float32)
-        try:
-            _zoom_results = ccd.detect_colour_checkers_segmentation(
-                _crop_tm, show=False, additional_data=True, apply_cctf_decoding=False)
-            if _zoom_results:
-                _zdet = _zoom_results[0]
-                _zsw_tm = np.array(_zdet.swatch_colours, dtype=np.float32)
-                if _zsw_tm.shape == (24, 3):
-                    _zsw_safe = np.clip(_zsw_tm, 0.0, 0.9999)
-                    _zsw_linear = _zsw_safe / (1.0 - _zsw_safe)
-                    # Compare neutral ramp chroma error vs original
-                    def _chroma_err(sw, ref):
-                        n = sw[18:24]
-                        r = ref[18:24]
-                        lm = 0.2126*n[:,0] + 0.7152*n[:,1] + 0.0722*n[:,2]
-                        lr = 0.2126*r[:,0] + 0.7152*r[:,1] + 0.0722*r[:,2]
-                        sc = np.clip(lr / (lm + 1e-8), 0, 20)[:, None]
-                        return float(np.mean(np.abs(n * sc - r)))
-                    _ref_arr = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
-                    _orig_err = _chroma_err(swatches_linear, _ref_arr)
-                    _zoom_err = _chroma_err(_zsw_linear, _ref_arr)
-                    print(f"[cc-erp] Zoom re-detect: orig_err={_orig_err:.4f}  zoom_err={_zoom_err:.4f}  "
-                          f"chart_area={_chart_area_frac*100:.1f}%  upscale={_zoom_w}px")
-                    if _zoom_err < _orig_err:
-                        print(f"[cc-erp] Zoom result is better — using zoomed swatch values")
-                        sw_tm = _zsw_tm
-                        swatches_linear = _zsw_linear
-                        # Update quad_tile to crop-space coords scaled back to tile
-                        _zquad_w = np.array(_zdet.quadrilateral, dtype=np.float32)
-                        _zscale_x = (_cx1 - _cx0) / WORKING_W
-                        _zscale_y = (_cy1 - _cy0) / WORKING_W
-                        _zquad_crop = _zquad_w.copy()
-                        _zquad_crop[:, 0] = _zquad_w[:, 0] * _zscale_x * ((_crop_w) / _zoom_w) + _cx0
-                        _zquad_crop[:, 1] = _zquad_w[:, 1] * _zscale_y * ((_crop_h) / _zoom_h) + _cy0
-                        quad_tile = _zquad_crop
-                    else:
-                        print(f"[cc-erp] Zoom result not better — keeping original swatch values")
-        except Exception as _ze:
-            print(f"[cc-erp] Zoom re-detect failed: {_ze}")
 
     # ── Swatch centre positions: use swatch_masks in colour_checker space ─
     # Then map through the homography quad_tile → colour_checker rectangle.
