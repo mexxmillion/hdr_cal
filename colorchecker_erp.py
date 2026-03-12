@@ -45,6 +45,15 @@ try:
 except ImportError:
     HAVE_CCD = False
 
+# Check if the ML inference method is available (requires ultralytics)
+HAVE_CCD_INFERENCE = False
+if HAVE_CCD:
+    try:
+        _ = ccd.detect_colour_checkers_inference
+        HAVE_CCD_INFERENCE = True
+    except AttributeError:
+        pass
+
 try:
     import colour
     HAVE_COLOUR = True
@@ -52,8 +61,40 @@ except ImportError:
     HAVE_COLOUR = False
 
 
-# ─── CC24 reference (linear sRGB, D65) ───────────────────────────────────────
-# Patch order: row-major, top-left = patch 1 (dark skin)
+# ─── Colorspace matrices ─────────────────────────────────────────────────────
+# sRGB D65 → XYZ D65 (IEC 61966-2-1)
+_M_SRGB_TO_XYZ = np.array([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+], dtype=np.float64)
+
+# XYZ D65 → ACEScg AP1 (S-2014-004)
+_M_XYZ_TO_ACESCG = np.array([
+    [ 1.6410234, -0.3248033, -0.2364247],
+    [-0.6636629,  1.6153316,  0.0167563],
+    [ 0.0117219, -0.0082844,  0.9883949],
+], dtype=np.float64)
+
+# Combined: linear sRGB → ACEScg
+M_SRGB_LINEAR_TO_ACESCG = (_M_XYZ_TO_ACESCG @ _M_SRGB_TO_XYZ).astype(np.float32)
+
+# Inverse: ACEScg → linear sRGB
+M_ACESCG_TO_SRGB_LINEAR = np.linalg.inv(
+    M_SRGB_LINEAR_TO_ACESCG.astype(np.float64)
+).astype(np.float32)
+
+
+def apply_matrix_3x3(img: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """Apply a 3×3 matrix to every pixel of a (H,W,3) or (N,3) array."""
+    shape = img.shape
+    return (img.reshape(-1, 3).astype(np.float32) @ M.T).reshape(shape).astype(np.float32)
+
+
+# ─── CC24 reference values ────────────────────────────────────────────────────
+# Source: Macbeth ColorChecker Classic spectral data, rendered to D65.
+# These are LINEAR (scene-referred) values in sRGB / Rec.709 primaries.
+# Patch order: row-major, top-left = patch 1 (dark skin).
 CC24_LINEAR_SRGB = np.array([
     [0.4000, 0.3176, 0.2745],  # 01 dark skin
     [0.7608, 0.5804, 0.4941],  # 02 light skin
@@ -76,10 +117,50 @@ CC24_LINEAR_SRGB = np.array([
     [0.9412, 0.9412, 0.9412],  # 19 white  N9.5
     [0.6196, 0.6196, 0.6196],  # 20 neutral 8
     [0.3647, 0.3647, 0.3647],  # 21 neutral 6.5
-    [0.1882, 0.1882, 0.1882],  # 22 neutral 5
+    [0.1882, 0.1882, 0.1882],  # 22 neutral 5  ← WB reference, ~18% grey
     [0.0902, 0.0902, 0.0902],  # 23 neutral 3.5
     [0.0314, 0.0314, 0.0314],  # 24 black   N2
 ], dtype=np.float32)
+
+# ACEScg (AP1) reference values.
+# IMPORTANT: The CC24 sRGB values are spectral reflectances rendered under D65
+# into sRGB primaries. You cannot get correct ACEScg values by applying the
+# sRGB->ACEScg matrix — that matrix encodes a D65->D60 white point adaptation
+# which breaks the neutral patches (makes R≠G≠B for a spectrally flat grey).
+#
+# Correct approach:
+#   - Neutral patches (19-24): R=G=B in ANY colorspace — a flat reflector is
+#     achromatic regardless of primaries. Keep identical to sRGB values.
+#   - Chromatic patches: ideally re-rendered from spectral data into AP1.
+#     As an approximation we use the sRGB values — the gamut difference between
+#     sRGB and AP1 is modest for the CC24 patch colours, and WB is derived from
+#     the neutral patches anyway.
+#
+# For the 3×3 colour matrix solve the chromatic error is acceptable because
+# you're solving for the best-fit matrix, not comparing absolute values.
+CC24_LINEAR_ACESCG = CC24_LINEAR_SRGB.copy()
+# Neutrals are already correct (equal R=G=B). No transform needed.
+
+# Alias — used internally, always points at sRGB values (correct for all colorspaces)
+CC24_LINEAR = CC24_LINEAR_SRGB
+
+
+def get_cc24_reference(colorspace: str = "acescg") -> np.ndarray:
+    """
+    Return the CC24 reference array for the requested colorspace.
+
+    For WB purposes (patch 22, neutral grey) the result is identical in all
+    colorspaces — a spectrally flat reflector has equal R=G=B regardless of
+    primaries. The colorspace distinction only matters for the full 3×3 colour
+    matrix solve on chromatic patches.
+
+    colorspace: "acescg" (default for EXR) or "srgb" (for LDR inputs)
+    """
+    cs = colorspace.lower().replace("-", "").replace("_", "")
+    if cs in ("acescg", "aces", "ap1", "srgb", "rec709", "linear"):
+        return CC24_LINEAR_SRGB
+    raise ValueError(f"Unknown colorspace '{colorspace}'. Use 'acescg' or 'srgb'.")
+
 
 # Physical CC24 patch layout in mm (4 cols × 6 rows, 24×24 mm patches, 6 mm gap)
 # Origin at top-left patch centre.  X = right, Y = down.
@@ -271,16 +352,14 @@ def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
                     ((v + 0.055) / 1.055) ** 2.4).astype(np.float32)
 
 
-# Linearised CC24 reference — computed once at import time
-CC24_LINEAR = _srgb_to_linear_arr(CC24_LINEAR_SRGB)
-
 
 def _detect_in_tile(tile_linear: np.ndarray,
                     map_uv: np.ndarray,
                     erp_linear_hd: np.ndarray,
                     yaw: float, pitch: float,
                     debug_dir,
-                    tile_idx: int):
+                    tile_idx: int,
+                    cc24_ref: Optional[np.ndarray] = None):
     """
     Detect a ColorChecker in one rectilinear tile.
 
@@ -303,20 +382,48 @@ def _detect_in_tile(tile_linear: np.ndarray,
     # Reinhard tonemap: maps [0, inf) → [0, 1)
     tile_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
 
-    try:
-        results = ccd.detect_colour_checkers_segmentation(
-            tile_tm,
-            show=False,
-            additional_data=True,
-            apply_cctf_decoding=False,
-        )
-    except Exception:
+    # ── Detection: inference (YOLOv8) first, segmentation as fallback ────────
+    # Inference handles small, rotated, perspective-distorted charts far better.
+    # Segmentation is kept as fallback for environments without ultralytics.
+    det = None
+    _method_used = "none"
+
+    if HAVE_CCD_INFERENCE:
+        try:
+            # Convert to uint8 sRGB for YOLO (expects 0-255 uint8)
+            _tile_u8 = np.clip(tile_tm * 255, 0, 255).astype(np.uint8)
+            _inf_results = ccd.detect_colour_checkers_inference(
+                _tile_u8,
+                additional_data=True,
+            )
+            if _inf_results:
+                det = _inf_results[0]
+                _method_used = "inference(YOLOv8)"
+                print(f"[cc-erp] Inference detection succeeded on tile yaw={yaw:.0f} pitch={pitch:.0f}")
+            else:
+                print(f"[cc-erp] Inference: no detection on tile — trying segmentation fallback")
+        except Exception as _e:
+            print(f"[cc-erp] Inference failed ({_e}) — trying segmentation fallback")
+
+    if det is None:
+        try:
+            _seg_results = ccd.detect_colour_checkers_segmentation(
+                tile_tm,
+                show=False,
+                additional_data=True,
+                apply_cctf_decoding=False,
+            )
+            if _seg_results:
+                det = _seg_results[0]
+                _method_used = "segmentation"
+                print(f"[cc-erp] Segmentation detection on tile yaw={yaw:.0f} pitch={pitch:.0f}")
+        except Exception:
+            pass
+
+    if det is None:
         return None
 
-    if not results:
-        return None
-
-    det = results[0]
+    print(f"[cc-erp] Detection method: {_method_used}")
 
     # ── Swatch colours directly from the library ──────────────────────────
     # The library perspective-corrects the checker and samples each patch.
@@ -352,6 +459,72 @@ def _detect_in_tile(tile_linear: np.ndarray,
     quad_tile = quad_w.copy()
     quad_tile[:, 0] *= scale_x
     quad_tile[:, 1] *= scale_y
+
+    # ── Zoom-in re-detection: crop tightly around detected quad, upscale ──
+    # The chart may be small in the tile (e.g. bottom-right corner).
+    # Crop with 40% padding around the bounding box, upscale to 800px wide,
+    # re-run detection. If result has better swatch quality, use it instead.
+    _x0 = int(max(0, quad_tile[:, 0].min()))
+    _x1 = int(min(out_w, quad_tile[:, 0].max()))
+    _y0 = int(max(0, quad_tile[:, 1].min()))
+    _y1 = int(min(out_h, quad_tile[:, 1].max()))
+    _cw = _x1 - _x0
+    _ch = _y1 - _y0
+    _chart_area_frac = (_cw * _ch) / (out_w * out_h + 1e-8)
+
+    # Only zoom if chart occupies less than 25% of tile area
+    if _cw > 10 and _ch > 10 and _chart_area_frac < 0.25:
+        _pad_x = int(_cw * 0.4)
+        _pad_y = int(_ch * 0.4)
+        _cx0 = max(0, _x0 - _pad_x)
+        _cx1 = min(out_w, _x1 + _pad_x)
+        _cy0 = max(0, _y0 - _pad_y)
+        _cy1 = min(out_h, _y1 + _pad_y)
+        _crop = tile_linear[_cy0:_cy1, _cx0:_cx1]
+        _crop_h, _crop_w = _crop.shape[:2]
+        # Upscale to ~800px wide
+        _zoom_w = 800
+        _zoom_h = int(_crop_h * _zoom_w / (_crop_w + 1e-8))
+        _crop_up = cv2.resize(_crop, (_zoom_w, _zoom_h), interpolation=cv2.INTER_LINEAR)
+        _crop_tm = (_crop_up / (_crop_up + 1.0)).astype(np.float32)
+        try:
+            _zoom_results = ccd.detect_colour_checkers_segmentation(
+                _crop_tm, show=False, additional_data=True, apply_cctf_decoding=False)
+            if _zoom_results:
+                _zdet = _zoom_results[0]
+                _zsw_tm = np.array(_zdet.swatch_colours, dtype=np.float32)
+                if _zsw_tm.shape == (24, 3):
+                    _zsw_safe = np.clip(_zsw_tm, 0.0, 0.9999)
+                    _zsw_linear = _zsw_safe / (1.0 - _zsw_safe)
+                    # Compare neutral ramp chroma error vs original
+                    def _chroma_err(sw, ref):
+                        n = sw[18:24]
+                        r = ref[18:24]
+                        lm = 0.2126*n[:,0] + 0.7152*n[:,1] + 0.0722*n[:,2]
+                        lr = 0.2126*r[:,0] + 0.7152*r[:,1] + 0.0722*r[:,2]
+                        sc = np.clip(lr / (lm + 1e-8), 0, 20)[:, None]
+                        return float(np.mean(np.abs(n * sc - r)))
+                    _ref_arr = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
+                    _orig_err = _chroma_err(swatches_linear, _ref_arr)
+                    _zoom_err = _chroma_err(_zsw_linear, _ref_arr)
+                    print(f"[cc-erp] Zoom re-detect: orig_err={_orig_err:.4f}  zoom_err={_zoom_err:.4f}  "
+                          f"chart_area={_chart_area_frac*100:.1f}%  upscale={_zoom_w}px")
+                    if _zoom_err < _orig_err:
+                        print(f"[cc-erp] Zoom result is better — using zoomed swatch values")
+                        sw_tm = _zsw_tm
+                        swatches_linear = _zsw_linear
+                        # Update quad_tile to crop-space coords scaled back to tile
+                        _zquad_w = np.array(_zdet.quadrilateral, dtype=np.float32)
+                        _zscale_x = (_cx1 - _cx0) / WORKING_W
+                        _zscale_y = (_cy1 - _cy0) / WORKING_W
+                        _zquad_crop = _zquad_w.copy()
+                        _zquad_crop[:, 0] = _zquad_w[:, 0] * _zscale_x * ((_crop_w) / _zoom_w) + _cx0
+                        _zquad_crop[:, 1] = _zquad_w[:, 1] * _zscale_y * ((_crop_h) / _zoom_h) + _cy0
+                        quad_tile = _zquad_crop
+                    else:
+                        print(f"[cc-erp] Zoom result not better — keeping original swatch values")
+        except Exception as _ze:
+            print(f"[cc-erp] Zoom re-detect failed: {_ze}")
 
     # ── Swatch centre positions: use swatch_masks in colour_checker space ─
     # Then map through the homography quad_tile → colour_checker rectangle.
@@ -424,7 +597,8 @@ def _detect_in_tile(tile_linear: np.ndarray,
 
     # ── Confidence: chroma error on luma-normalised neutral ramp ─────────
     neutrals_meas = swatches_linear[18:24]
-    neutrals_ref  = CC24_LINEAR[18:24]
+    _ref = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
+    neutrals_ref  = _ref[18:24]
     lum_meas = 0.2126*neutrals_meas[:,0] + 0.7152*neutrals_meas[:,1] + 0.0722*neutrals_meas[:,2]
     lum_ref  = 0.2126*neutrals_ref[:,0]  + 0.7152*neutrals_ref[:,1]  + 0.0722*neutrals_ref[:,2]
     scale_n  = np.clip(lum_ref / (lum_meas + 1e-8), 0.0, 20.0)[:, None]
@@ -454,8 +628,16 @@ def _detect_in_tile(tile_linear: np.ndarray,
                  else f"tile_{lbl}_detected.jpg")
         cv2.imwrite(os.path.join(debug_dir, fname), vis)
 
+    # ── Reorder swatches to match CC24 row-major layout ──────────────────
+    # The library may return patches in a different order depending on how
+    # it detected the checker orientation. Find the permutation that best
+    # matches CC24_LINEAR by minimising total colour distance, then reorder.
+    swatches_linear, reorder_idx = _reorder_swatches_to_cc24(swatches_linear, cc24_ref)
+    swatch_centres_uv = swatch_centres_uv[reorder_idx]
+    swatch_centres_tile = [swatch_centres_tile[i] for i in reorder_idx]
+
     return CheckerDetection(
-        swatches_linear=swatches_linear,   # from library, Reinhard-inverted
+        swatches_linear=swatches_linear,
         swatch_centres_uv=swatch_centres_uv,
         tile_yaw=yaw,
         tile_pitch=pitch,
@@ -467,7 +649,60 @@ def _detect_in_tile(tile_linear: np.ndarray,
     )
 
 
-def _detect_checker_polygon(tile_u8_bgr):
+def _reorder_swatches_to_cc24(swatches: np.ndarray,
+                              cc24_ref: Optional[np.ndarray] = None) -> tuple:
+    """
+    Reorder the library's 24 swatches to match CC24 row-major layout.
+
+    cc24_ref: (24,3) reference in the working colorspace. If None, uses
+              CC24_LINEAR_SRGB (backward compat). Pass get_cc24_reference(cs)
+              from the caller to match the image colorspace.
+
+    Uses luma-normalised chroma distance so illuminant doesn't affect matching.
+    """
+    rows, cols = 4, 6
+    assert swatches.shape == (24, 3)
+
+    if cc24_ref is None:
+        cc24_ref = CC24_LINEAR_SRGB
+
+    # Reference: luma-normalised (illuminant-independent chroma comparison)
+    ref = cc24_ref.copy()                           # (24,3)
+    ref_luma = (0.2126*ref[:,0] + 0.7152*ref[:,1] + 0.0722*ref[:,2])[:,None]
+    ref_norm = ref / np.clip(ref_luma, 1e-4, None) # (24,3) chroma only
+
+    sw = swatches.copy()
+    sw_luma = (0.2126*sw[:,0] + 0.7152*sw[:,1] + 0.0722*sw[:,2])[:,None]
+    sw_norm = sw / np.clip(sw_luma, 1e-4, None)
+
+    # Build the 8 candidate index permutations of a 4×6 grid
+    grid = np.arange(24).reshape(rows, cols)       # row-major CC24 order
+
+    def _grid_to_idx(g):
+        return g.flatten().tolist()
+
+    candidates = []
+    for flip in (False, True):
+        g = grid if not flip else grid[:, ::-1]
+        for rot in range(4):
+            candidates.append(_grid_to_idx(np.rot90(g, rot)))
+
+    best_idx  = candidates[0]
+    best_err  = float('inf')
+    for idx in candidates:
+        reordered = sw_norm[idx]                   # (24,3) chroma
+        err = float(np.mean(np.abs(reordered - ref_norm)))
+        if err < best_err:
+            best_err  = err
+            best_idx  = idx
+
+    reorder_arr = np.array(best_idx, dtype=np.int32)
+    print(f"[cc-erp] Swatch reorder: best orientation err={best_err:.4f}  "
+          f"idx[21]={best_idx[21]} (patch 22 in library order)")
+    return swatches[reorder_arr], reorder_arr
+
+
+
     """
     Find the ColorChecker's 4-corner polygon in the tile using contour detection.
 
@@ -656,24 +891,23 @@ def find_colorchecker_in_erp(
     tile_w: int = 900,
     tile_h: int = 675,
     yaw_step_deg: float = 40.0,
-    pitch_values: tuple = (-50.0, -25.0, 0.0),
+    pitch_values: tuple = (-45.0, -20.0, 0.0, 20.0, 45.0),
     min_confidence: float = 0.05,
+    colorspace: str = "acescg",
     debug_dir: Optional[str] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
-    Sweep the lower 2/3 of the ERP panorama with overlapping rectilinear tiles.
+    Cubemap two-pass sweep to find a ColorChecker Classic 24 inside an ERP panorama.
 
-    The chart is always near the horizon or below (tripod, floor) — never sky.
-    Default pitch_values cover 0° (horizon) down to -50° (floor).
-
-    ALL tiles are searched. The detection with the highest confidence score
-    wins, regardless of order. min_confidence is a floor to reject obvious
-    noise (set very low — 0.05 — so a dim or partially visible checker still
-    wins over nothing).
+    colorspace: working colorspace of erp_linear.
+      "acescg" (default) — use for EXR inputs from VFX pipelines.
+      "srgb"             — use for LDR (JPG/PNG) inputs linearised from sRGB.
+      This affects which CC24 reference values are used for patch ordering,
+      confidence scoring, WB derivation, and the colour matrix solve.
 
     Returns:
-        swatches_linear : (24, 3) float32 linear RGB, or None
-        info            : dict with detection metadata
+      swatches_linear : (24,3) float32 in the same colorspace as erp_linear
+      info            : dict with detection metadata
     """
     if not HAVE_CCD:
         return None, {"error": "colour-checker-detection not installed. "
@@ -682,39 +916,95 @@ def find_colorchecker_in_erp(
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
 
-    tiles = _build_sweep_tiles(yaw_step_deg, pitch_values, fov_deg)
-    print(f"[cc-erp] Sweeping {len(tiles)} rectilinear tiles "
-          f"(FOV={fov_deg}°, {tile_w}×{tile_h}, "
-          f"pitches={[int(p) for p in pitch_values]}°) ...")
-
     best: Optional[CheckerDetection] = None
     all_detections = []
+    total_tiles = 0
 
-    for idx, (yaw, pitch) in enumerate(tiles):
-        tile_linear, map_uv = erp_to_rectilinear(
-            erp_linear, yaw, pitch, fov_deg, tile_w, tile_h)
+    # Resolve reference array for this colorspace — used for reordering,
+    # confidence scoring, and WB derivation throughout.
+    cc24_ref = get_cc24_reference(colorspace)
+    print(f"[cc-erp] Colorspace: {colorspace}  "
+          f"(CC24 reference patch 22: "
+          f"R={cc24_ref[21,0]:.4f} G={cc24_ref[21,1]:.4f} B={cc24_ref[21,2]:.4f})")
 
-        det = _detect_in_tile(
-            tile_linear, map_uv, erp_linear,
-            yaw, pitch, debug_dir, idx)
+    # Cubemap two-pass strategy:
+    #   Pass 1 — standard cube: 6 faces at 90° FOV, axis-aligned
+    #     front/back/left/right at pitch=0°, top at pitch=+90°, bottom at pitch=-90°
+    #   Pass 2 — rotated cube: whole cube rotated 45° yaw + 35° pitch
+    #     so face edges land in completely different places than pass 1
+    # 12 tiles total, mathematically guaranteed full sphere coverage.
+    # 90° FOV faces are the gold standard for rectilinear projection —
+    # zero fisheye distortion at edges, exactly what the library expects.
 
-        if det is None:
-            continue
+    def _cubemap_faces(yaw_offset=0.0, pitch_offset=0.0):
+        """6 cubemap faces. yaw_offset/pitch_offset rotate the whole cube."""
+        faces = [
+            # (yaw, pitch) in world space for each face centre
+            (0,    0),    # front
+            (90,   0),    # right
+            (180,  0),    # back
+            (270,  0),    # left
+            (0,    90),   # top
+            (0,   -90),   # bottom
+        ]
+        result = []
+        for yaw, pitch in faces:
+            y = (yaw + yaw_offset) % 360
+            p = np.clip(pitch + pitch_offset, -90, 90)
+            result.append((float(y), float(p), 90.0, 1024, 1024))
+        return result
 
-        all_detections.append(det)
-        print(f"[cc-erp]  tile {idx:02d} yaw={yaw:.0f}° pitch={pitch:.0f}°  "
-              f"confidence={det.confidence:.3f}")
+    sweep_passes = [
+        ("cube-standard", _cubemap_faces(yaw_offset=0,  pitch_offset=0)),
+        ("cube-rotated",  _cubemap_faces(yaw_offset=45, pitch_offset=35)),
+    ]
 
-        # Always keep the best — search ALL tiles, no early exit
-        if det.confidence >= min_confidence:
+    for pass_label, tiles_with_fov in sweep_passes:
+        n = len(tiles_with_fov)
+        fov0 = tiles_with_fov[0][2]
+        print(f"[cc-erp] Pass {pass_label}: {n} tiles (FOV={fov0}°)")
+        total_tiles += n
+
+        for idx, (yaw, pitch, pass_fov, pass_tw, pass_th) in enumerate(tiles_with_fov):
+            tile_linear, map_uv = erp_to_rectilinear(
+                erp_linear, yaw, pitch, pass_fov, pass_tw, pass_th)
+
+            # Save every tile as PNG so we can see what the library sees
+            if debug_dir:
+                tile_u8 = _linear_to_u8_for_detection(tile_linear)
+                tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
+                cv2.putText(tile_bgr,
+                            f"{pass_label} yaw={yaw:.0f} pitch={pitch:.0f} fov={pass_fov:.0f}",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 1)
+                tile_fname = (f"sweep_{pass_label}_y{int(yaw):03d}_p{int(pitch):+03d}.jpg")
+                cv2.imwrite(os.path.join(debug_dir, tile_fname), tile_bgr)
+
+            det = _detect_in_tile(
+                tile_linear, map_uv, erp_linear,
+                yaw, pitch, debug_dir,
+                tile_idx=total_tiles + idx,
+                cc24_ref=cc24_ref)
+
+            if det is None or det.confidence < min_confidence:
+                continue
+
+            all_detections.append(det)
             if best is None or det.confidence > best.confidence:
                 best = det
+                print(f"[cc-erp]  [{pass_label}] tile {idx} "
+                      f"yaw={yaw:.0f}° pitch={pitch:.0f}°  "
+                      f"confidence={det.confidence:.3f}")
+
+        if best is not None and best.confidence > 0.6:
+            print(f"[cc-erp] Good detection found in {pass_label} pass "
+                  f"(conf={best.confidence:.3f}) — skipping remaining passes.")
+            break
 
     if best is None:
-        print("[cc-erp] No ColorChecker found after full sweep.")
-        return None, {"found": False, "tiles_searched": len(tiles)}
+        print(f"[cc-erp] No ColorChecker found after full sweep ({total_tiles} tiles).")
+        return None, {"found": False, "tiles_searched": total_tiles}
 
-    print(f"[cc-erp] Best coarse detection: tile yaw={best.tile_yaw:.0f}° "
+    print(f"[cc-erp] Best detection: tile yaw={best.tile_yaw:.0f}° "
           f"pitch={best.tile_pitch:.0f}° confidence={best.confidence:.3f}")
 
     # ── Targeted re-detection centred on the found checker ────────────────
@@ -750,7 +1040,7 @@ def find_colorchecker_in_erp(
     print(f"[cc-erp] Targeted re-detection at yaw={refine_yaw:.1f}° "
           f"pitch={refine_pitch:.1f}° (centred on checker)")
 
-    refine_fov = min(fov_deg * 1.4, 100.0)   # wider FOV, capped at 100°
+    refine_fov = 60.0   # tighter than coarse, looser than fine — centres on checker
     tile_r, map_uv_r = erp_to_rectilinear(
         erp_linear, refine_yaw, refine_pitch,
         refine_fov, tile_w, tile_h)
@@ -758,7 +1048,8 @@ def find_colorchecker_in_erp(
     det_refined = _detect_in_tile(
         tile_r, map_uv_r, erp_linear,
         refine_yaw, refine_pitch,
-        debug_dir, tile_idx=-1)   # tile_idx=-1 flags this as the refinement tile
+        debug_dir, tile_idx=-1,
+        cc24_ref=cc24_ref)   # tile_idx=-1 flags this as the refinement tile
 
     if det_refined is not None and det_refined.confidence >= best.confidence * 0.8:
         # Accept refined result if it's not significantly worse.
@@ -781,11 +1072,11 @@ def find_colorchecker_in_erp(
           f"φ={best.checker_normal_phi_deg:.1f}°")
 
     if debug_dir:
-        _save_final_debug(debug_dir, best, erp_linear)
+        _save_final_debug(debug_dir, best, erp_linear, cc24_ref=cc24_ref)
 
     info = {
         "found":                    True,
-        "tiles_searched":           len(tiles),
+        "tiles_searched":           total_tiles,
         "refinement_pass":          refined,
         "best_tile_yaw_deg":        best.tile_yaw,
         "best_tile_pitch_deg":      best.tile_pitch,
@@ -804,19 +1095,18 @@ def solve_color_matrix_from_swatches(
     measured_linear: np.ndarray,
     reference_linear: Optional[np.ndarray] = None,
     use_neutral_only: bool = False,
+    colorspace: str = "acescg",
 ) -> Tuple[np.ndarray, float]:
     """
     Solve a 3×3 colour correction matrix M such that measured @ M ≈ reference.
-    Operates in linear RGB space.  Least-squares over all 24 patches.
+    Operates in linear RGB. Least-squares over all 24 (or 6 neutral) patches.
 
-    use_neutral_only: if True, solve only on the 6 neutral patches (19–24).
-      Useful when the checker has been exposed to strongly coloured light —
-      the neutrals give a purer white-balance signal.
-
+    colorspace: used to select CC24 reference if reference_linear is None.
+    use_neutral_only: solve on neutral patches only (more stable under coloured light).
     Returns: (M 3×3, RMSE)
     """
     if reference_linear is None:
-        reference_linear = CC24_LINEAR_SRGB
+        reference_linear = get_cc24_reference(colorspace)
 
     if use_neutral_only:
         A = measured_linear[18:]    # patches 19–24
@@ -854,12 +1144,15 @@ def _save_tile_debug(debug_dir, tile_idx, tile_rgb, centres,
     cv2.imwrite(os.path.join(debug_dir, fname), vis)
 
 
-def _save_final_debug(debug_dir, det: 'CheckerDetection', erp_linear: np.ndarray):
+def _save_final_debug(debug_dir, det: 'CheckerDetection', erp_linear: np.ndarray,
+                      cc24_ref: Optional[np.ndarray] = None):
     """
     Save debug images:
-      cc_erp_swatches.jpg    — ERP panorama with green dots at detected swatch positions
-      cc_swatch_comparison.jpg — top row: measured HDR (tonemapped), bottom: CC24 reference
+      cc_erp_swatches.jpg      — ERP with green dots at detected swatch positions
+      cc_swatch_comparison.jpg — 3 rows: measured / reference / post-WB
     """
+    if cc24_ref is None:
+        cc24_ref = CC24_LINEAR_SRGB
     # ── ERP overlay ───────────────────────────────────────────────────────
     erp_u8_rgb = _linear_to_u8_for_detection(erp_linear)
     erp_u8_bgr = cv2.cvtColor(erp_u8_rgb, cv2.COLOR_RGB2BGR)
@@ -886,39 +1179,75 @@ def _save_final_debug(debug_dir, det: 'CheckerDetection', erp_linear: np.ndarray
     cv2.imwrite(os.path.join(debug_dir, "cc_erp_swatches.jpg"), vis)
 
     # ── Swatch comparison strip ───────────────────────────────────────────
-    # Top row    : measured HDR values (tonemapped for display)
-    # Bottom row : CC24 reference values (linearised, tonemapped for display)
+    # Row 1 (M): measured HDR values from library (tonemapped for display)
+    # Row 2 (R): CC24 reference values in working colorspace
+    # Row 3 (W): measured × WB scale (what the swatches look like after calibration)
     sw = 48
-    gap = 4
-    ref_linear = CC24_LINEAR   # (24,3) already linear
-    strip_lin = np.zeros((sw*2 + gap, sw*24, 3), dtype=np.float32)
+    gap = 2
+    n_rows = 3
+    strip_h = sw * n_rows + gap * (n_rows - 1)
+    ref_linear = cc24_ref   # (24,3) in working colorspace
+
+    # Compute WB scale from patch 22 for the third row.
+    # Use FULL per-channel scale (not G-normalised) so patch 22 W == R exactly.
+    # If W[22] != R[22] the reorder is wrong or the wrong patch is being used.
+    p22 = det.swatches_linear[21]
+    ref22 = cc24_ref[21]
+    wb_scale_full = (ref22 / np.clip(p22, 1e-8, None)).astype(np.float32)
+
+    strip_lin = np.zeros((strip_h, sw*24, 3), dtype=np.float32)
     for i in range(24):
-        # Measured: already linear HDR — just display-normalise each patch individually
-        meas_val = det.swatches_linear[i]                   # (3,) linear HDR
-        strip_lin[:sw, i*sw:(i+1)*sw] = meas_val            # solid colour fill
+        meas = det.swatches_linear[i]
+        row0 = 0
+        row1 = sw + gap
+        row2 = (sw + gap) * 2
+        strip_lin[row0:row0+sw, i*sw:(i+1)*sw] = meas                      # measured
+        strip_lin[row1:row1+sw, i*sw:(i+1)*sw] = ref_linear[i]             # reference
+        strip_lin[row2:row2+sw, i*sw:(i+1)*sw] = meas * wb_scale_full      # post-WB: patch22 W==R by construction
 
-        # Reference: linear CC24 values
-        strip_lin[sw+gap:, i*sw:(i+1)*sw] = ref_linear[i]
-
-    # Tonemap strip independently for display
-    strip_u8 = _linear_to_u8_for_detection(strip_lin)       # (H, W, 3) uint8 RGB
+    strip_u8 = _linear_to_u8_for_detection(strip_lin)
     strip_bgr = cv2.cvtColor(strip_u8, cv2.COLOR_RGB2BGR)
 
-    # Add patch number labels
+    # Labels
     for i in range(24):
-        cv2.putText(strip_bgr, str(i+1),
-                    (i*sw + 2, sw - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1)
-        cv2.putText(strip_bgr, "M", (i*sw + 2, 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 200, 200), 1)
-        cv2.putText(strip_bgr, "R", (i*sw + 2, sw + gap + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 200, 200), 1)
+        x = i * sw
+        cv2.putText(strip_bgr, str(i+1), (x+2, sw-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255,255,255), 1)
+        cv2.putText(strip_bgr, "M", (x+2, 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200,200,200), 1)
+        cv2.putText(strip_bgr, "R", (x+2, sw+gap+10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200,200,200), 1)
+        cv2.putText(strip_bgr, "W", (x+2, (sw+gap)*2+10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200,200,200), 1)
 
-    # Highlight patch 22 (18% grey WB reference) with a red border
+    # Red border on patch 22
     p22_x = 21 * sw
-    cv2.rectangle(strip_bgr, (p22_x, 0), (p22_x + sw - 1, sw*2 + gap - 1),
-                  (0, 0, 255), 2)
-    cv2.putText(strip_bgr, "#22 WB", (p22_x, sw*2 + gap - 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 255), 1)
+    cv2.rectangle(strip_bgr, (p22_x, 0), (p22_x+sw-1, strip_h-1), (0,0,255), 2)
+    cv2.putText(strip_bgr, "#22 WB", (p22_x, strip_h-2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0,0,255), 1)
 
     cv2.imwrite(os.path.join(debug_dir, "cc_swatch_comparison.jpg"), strip_bgr)
+
+    # ── Per-patch value printout ──────────────────────────────────────────
+    print(f"[cc-erp] ── Swatch values (linear, Reinhard-inverted from library) ──")
+    print(f"[cc-erp]   {'#':>3}  {'R':>8}  {'G':>8}  {'B':>8}  {'luma':>8}  note")
+    for i in range(24):
+        v = det.swatches_linear[i]
+        luma = 0.2126*v[0] + 0.7152*v[1] + 0.0722*v[2]
+        note = ""
+        if i == 21:
+            note = "  ← PATCH 22 (WB ref, should be achromatic)"
+        elif i >= 18:
+            note = "  ← neutral ramp"
+        print(f"[cc-erp]   {i+1:>3}  {v[0]:>8.5f}  {v[1]:>8.5f}  {v[2]:>8.5f}  {luma:>8.5f}{note}")
+
+    # ── WB multiplier from patch 22 ───────────────────────────────────────
+    p22 = det.swatches_linear[21]
+    ref22 = cc24_ref[21]
+    scale = ref22 / np.clip(p22, 1e-8, None)
+    scale_g_norm = scale / max(float(scale[1]), 1e-8)
+    print(f"[cc-erp] ── Patch 22 WB derivation ──")
+    print(f"[cc-erp]   measured linear  : R={p22[0]:.5f}  G={p22[1]:.5f}  B={p22[2]:.5f}")
+    print(f"[cc-erp]   reference linear : R={ref22[0]:.5f}  G={ref22[1]:.5f}  B={ref22[2]:.5f}")
+    print(f"[cc-erp]   scale (ref/meas) : R={scale[0]:.5f}  G={scale[1]:.5f}  B={scale[2]:.5f}")
+    print(f"[cc-erp]   G-normalised WB  : R={scale_g_norm[0]:.5f}  G={scale_g_norm[1]:.5f}  B={scale_g_norm[2]:.5f}")

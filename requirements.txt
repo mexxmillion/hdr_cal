@@ -1,0 +1,29 @@
+# hdri_cal — HDRI calibration pipeline for VFX / IBL compositing
+# Python 3.9+
+#
+# Core (required)
+numpy>=1.24
+opencv-python>=4.8
+imageio>=2.31
+scipy>=1.11
+
+# EXR I/O (required for .exr input/output)
+# Try pyexr first; if it fails to build, OpenEXR is the fallback
+pyexr>=0.4.0
+# OpenEXR>=3.1.0   # fallback if pyexr unavailable
+
+# ColorChecker detection (required for --colorchecker / --colorchecker-in-hdri)
+colour-science>=0.4.3
+colour-checker-detection>=0.1.5
+
+# ── Windows notes ──────────────────────────────────────────────────────────────
+# If pyexr fails to install on Windows, try:
+#   pip install openexr-python
+# or install via conda:
+#   conda install -c conda-forge openexr
+
+# ── Conda environment (recommended) ───────────────────────────────────────────
+# conda create -n hdri_cal python=3.11
+# conda activate hdri_cal
+# conda install -c conda-forge numpy opencv scipy imageio openexr
+# pip install pyexr colour-science colour-checker-detection

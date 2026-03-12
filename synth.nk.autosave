@@ -1,0 +1,797 @@
+#! C:/Program Files/Nuke13.2v2/nuke-13.2.2.dll -nx
+version 13.2 v2
+define_window_layout_xml {<?xml version="1.0" encoding="UTF-8"?>
+<layout version="1.0">
+    <window x="-1" y="-8" w="2560" h="1369" maximized="1" screen="0">
+        <splitter orientation="1">
+            <split size="40"/>
+            <dock id="" hideTitles="1" activePageId="Toolbar.1">
+                <page id="Toolbar.1"/>
+            </dock>
+            <split size="1897" stretch="1"/>
+            <splitter orientation="2">
+                <split size="779"/>
+                <dock id="" activePageId="Viewer.3">
+                    <page id="Viewer.1"/>
+                    <page id="Viewer.2"/>
+                    <page id="Viewer.3"/>
+                </dock>
+                <split size="548"/>
+                <dock id="" activePageId="DAG.1">
+                    <page id="DAG.1"/>
+                    <page id="Curve Editor.1"/>
+                    <page id="DopeSheet.1"/>
+                </dock>
+            </splitter>
+            <split size="615"/>
+            <dock id="" activePageId="Properties.1" focus="true">
+                <page id="Properties.1"/>
+                <page id="uk.co.thefoundry.backgroundrenderview.1"/>
+            </dock>
+        </splitter>
+    </window>
+</layout>
+}
+Root {
+ inputs 0
+ name W:/git/hdr_cal/synth.nk
+ format "2048 1556 0 0 2048 1556 1 2K_Super_35(full-ap)"
+ proxy_type scale
+ proxy_format "1024 778 0 0 1024 778 1 1K_Super_35(full-ap)"
+ colorManagement OCIO
+ defaultViewerLUT "OCIO LUTs"
+ workingSpaceLUT scene_linear
+ monitorLut ACES/sRGB
+ monitorOutLUT "sRGB (ACES)"
+ int8Lut matte_paint
+ int16Lut texture_paint
+ logLut compositing_log
+ floatLut scene_linear
+}
+Read {
+ inputs 0
+ file_type exr
+ file C:/Users/Maung/Downloads/charts/acescg_chart.exr
+ format "3583 2525 0 0 3583 2525 1 "
+ origset true
+ name Read6
+ xpos -635
+ ypos 152
+}
+Transform {
+ translate {-850 635}
+ rotate 40.22112656
+ scale 0.2469999939
+ center {1791.5 1262.5}
+ name Transform3
+ xpos -635
+ ypos 301
+}
+Grade {
+ multiply 1.12
+ name Grade19
+ xpos -635
+ ypos 325
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/charolettenbrunn_park_4k.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read4
+ xpos -290
+ ypos 62
+}
+Grade {
+ multiply 0.86
+ name Grade11
+ xpos -290
+ ypos 167
+}
+Grade {
+ multiply 0.36
+ name Grade12
+ xpos -285
+ ypos 191
+ disable true
+}
+Clamp {
+ maximum 9
+ name Clamp3
+ xpos -285
+ ypos 255
+}
+set N5776dfe0 [stack 0]
+SphericalTransform2 {
+ panTiltRollInput {0 90 0}
+ projTypeOutput Rectilinear
+ name SphericalTransform5
+ xpos -451
+ ypos 311
+}
+Merge2 {
+ inputs 2
+ name Merge5
+ xpos -554
+ ypos 397
+}
+SphericalTransform2 {
+ projTypeInput Rectilinear
+ panTiltRollOutput {0 90 0}
+ name SphericalTransform6
+ xpos -554
+ ypos 441
+}
+push $N5776dfe0
+Merge2 {
+ inputs 2
+ name Merge6
+ xpos -457
+ ypos 441
+}
+set N5776d820 [stack 0]
+Grade {
+ multiply {1.475000024 1 0.5250000358 1}
+ name Grade14
+ xpos -438
+ ypos 474
+}
+set N3a578040 [stack 0]
+Write {
+ file W:/git/hdr_cal/data/input_cloudy_red.exr
+ file_type exr
+ first_part rgba
+ version 13
+ name Write10
+ xpos -438
+ ypos 681
+}
+push $N3a578040
+Grade {
+ multiply {0.5749999881 1 1.424999952 1}
+ name Grade15
+ xpos -345
+ ypos 555
+}
+Write {
+ file W:/git/hdr_cal/data/input_cloudy_blue.exr
+ file_type exr
+ first_part rgba
+ version 14
+ name Write11
+ xpos -345
+ ypos 660
+}
+Read {
+ inputs 0
+ file_type exr
+ file C:/Users/Maung/Downloads/charts/acescg_chart.exr
+ format "3583 2525 0 0 3583 2525 1 "
+ origset true
+ name Read5
+ xpos -1329
+ ypos 76
+}
+Transform {
+ translate {-945 -350}
+ rotate -156.9649506
+ scale 0.2469999939
+ center {1791.5 1262.5}
+ name Transform2
+ xpos -1329
+ ypos 225
+}
+Grade {
+ multiply 1.2
+ name Grade18
+ xpos -1329
+ ypos 249
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/sunny_rose_garden_4k_clamped.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read2
+ xpos -969
+ ypos -11
+}
+Grade {
+ multiply 0.86
+ name Grade2
+ xpos -969
+ ypos 114
+}
+Grade {
+ multiply 0.36
+ name Grade3
+ xpos -964
+ ypos 138
+ disable true
+}
+Clamp {
+ maximum 9
+ name Clamp2
+ xpos -964
+ ypos 202
+}
+set N7ba61440 [stack 0]
+SphericalTransform2 {
+ panTiltRollInput {0 90 0}
+ projTypeOutput Rectilinear
+ name SphericalTransform3
+ xpos -1145
+ ypos 235
+}
+Merge2 {
+ inputs 2
+ name Merge3
+ xpos -1248
+ ypos 309
+}
+Grade {
+ channels alpha
+ add 1
+ name Grade16
+ xpos -1248
+ ypos 333
+}
+SphericalTransform2 {
+ projTypeInput Rectilinear
+ panTiltRollOutput {0 90 0}
+ name SphericalTransform4
+ xpos -1248
+ ypos 365
+}
+push $N7ba61440
+Merge2 {
+ inputs 2
+ name Merge4
+ xpos -1136
+ ypos 388
+}
+set N7ba61820 [stack 0]
+Grade {
+ multiply {0.7249999642 1 1.274999976 1}
+ name Grade10
+ xpos -1024
+ ypos 501
+}
+Write {
+ file W:/git/hdr_cal/data/input_high_blue.exr
+ file_type exr
+ first_part rgba
+ version 16
+ name Write5
+ xpos -1024
+ ypos 683
+}
+push $N5776d820
+Grade {
+ multiply 0.2
+ name Grade13
+ xpos -497
+ ypos 564
+}
+Write {
+ file W:/git/hdr_cal/data/input_cloudy_dark.exr
+ file_type exr
+ first_part rgba
+ version 15
+ name Write9
+ xpos -535
+ ypos 709
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/sunny_rose_garden_4k_clamped.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read8
+ xpos -748
+ ypos -33
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/out_high_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 1
+ name Read7
+ xpos -3430
+ ypos 360
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/out_low_red_sphere.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 2
+ name Read11
+ xpos -3295
+ ypos 450
+}
+Viewer {
+ frame_range 1-100
+ colour_sample_bbox {-0.2944335938 -0.4279785156 0.1640625 -0.2282714844}
+ viewerProcess "sRGB (ACES)"
+ name Viewer1
+ xpos -1527
+ ypos 149
+}
+Read {
+ inputs 0
+ file_type exr
+ file C:/Users/Maung/Downloads/charts/acescg_chart.exr
+ format "3583 2525 0 0 3583 2525 1 "
+ origset true
+ name Read3
+ xpos -2004
+ ypos 135
+}
+Grade {
+ multiply 0.76
+ name Grade17
+ xpos -2004
+ ypos 227
+}
+Transform {
+ translate {1615 -545}
+ rotate -113.262207
+ scale 0.2469999939
+ center {1791.5 1262.5}
+ name Transform1
+ xpos -2004
+ ypos 282
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/autumn_hilly_field_4k.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ colorspace "Utility - Linear - Rec.709"
+ name Read1
+ xpos -1659
+ ypos 45
+}
+Grade {
+ multiply 1.58
+ name Grade9
+ xpos -1659
+ ypos 150
+ disable true
+}
+Grade {
+ multiply 0.36
+ name Grade1
+ xpos -1654
+ ypos 174
+ disable true
+}
+Clamp {
+ maximum 9
+ name Clamp1
+ xpos -1654
+ ypos 238
+}
+set N3a38da60 [stack 0]
+SphericalTransform2 {
+ panTiltRollInput {0 90 0}
+ projTypeOutput Rectilinear
+ name SphericalTransform1
+ xpos -1820
+ ypos 292
+}
+Merge2 {
+ inputs 2
+ name Merge1
+ xpos -1923
+ ypos 380
+}
+SphericalTransform2 {
+ projTypeInput Rectilinear
+ panTiltRollOutput {0 90 0}
+ name SphericalTransform2
+ xpos -1923
+ ypos 424
+}
+push $N3a38da60
+Merge2 {
+ inputs 2
+ name Merge2
+ xpos -1826
+ ypos 424
+}
+set N35d1d6c0 [stack 0]
+Write {
+ file W:/git/hdr_cal/data/input_low_neutral.exr
+ file_type exr
+ first_part rgba
+ version 18
+ name Write6
+ xpos -1999
+ ypos 646
+}
+push $N5776d820
+Write {
+ file W:/git/hdr_cal/data/input_cloudy_neutral.exr
+ file_type exr
+ first_part rgba
+ version 15
+ name Write12
+ xpos -630
+ ypos 663
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/out_low_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 5
+ name Read9
+ xpos -3294
+ ypos 358
+}
+push $N35d1d6c0
+Grade {
+ multiply 0.2
+ name Grade8
+ xpos -1866
+ ypos 547
+}
+Write {
+ file W:/git/hdr_cal/data/input_low_dark.exr
+ file_type exr
+ first_part rgba
+ version 18
+ name Write7
+ xpos -1887
+ ypos 690
+}
+push $N7ba61820
+Write {
+ file W:/git/hdr_cal/data/input_high_neutral.exr
+ file_type exr
+ first_part rgba
+ version 16
+ name Write8
+ xpos -1304
+ ypos 703
+}
+push $N7ba61820
+Grade {
+ multiply 0.2
+ name Grade5
+ xpos -1176
+ ypos 511
+}
+Write {
+ file W:/git/hdr_cal/data/input_high_dark.exr
+ file_type exr
+ first_part rgba
+ version 17
+ name Write1
+ xpos -1204
+ ypos 708
+}
+push $N35d1d6c0
+Grade {
+ multiply {1.120000005 1 0.8799999952 1}
+ name Grade4
+ xpos -1807
+ ypos 457
+}
+set N14b110b0 [stack 0]
+Grade {
+ multiply {0.5749999881 1 1.424999952 1}
+ name Grade6
+ xpos -1714
+ ypos 538
+}
+Write {
+ file W:/git/hdr_cal/data/input_low_blue.exr
+ file_type exr
+ first_part rgba
+ version 17
+ name Write4
+ xpos -1714
+ ypos 684
+}
+push $N3a38da60
+Write {
+ file W:/git/hdr_cal/data/autumn_hilly_field_4k._clamped.exr
+ file_type exr
+ first_part rgba
+ version 18
+ name Write13
+ xpos -1559
+ ypos 333
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/out_low_red_new.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 7
+ name Read14
+ xpos -1535
+ ypos 503
+}
+Viewer {
+ frame_range 1-100
+ colour_sample_bbox {0.4560546875 -0.306640625 0.4638671875 -0.3017578125}
+ viewerProcess "sRGB (ACES)"
+ name Viewer2
+ xpos -837
+ ypos 113
+}
+Read {
+ inputs 0
+ file_type exr
+ file C:/Users/Maung/Downloads/charts/acescg_chart.exr
+ format "3583 2525 0 0 3583 2525 1 "
+ origset true
+ name Read15
+ xpos -2617
+ ypos 145
+}
+Grade {
+ multiply 0.59
+ name Grade20
+ xpos -2617
+ ypos 237
+}
+Transform {
+ translate {-952 88}
+ rotate -113.262207
+ scale 0.2469999939
+ center {1791.5 1262.5}
+ name Transform4
+ xpos -2617
+ ypos 292
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/red_church_4k.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ colorspace "Utility - Linear - Rec.709"
+ name Read16
+ xpos -2272
+ ypos 55
+}
+Grade {
+ multiply 1.58
+ name Grade21
+ xpos -2272
+ ypos 160
+ disable true
+}
+Grade {
+ multiply 0.36
+ name Grade22
+ xpos -2267
+ ypos 184
+ disable true
+}
+Clamp {
+ maximum 9
+ name Clamp4
+ xpos -2267
+ ypos 248
+}
+set Nb1e1a0d0 [stack 0]
+SphericalTransform2 {
+ panTiltRollInput {0 90 0}
+ projTypeOutput Rectilinear
+ name SphericalTransform7
+ xpos -2433
+ ypos 302
+}
+Merge2 {
+ inputs 2
+ name Merge7
+ xpos -2536
+ ypos 390
+}
+SphericalTransform2 {
+ projTypeInput Rectilinear
+ panTiltRollOutput {0 90 0}
+ name SphericalTransform8
+ xpos -2536
+ ypos 434
+}
+push $Nb1e1a0d0
+Merge2 {
+ inputs 2
+ name Merge8
+ xpos -2439
+ ypos 434
+}
+set Nb1e1b050 [stack 0]
+Write {
+ file W:/git/hdr_cal/data/input_church_neutral.exr
+ file_type exr
+ first_part rgba
+ version 20
+ name Write14
+ xpos -2612
+ ypos 656
+}
+push $Nb1e1b050
+Grade {
+ multiply 0.2
+ name Grade23
+ xpos -2479
+ ypos 557
+}
+Write {
+ file W:/git/hdr_cal/data/input_church_dark.exr
+ file_type exr
+ first_part rgba
+ version 20
+ name Write15
+ xpos -2500
+ ypos 699
+}
+push $Nb1e1b050
+Grade {
+ multiply {0.5749999881 1 1.424999952 1}
+ name Grade25
+ xpos -2327
+ ypos 548
+}
+Write {
+ file W:/git/hdr_cal/data/input_church_blue.exr
+ file_type exr
+ first_part rgba
+ version 19
+ name Write16
+ xpos -2327
+ ypos 694
+}
+push $Nb1e1a0d0
+Write {
+ file W:/git/hdr_cal/data/autumn_hilly_field_4k._clamped.exr
+ file_type exr
+ first_part rgba
+ version 18
+ name Write17
+ xpos -2175
+ ypos 432
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/out_low_red_new.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ proxy W:/git/hdr_cal/out/out_low_red_new.exr
+ proxy_format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 10
+ name Read12
+ xpos -3027
+ ypos 343
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/data/out_cloudy_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read10
+ xpos -3174
+ ypos 358
+}
+push $N14b110b0
+Write {
+ file W:/git/hdr_cal/data/input_low_red.exr
+ file_type exr
+ first_part rgba
+ version 17
+ name Write2
+ xpos -1807
+ ypos 664
+}
+push $N7ba61820
+Grade {
+ multiply {1.245000124 0.960000217 0.7950001359 1}
+ name Grade7
+ xpos -1125
+ ypos 429
+}
+Write {
+ file W:/git/hdr_cal/data/input_high_red.exr
+ file_type exr
+ first_part rgba
+ version 15
+ name Write3
+ xpos -1117
+ ypos 697
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/high_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read13
+ xpos -1560
+ ypos 679
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/churh_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read17
+ xpos -2839
+ ypos 602
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/church_red_chartwb_sphereexp.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 3
+ name Read22
+ xpos -2863
+ ypos 391
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/out/churh_red.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ name Read19
+ xpos -2824
+ ypos 475
+}
+push $Nb1e1b050
+Grade {
+ multiply {1.120000005 1 0.8799999952 1}
+ name Grade24
+ xpos -2420
+ ypos 483
+}
+Write {
+ file W:/git/hdr_cal/data/input_church_red.exr
+ file_type exr
+ first_part rgba
+ version 21
+ name Write18
+ xpos -2420
+ ypos 674
+}
+Read {
+ inputs 0
+ file_type exr
+ file W:/git/hdr_cal/debug_hdri/base_dome_calibrated.exr
+ format "4096 2048 0 0 4096 2048 1 4K_LatLong"
+ origset true
+ version 7
+ name Read18
+ xpos -2765
+ ypos 420
+}
+Viewer {
+ frame_range 1-100
+ colour_sample_bbox {0.4877929688 -0.3032226563 0.4965820313 -0.2978515625}
+ viewerProcess "sRGB (ACES)"
+ name Viewer3
+ selected true
+ xpos -158
+ ypos 166
+}

@@ -1,15 +1,21 @@
 {
-  "input": "w:\\git\\hdr_cal\\input_chart_red.exr",
+  "input": "./data/input_church_red.exr",
   "args": {
-    "input": "w:\\git\\hdr_cal\\input_chart_red.exr",
-    "out": "out_chart_red.exr",
+    "input": "./data/input_church_red.exr",
+    "out": "./out/churh_red.exr",
     "debug_dir": "debug_hdri",
     "res": "full",
+    "colorspace": null,
+    "wb_source": "auto",
+    "exposure_source": "auto",
+    "exposure_scale": null,
+    "sphere_target": "irradiance",
     "kelvin": null,
     "rgb_scale": null,
     "wb_swatch": null,
     "dome_wb": null,
-    "sphere_wb": true,
+    "sphere_wb": false,
+    "chart_facing": "auto",
     "metering_mode": "bottom_dome",
     "meter_stat": "median",
     "meter_target": 0.18,
@@ -17,6 +23,8 @@
     "swatch_size": 5,
     "sun_threshold": 0.1,
     "sun_upper_only": false,
+    "sun_gain_ceiling": 2000.0,
+    "sun_gain_rolloff": 500.0,
     "sun_blur_px": 0,
     "center_hdri": true,
     "center_elevation": false,
@@ -24,6 +32,7 @@
     "sphere_res": 96,
     "sphere_solve": "energy_conservation",
     "lobe_neutralise": 1.0,
+    "solve_target": "auto",
     "direct_highlight_target": 0.32,
     "target_peak_ratio": 2.5,
     "ref_sphere": null,
@@ -32,90 +41,97 @@
     "ref_sphere_r": null,
     "ref_sphere_albedo": 0.18,
     "colorchecker": null,
-    "colorchecker_in_hdri": true,
-    "cc_fov": 70.0,
-    "cc_tile_w": 900,
-    "cc_tile_h": 675,
-    "cc_yaw_step": 40.0,
-    "cc_pitches": [
-      -45.0,
-      -20.0,
-      0.0,
-      20.0,
-      45.0
-    ]
+    "colorchecker_in_hdri": false,
+    "validate_only": false
   },
+  "colorspace": "acescg",
   "is_hdr_input": true,
   "working_resolution": [
     2048,
     4096
   ],
-  "orientation_energy_ratio": 3.609455624724469,
+  "orientation_energy_ratio": 2.5581795029100447,
   "white_balance": {
-    "source": "colorchecker_patch19",
+    "source": "colorchecker_patch22",
+    "wb_src_resolved": "chart",
+    "exp_src_resolved": "chart",
+    "chart_use_wb": true,
+    "chart_use_exp": true,
     "wb_scale": [
-      0.6795814037322998,
+      0.8951627016067505,
       1.0,
-      1.9130916595458984
+      1.1411070823669434
     ],
     "dome_wb_mode": null,
     "sphere_wb": false,
     "wb_info": {},
     "sphere_cross_check": {
       "sphere_implied_scale": [
-        0.7693732380867004,
-        0.9934598207473755,
-        1.7438886165618896
+        0.9522581696510315,
+        1.0171136856079102,
+        0.9710549116134644
       ],
       "chart_scale": [
-        0.6795814037322998,
+        0.8951627016067505,
         1.0,
-        1.9130916595458984
+        1.1411070823669434
       ],
-      "max_channel_diff": 0.1692030429840088,
+      "max_channel_diff": 0.170052170753479,
       "status": "LARGE_DISAGREEMENT"
+    },
+    "wb_blend": {
+      "applied": false,
+      "blend_t": 0.0,
+      "method": "chart_only_explicit",
+      "reason": "chart confidence 0.837 >= 0.5"
     },
     "sphere_check": {
       "mean_rgb": [
-        0.07623020559549332,
-        0.08687055110931396,
-        0.09467601776123047
+        0.05824128910899162,
+        0.06091355159878731,
+        0.07280576229095459
       ],
-      "chroma_rg": -0.010640345513820648,
-      "chroma_bg": 0.007805466651916504
+      "chroma_rg": -0.002672262489795685,
+      "chroma_bg": 0.011892210692167282
     }
   },
   "metering": {
-    "mode": "bottom_dome",
-    "stat": "median",
-    "meter_value": 0.17823727428913116,
-    "pixel_count": 4194304,
-    "weighted_mean": 0.1767684817314148
+    "mode": "colorchecker_patch22_pose_aware",
+    "pose_mode": "hdri_internal_classic",
+    "chart_facing_override": "auto",
+    "E_on_chart": 3.141592653589793,
+    "E_upper": 1.162038803100586,
+    "predicted_patch22_luma": 0.18,
+    "measured_patch22_luma": 0.11254984140396118,
+    "classic_exposure_scale": 1.5992914583855193,
+    "target": 0.18,
+    "exposure_scale": 1.5992914583855193,
+    "note": "Chart inside HDRI \u2014 classic formula (albedo / patch22_luma). Assumed clean."
   },
-  "exposure_scale": 1.009889770351904,
+  "exposure_scale": 1.5992914583855193,
   "hot_lobe": {
     "center_dir": [
-      0.532296895980835,
-      0.752814531326294,
-      0.38720837235450745
+      0.7750902771949768,
+      0.2932124435901642,
+      0.5596977472305298
     ],
     "center_uv": [
-      0.6000923372731444,
-      0.22869571049980705
+      0.5995369338467265,
+      0.40527567669088727
     ],
-    "theta_deg": 41.16522788996527,
-    "phi_deg": 36.03324141833196,
-    "hottest": 10.10720157623291,
-    "low": 9.096481418609619,
-    "high": 10.10720157623291,
-    "mask_pixel_count_soft": 1264,
-    "mask_pixel_count_strong": 1206
+    "theta_deg": 72.94962180435971,
+    "phi_deg": 35.833296184821535,
+    "hottest": 14.405538558959961,
+    "low": 12.964984703063966,
+    "high": 14.405538558959961,
+    "mask_pixel_count_soft": 2625,
+    "mask_pixel_count_strong": 2436
   },
   "hdri_centering": {
-    "col_shift_px": 3686,
+    "col_shift_px": 3688,
     "row_shift_px": 0,
-    "original_phi_deg": 36.03324141833196,
-    "original_theta_deg": 41.16522788996527,
+    "original_phi_deg": 35.833296184821535,
+    "original_theta_deg": 72.94962180435971,
     "center_elevation": false,
     "applied": true
   },
@@ -124,35 +140,35 @@
     "sphere_res": 96,
     "sphere_solve": "energy_conservation",
     "gray_ball_pre_solve": {
-      "mean": 0.07503501325845718,
-      "median": 0.06951070576906204,
-      "p95": 0.12683697044849396,
-      "max": 0.14332249760627747
+      "mean": 0.07800350338220596,
+      "median": 0.06743936240673065,
+      "p95": 0.13802579045295715,
+      "max": 0.15728707611560822
     },
-    "sun_gain_mean": 200.0,
+    "sun_gain_mean": 48.79014205932617,
     "sun_gains_per_channel": [
-      200.0,
-      200.0,
-      200.0
+      66.29559326171875,
+      57.14929962158203,
+      22.92552947998047
     ],
     "gray_ball_post_solve": {
-      "mean": 0.12054771184921265,
-      "median": 0.07242181152105331,
-      "p95": 0.2990495264530182,
-      "max": 0.35659244656562805
+      "mean": 0.13121913373470306,
+      "median": 0.07362109422683716,
+      "p95": 0.33846530318260193,
+      "max": 0.40545323491096497
     },
-    "peak_ratio": 2.4807565557700912,
+    "peak_ratio": 0.0,
     "verify_pre_wb_mean_rgb": [
-      0.06771141290664673,
-      0.07653011381626129,
-      0.0817907303571701
+      0.07630860805511475,
+      0.07718130201101303,
+      0.09113873541355133
     ],
     "verify_final_mean_rgb": [
-      0.11323828995227814,
-      0.12203987687826157,
-      0.1272914558649063
+      0.13879622519016266,
+      0.13089588284492493,
+      0.11210919171571732
     ],
-    "verify_final_neutral": true
+    "verify_final_neutral": false
   },
   "ref_sphere_calibration": {
     "applied": false
@@ -162,157 +178,219 @@
     "source": "__hdri__",
     "wb_from_neutral5_grey": true,
     "wb_scale": [
-      0.6795814037322998,
+      0.8951627016067505,
       1.0,
-      1.9130916595458984
+      1.1411070823669434
     ],
     "patch_diagnostics": {
       "patch_index": 21,
       "patch_name": "Neutral 5 (~18% grey)",
       "measured_linear_rgb": [
-        0.28075745701789856,
-        0.19079753756523132,
-        0.09973256289958954
+        0.12573115527629852,
+        0.11254984140396118,
+        0.09863214939832687
       ],
       "reference_linear_rgb": [
-        0.02954654023051262,
-        0.02954654023051262,
-        0.02954654023051262
+        0.1881999969482422,
+        0.1881999969482422,
+        0.1881999969482422
       ],
-      "measured_luma": 0.20334811508655548,
-      "reference_luma": 0.02954653836786747,
-      "exposure_ratio": 6.88229912265124,
-      "chroma_rg": 0.4423936605453491,
-      "chroma_bg": -0.4478279948234558,
-      "chroma_error": 0.6294934978522898,
-      "confidence": 0.0
+      "measured_luma": 0.11434733122587204,
+      "reference_luma": 0.1881999969482422,
+      "exposure_ratio": 0.6075841290120704,
+      "chroma_rg": 0.11527431011199951,
+      "chroma_bg": -0.12171423435211182,
+      "chroma_error": 0.1676380667262607,
+      "confidence": 0.42520140883481095
     },
     "pose": {
-      "checker_normal_theta_deg": 92.07553100585938,
-      "checker_normal_phi_deg": 27.788667678833008,
+      "checker_normal_theta_deg": 177.71807861328125,
+      "checker_normal_phi_deg": 179.67807006835938,
       "checker_normal_world": [
-        0.4659058451652527,
-        -0.036216989159584045,
-        0.8840928077697754
+        0.00022370574879460037,
+        -0.9992070198059082,
+        -0.039815403521060944
       ],
       "refinement_pass": false
     },
-    "detection_confidence": 0.6445001661777496,
-    "tiles_searched": 45,
+    "detection_confidence": 0.837177898734808,
+    "tiles_searched": 6,
     "detection": {
       "found": true,
-      "tiles_searched": 45,
+      "tiles_searched": 6,
       "refinement_pass": false,
-      "best_tile_yaw_deg": 240.0,
-      "best_tile_pitch_deg": 45.0,
-      "confidence": 0.6445001661777496,
+      "best_tile_yaw_deg": 0.0,
+      "best_tile_pitch_deg": 90.0,
+      "confidence": 0.837177898734808,
       "checker_normal_world": [
-        0.4659058451652527,
-        -0.036216989159584045,
-        0.8840928077697754
+        0.00022370574879460037,
+        -0.9992070198059082,
+        -0.039815403521060944
       ],
-      "checker_normal_theta_deg": 92.07553100585938,
-      "checker_normal_phi_deg": 27.788667678833008,
+      "checker_normal_theta_deg": 177.71807861328125,
+      "checker_normal_phi_deg": 179.67807006835938,
       "swatch_centres_uv": [
         [
-          0.11660581827163696,
-          0.8296287059783936
+          0.2264079600572586,
+          0.830858588218689
         ],
         [
-          0.12949061393737793,
-          0.8410296440124512
+          0.2032351940870285,
+          0.8157011866569519
         ],
         [
-          0.14402325451374054,
-          0.8513854742050171
+          0.18459324538707733,
+          0.7990622520446777
         ],
         [
-          0.16025084257125854,
-          0.8604434728622437
+          0.1696544587612152,
+          0.7820267081260681
         ],
         [
-          0.17809204757213593,
-          0.867964506149292
+          0.1576126664876938,
+          0.7653133273124695
         ],
         [
-          0.19729065895080566,
-          0.8737488985061646
+          0.14780430495738983,
+          0.7493523359298706
         ],
         [
-          0.1442621499300003,
-          0.8095220923423767
+          0.2066313624382019,
+          0.8541764616966248
         ],
         [
-          0.1575581282377243,
-          0.8192055821418762
+          0.1822756826877594,
+          0.8350793123245239
         ],
         [
-          0.17197278141975403,
-          0.827715277671814
+          0.16400080919265747,
+          0.8149157762527466
         ],
         [
-          0.18738870322704315,
-          0.8348744511604309
+          0.1501203328371048,
+          0.794917106628418
         ],
         [
-          0.20359838008880615,
-          0.8405479788780212
+          0.13937066495418549,
+          0.7757868766784668
         ],
         [
-          0.2203086018562317,
-          0.8446581363677979
+          0.1308717429637909,
+          0.7578833699226379
         ],
         [
-          0.16777020692825317,
-          0.7845922708511353
+          0.17814216017723083,
+          0.8762948513031006
         ],
         [
-          0.18060758709907532,
-          0.7926902174949646
+          0.1547633856534958,
+          0.8525597453117371
         ],
         [
-          0.19409507513046265,
-          0.7996430397033691
+          0.1387304663658142,
+          0.8286757469177246
         ],
         [
-          0.2080771028995514,
-          0.8053491115570068
+          0.1272658407688141,
+          0.8057819604873657
         ],
         [
-          0.22235676646232605,
-          0.809751570224762
+          0.11874199658632278,
+          0.7844173312187195
         ],
         [
-          0.23670990765094757,
-          0.8128437399864197
+          0.11219046264886856,
+          0.764788806438446
         ],
         [
-          0.18719720840454102,
-          0.7563879489898682
+          0.1371583640575409,
+          0.8942522406578064
         ],
         [
-          0.19914484024047852,
-          0.7631937861442566
+          0.1196286678314209,
+          0.8658943772315979
         ],
         [
-          0.21141667664051056,
-          0.7689791321754456
+          0.10872256755828857,
+          0.8387545347213745
         ],
         [
-          0.22387589514255524,
-          0.7736941576004028
+          0.10134649276733398,
+          0.8135216236114502
         ],
         [
-          0.23637233674526215,
-          0.7773263454437256
+          0.09604623913764954,
+          0.7904422283172607
         ],
         [
-          0.24875345826148987,
-          0.7798991799354553
+          0.09206175804138184,
+          0.7695352435112
         ]
       ]
     },
     "note": "WB derived from CC24 patch #22 (Neutral 5, ~18% grey). No 3\u00d73 matrix."
+  },
+  "energy_validation": {
+    "E_upper": 3.1415927410125732,
+    "E_lower": 0.7647802829742432,
+    "E_sun": 7.081393718719482,
+    "E_full": 9.916918754577637,
+    "E_upper_rgb": [
+      3.1415834426879883,
+      3.141594171524048,
+      3.1416051387786865
+    ],
+    "E_lower_rgb": [
+      0.8364499807357788,
+      0.7579251527786255,
+      0.621647834777832
+    ],
+    "E_sun_rgb": [
+      7.622112274169922,
+      7.1261210441589355,
+      5.046138286590576
+    ],
+    "E_upper_chroma_norm": [
+      0.9999965564270811,
+      0.9999999715199187,
+      1.0000034625037084
+    ],
+    "E_sun_chroma_norm": [
+      1.1551938724930804,
+      1.0800223177967943,
+      0.7647838051633785
+    ],
+    "E_upper_over_pi": 1.0000000278275352,
+    "E_sun_over_pi": 2.2540776286282087,
+    "pred_card_facing_up": 0.18000000500895635,
+    "pred_card_facing_down": 0.043818682469244946,
+    "pred_card_facing_sun": 0.4057339731530776,
+    "pred_card_rgb_facing_up": [
+      0.17999947225420107,
+      0.18000008697122635,
+      0.18000071534863002
+    ],
+    "pred_card_rgb_facing_sun": [
+      0.43671486428479833,
+      0.40829666012966637,
+      0.2891224266610167
+    ],
+    "pred_sphere_full": 0.17578678607940673,
+    "pred_sphere_upper_only": 0.1413716733455658,
+    "pred_sphere_sun_facing": 0.3186627173423767,
+    "rendered_sphere_mean": 0.1272671769062678,
+    "rendered_sphere_rgb": [
+      0.13879628479480743,
+      0.13089591264724731,
+      0.11210933327674866
+    ],
+    "rendered_vs_analytical_err": 0.27601395699379816,
+    "sun_lobe_solid_angle_sr": 0.0054805395193398,
+    "sun_compression_estimate": 2998.9100249123057,
+    "chroma_imbalance_upper": 3.462503708417941e-06,
+    "chroma_imbalance_sun": 0.23521619483662148,
+    "solve_target_mode": "upper_hemi",
+    "albedo": 0.18
   },
   "notes": [
     "Pipeline: load \u2192 WB \u2192 meter \u2192 expose \u2192 hot-lobe \u2192 [centre] \u2192 split-render \u2192 sun-gain \u2192 [sphere-cal] \u2192 [CC-correct] \u2192 save.",
