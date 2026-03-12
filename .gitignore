@@ -1,0 +1,9 @@
+*.exr 
+*.exr
+*.hdr
+*.exr
+*.png
+outputs/
+__pycache__/
+.venv/
+*.exr 
