@@ -338,17 +338,22 @@ class CheckerDetection:
 
 
 def _linear_to_u8_for_detection(img_linear: np.ndarray) -> np.ndarray:
-    """Convert linear float HDR tile to uint8 sRGB for the detector."""
-    # Tonemap: exposure-normalise to a sensible display range
-    lum = 0.2126*img_linear[...,0] + 0.7152*img_linear[...,1] + 0.0722*img_linear[...,2]
+    """Convert linear ACEScg HDR to uint8 sRGB for detection/debug display."""
+    img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
+    if apply_matrix_3x3 is not None and M_ACESCG_TO_SRGB_LINEAR is not None:
+        img_disp = np.clip(apply_matrix_3x3(img_linear, M_ACESCG_TO_SRGB_LINEAR), 0.0, None)
+    else:
+        img_disp = img_linear
+    lum = 0.2126 * img_disp[..., 0] + 0.7152 * img_disp[..., 1] + 0.0722 * img_disp[..., 2]
     valid = lum[lum > 0]
     if valid.size:
         scale = 1.0 / max(float(np.percentile(valid, 99)), 1e-6)
     else:
         scale = 1.0
-    srgb = np.where(img_linear*scale <= 0.0031308,
-                    img_linear*scale * 12.92,
-                    1.055 * np.power(np.clip(img_linear*scale, 1e-9, None), 1/2.4) - 0.055)
+    disp = np.clip(img_disp * scale, 0.0, None)
+    srgb = np.where(disp <= 0.0031308,
+                    disp * 12.92,
+                    1.055 * np.power(np.clip(disp, 1e-9, None), 1 / 2.4) - 0.055)
     return np.clip(srgb * 255 + 0.5, 0, 255).astype(np.uint8)
 
 

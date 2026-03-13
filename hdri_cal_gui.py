@@ -522,9 +522,18 @@ class SettingsPanel(QScrollArea):
         self.center_hdri = QCheckBox("Centre HDRI on sun")
         self.center_hdri.setChecked(True)
         self.center_hdri.setToolTip("Shift azimuth so the sun sits at the centre column (φ=0)")
+        self.input_colorspace = QComboBox()
+        self.input_colorspace.addItems(["auto", "acescg", "srgb"])
+        self.input_colorspace.setToolTip(
+            "Input primaries of the source image.\n"
+            "auto   - EXR/HDR defaults to ACEScg, JPG/PNG to sRGB\n"
+            "acescg - treat input as linear ACEScg\n"
+            "srgb   - treat input as linear sRGB and convert to ACEScg before processing"
+        )
 
         f.addRow("WB source",       self.wb_source)
         f.addRow("Exposure source", self.exp_source)
+        f.addRow("Input primaries", self.input_colorspace)
         f.addRow("",                self.center_hdri)
         self._lay.addWidget(grp)
 
@@ -596,7 +605,6 @@ class SettingsPanel(QScrollArea):
         grp = QGroupBox("Misc"); f = QFormLayout(grp)
         self.center_elevation = QCheckBox("Centre elevation too")
         self.center_elevation.setToolTip("Also shift vertically so sun sits on horizon")
-        self.colorspace = QComboBox(); self.colorspace.addItems(["auto","acescg","srgb"])
         self.sphere_res = QSpinBox()
         self.sphere_res.setRange(32,256); self.sphere_res.setValue(96); self.sphere_res.setSingleStep(16)
         self.sphere_res.setToolTip("Validation sphere render resolution in pixels")
@@ -605,7 +613,6 @@ class SettingsPanel(QScrollArea):
         btn_sp.clicked.connect(lambda: self._browse(self.ref_sphere, "Sphere plate (*.jpg *.jpeg *.png)"))
         row_sp = QHBoxLayout(); row_sp.addWidget(self.ref_sphere); row_sp.addWidget(btn_sp)
         f.addRow("",           self.center_elevation)
-        f.addRow("Colorspace", self.colorspace)
         f.addRow("Sphere res", self.sphere_res)
         f.addRow("Ref sphere", row_sp)
         self._adv_groups.append(grp)
@@ -658,7 +665,7 @@ class SettingsPanel(QScrollArea):
 
         # Advanced — Misc
         cfg.center_elevation = self.center_elevation.isChecked()
-        cs = self.colorspace.currentText()
+        cs = self.input_colorspace.currentText()
         cfg.colorspace = None if cs == "auto" else cs
         cfg.sphere_res = self.sphere_res.value()
         ref = self.ref_sphere.text().strip()

@@ -75,16 +75,24 @@ def linear_to_srgb(x):
     x = np.clip(x, 0.0, None)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
 
+def _to_display_srgb_linear(img_linear, source_colorspace="acescg"):
+    """Convert a linear working image into linear sRGB for display."""
+    img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
+    cs = (source_colorspace or "acescg").lower().replace("-", "").replace("_", "")
+    if cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_ACESCG_TO_SRGB_LINEAR is not None:
+        return np.clip(apply_matrix_3x3(img_linear, M_ACESCG_TO_SRGB_LINEAR), 0.0, None)
+    return img_linear
+
 def luminance(rgb):
     return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
 
-def load_image_any(path, target_colorspace="acescg"):
+def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
     """
     Load any image to float32 linear RGB in the requested colorspace.
 
-    EXR / HDR inputs are assumed to already be in target_colorspace (no conversion).
-    LDR inputs (JPG/PNG) are linearised from sRGB and, if target_colorspace is
-    'acescg', converted to ACEScg via the sRGB→ACEScg matrix.
+    `input_colorspace` describes the source primaries for already-linear HDR data.
+    The pipeline now processes internally in ACEScg, so linear sRGB HDR inputs are
+    converted up front when requested.
     """
     ext = os.path.splitext(path)[1].lower()
     log(f"Loading: {path}")
@@ -96,13 +104,27 @@ def load_image_any(path, target_colorspace="acescg"):
             img = np.stack([img]*3, axis=-1)
         if img.shape[-1] > 3:
             img = img[..., :3]
-        log(f"Loaded EXR — assumed {target_colorspace} (no conversion)")
+        src_cs = (input_colorspace or target_colorspace or "acescg").lower().replace("-", "").replace("_", "")
+        dst_cs = (target_colorspace or src_cs).lower().replace("-", "").replace("_", "")
+        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
+            img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+            img = np.clip(img, 0.0, None)
+            log("Loaded EXR — interpreted as linear sRGB and converted to ACEScg")
+        else:
+            log(f"Loaded EXR — interpreted as {input_colorspace or target_colorspace or 'acescg'}")
         return img, True
     if ext == ".hdr":
         img = imageio.imread(path).astype(np.float32)
         if img.shape[-1] > 3:
             img = img[..., :3]
-        log(f"Loaded .hdr (linear Radiance) — assumed {target_colorspace}")
+        src_cs = (input_colorspace or target_colorspace or "acescg").lower().replace("-", "").replace("_", "")
+        dst_cs = (target_colorspace or src_cs).lower().replace("-", "").replace("_", "")
+        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
+            img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+            img = np.clip(img, 0.0, None)
+            log("Loaded .hdr — interpreted as linear sRGB and converted to ACEScg")
+        else:
+            log(f"Loaded .hdr — interpreted as {input_colorspace or target_colorspace or 'acescg'}")
         return img, True
     # LDR path — linearise from sRGB then optionally convert to ACEScg
     img = imageio.imread(path)
@@ -135,12 +157,13 @@ def save_exr(path, img):
     pyexr.write(path, img)
     log(f"Saved EXR: {path}")
 
-def save_png_preview(path, img_linear, percentile=99.5):
+def save_png_preview(path, img_linear, percentile=99.5, source_colorspace="acescg"):
     img_linear = np.clip(img_linear, 0.0, None)
     lum = luminance(img_linear)
     valid = lum[np.isfinite(lum)]
     denom = max(1e-6, np.percentile(valid, percentile)) if valid.size else 1.0
-    view = linear_to_srgb(np.clip(img_linear / denom, 0.0, 1.0))
+    display_linear = _to_display_srgb_linear(np.clip(img_linear / denom, 0.0, None), source_colorspace)
+    view = linear_to_srgb(np.clip(display_linear, 0.0, 1.0))
     imageio.imwrite(path, np.clip(view * 255 + 0.5, 0, 255).astype(np.uint8))
     log(f"Saved preview: {path}")
 
@@ -1097,15 +1120,17 @@ try:
         def get_cc24_reference(colorspace="acescg"):
             return CC24_LINEAR_SRGB
     try:
-        from colorchecker_erp import apply_matrix_3x3, M_SRGB_LINEAR_TO_ACESCG
+        from colorchecker_erp import apply_matrix_3x3, M_SRGB_LINEAR_TO_ACESCG, M_ACESCG_TO_SRGB_LINEAR
     except ImportError:
         apply_matrix_3x3 = None
         M_SRGB_LINEAR_TO_ACESCG = None
+        M_ACESCG_TO_SRGB_LINEAR = None
 except Exception as _cc_import_err:
     HAVE_CC_ERP = False
     CC24_LINEAR_SRGB = None
     apply_matrix_3x3 = None
     M_SRGB_LINEAR_TO_ACESCG = None
+    M_ACESCG_TO_SRGB_LINEAR = None
     import traceback as _tb
     warn(f"colorchecker_erp import failed: {_cc_import_err}")
     warn("Full traceback:")
@@ -1167,10 +1192,9 @@ def main():
                          "save at full then re-run at half for iteration.")
     ap.add_argument("--colorspace", default=None,
                     choices=["acescg", "srgb"],
-                    help="Working colorspace of the input. "
+                    help="Input primaries of the source image. "
                          "Default: auto — 'acescg' for .exr/.hdr, 'srgb' for .jpg/.png. "
-                         "Controls CC24 reference values for WB and colour matrix solve. "
-                         "Override only if your EXR is known to be in sRGB primaries.")
+                         "The pipeline processes internally in ACEScg; choose 'srgb' for linear-sRGB EXR/HDR inputs so they are converted on load.")
 
     # ── White balance — primary source selectors ─────────────────────────
     # Two independent axes: --wb-source and --exposure-source.
@@ -1470,20 +1494,21 @@ def _run_pipeline(args):
     wb_swatch_xy    = parse_xy(args.wb_swatch)        if args.wb_swatch else None
     meter_swatch_xy = parse_xy(args.swatch)           if args.swatch    else None
 
-    # ── Colorspace auto-detect ────────────────────────────────────────────
-    # EXR / HDR from a VFX pipeline = ACEScg (AP1 primaries).
-    # LDR (JPG/PNG) = sRGB. User can override with --colorspace.
+    # ── Input colorspace / working space ─────────────────────────────────
+    # The pipeline now processes internally in ACEScg.
     if args.colorspace:
-        working_cs = args.colorspace
+        input_cs = args.colorspace
     else:
         ext = os.path.splitext(args.input)[1].lower()
-        working_cs = "srgb" if ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff") else "acescg"
+        input_cs = "srgb" if ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff") else "acescg"
+    working_cs = "acescg"
+    log(f"Input colorspace: {input_cs}")
     log(f"Working colorspace: {working_cs}")
 
-    meta = {"input": args.input, "args": vars(args), "colorspace": working_cs}
+    meta = {"input": args.input, "args": vars(args), "input_colorspace": input_cs, "colorspace": working_cs}
 
     # ── 1. Load ───────────────────────────────────────────────────────────
-    img, is_hdr = load_image_any(args.input, target_colorspace=working_cs)
+    img, is_hdr = load_image_any(args.input, target_colorspace=working_cs, input_colorspace=input_cs)
     img = np.clip(img, 0.0, None).astype(np.float32)
     if img.ndim != 3 or img.shape[2] != 3:
         raise RuntimeError("Input must be RGB")
@@ -1570,7 +1595,7 @@ def _run_pipeline(args):
             )
         else:
             log(f"Loading ColorChecker plate: {checker_src}")
-            cc_img_raw, _ = load_image_any(checker_src)
+            cc_img_raw, _ = load_image_any(checker_src, target_colorspace=working_cs)
             from colorchecker_erp import _linear_to_u8_for_detection
             import colour_checker_detection as _ccd_direct
             tile_u8_bgr = cv2.cvtColor(
@@ -2497,9 +2522,9 @@ def _run_pipeline(args):
     sphere_cal_info = {"applied": False}
     if args.ref_sphere:
         log(f"Loading reference sphere image: {args.ref_sphere}")
-        ref_img_linear, _ = load_image_any(args.ref_sphere)
+        ref_img_linear, _ = load_image_any(args.ref_sphere, target_colorspace=working_cs)
         ref_bgr = cv2.cvtColor(
-            np.clip(linear_to_srgb(ref_img_linear) * 255, 0, 255).astype(np.uint8),
+            np.clip(linear_to_srgb(np.clip(_to_display_srgb_linear(ref_img_linear, working_cs), 0.0, 1.0)) * 255, 0, 255).astype(np.uint8),
             cv2.COLOR_RGB2BGR)
 
         # Auto-detect or use manual coords
