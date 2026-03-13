@@ -1347,9 +1347,8 @@ def main():
                          "correction. Requires colour-checker-detection.")
     ap.add_argument("--colorchecker-in-hdri", action="store_true", default=False,
                     help="Search for a ColorChecker inside the HDRI latlong "
-                         "itself using a cubemap tile sweep (6 faces × 90° FOV "
-                         "+ rotated pass). More robust than manual --colorchecker "
-                         "for on-set HDRI captures where the chart is on the floor.")
+                         "itself using an overlapped cubemap sweep plus centred refinement passes. "
+                         "More robust than manual --colorchecker for on-set HDRI captures where the chart is on the floor.")
 
     # ── Validate-only mode ────────────────────────────────────────────────
     ap.add_argument("--validate-only", action="store_true", default=False,
