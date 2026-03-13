@@ -245,6 +245,8 @@ def config_to_namespace(cfg: PipelineConfig):
         "swatch":               None,
         "colorchecker":         None,
         "colorchecker_in_hdri": False,
+        "cc_read_backend":      "colour",
+        "cc_compare_backends":  False,
         "sphere_solve":         "energy_conservation",
         "validate_only":        False,
     }
@@ -291,7 +293,8 @@ class PipelineWorker(QRunnable):
                 "01_wb_preview.png", "02_exposed_preview.png",
                 "03_hot_mask.png",   "07_corrected_preview.png",
                 "08_verify_sphere_final.png",
-                "colorchecker/cc_erp_swatches.jpg",
+                "colorchecker/cc_detected_tile.jpg",
+                "colorchecker/cc_rectified_final.jpg",
                 "colorchecker/cc_swatch_comparison.jpg",
             ]:
                 p = os.path.join(dd, fname)
@@ -371,12 +374,13 @@ class PreviewPanel(QWidget):
         self._tabs = QTabWidget(); lay.addWidget(self._tabs)
         self._labels: dict[str, QLabel] = {}
         for name, key in [
-            ("WB",       "01_wb_preview.png"),
-            ("Exposed",  "02_exposed_preview.png"),
-            ("Lobe",     "03_hot_mask.png"),
-            ("Chart",    "cc_erp_swatches.jpg"),
-            ("Swatches", "cc_swatch_comparison.jpg"),
-            ("Final",    "08_verify_sphere_final.png"),
+            ("WB",         "01_wb_preview.png"),
+            ("Exposed",    "02_exposed_preview.png"),
+            ("Lobe",       "03_hot_mask.png"),
+            ("Chart Tile", "cc_detected_tile.jpg"),
+            ("Rectified",  "cc_rectified_final.jpg"),
+            ("Swatches",   "cc_swatch_comparison.jpg"),
+            ("Final",      "08_verify_sphere_final.png"),
         ]:
             lbl = QLabel(); lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("background: #10101a;")
@@ -753,7 +757,7 @@ class MainWindow(QMainWindow):
         self._drop = DropZone(); self._drop.files_dropped.connect(self._on_files_dropped)
         ll.addWidget(self._drop)
         qh = QHBoxLayout(); qh.addWidget(QLabel("Queue"))
-        bc = QPushButton("✕"); bc.setMaximumWidth(24); bc.setMaximumHeight(20)
+        bc = QPushButton("Clear Files"); bc.setMinimumWidth(88); bc.setMaximumHeight(22)
         bc.clicked.connect(self._clear_queue); qh.addStretch(); qh.addWidget(bc); ll.addLayout(qh)
         self._file_list = QListWidget()
         self._file_list.setSelectionMode(QAbstractItemView.SingleSelection)
