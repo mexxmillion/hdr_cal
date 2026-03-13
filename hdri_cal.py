@@ -1347,9 +1347,15 @@ def main():
                          "correction. Requires colour-checker-detection.")
     ap.add_argument("--colorchecker-in-hdri", action="store_true", default=False,
                     help="Search for a ColorChecker inside the HDRI latlong "
-                         "itself using a cubemap tile sweep (6 faces × 90° FOV "
-                         "+ rotated pass). More robust than manual --colorchecker "
-                         "for on-set HDRI captures where the chart is on the floor.")
+                         "itself using an overlapped cubemap sweep plus centred refinement passes. "
+                         "More robust than manual --colorchecker for on-set HDRI captures where the chart is on the floor.")
+    ap.add_argument("--cc-read-backend", default="colour",
+                    choices=["auto", "colour", "contour"],
+                    help="Final swatch-read backend after the chart is located and recentered. "
+                         "'colour' reruns colour-checker-detection on the rectified checker image and is the default, "
+                         "'contour' uses a contour-fit quad, and 'auto' compares both and keeps the better-agreeing read.")
+    ap.add_argument("--cc-compare-backends", action="store_true", default=False,
+                    help="Save backend comparison overlays for the ColorChecker read stage.")
 
     # ── Validate-only mode ────────────────────────────────────────────────
     ap.add_argument("--validate-only", action="store_true", default=False,
@@ -1559,6 +1565,8 @@ def _run_pipeline(args):
                 img,   # raw linear, no WB yet
                 colorspace=working_cs,
                 debug_dir=cc_debug,
+                read_backend=getattr(args, "cc_read_backend", "auto"),
+                compare_backends=getattr(args, "cc_compare_backends", False),
             )
         else:
             log(f"Loading ColorChecker plate: {checker_src}")

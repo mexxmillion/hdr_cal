@@ -33,6 +33,7 @@ Usage (standalone):
 import os
 import math
 import itertools
+import shutil
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
@@ -320,13 +321,20 @@ class CheckerDetection:
     """One detected ColorChecker instance."""
     swatches_linear: np.ndarray          # (24, 3) float32, ERP-sampled
     swatch_centres_uv: np.ndarray        # (24, 2) float32, ERP coords [0,1]
+    swatch_centres_tile: np.ndarray      # (24, 2) float32, tile pixel coords
+    quad_tile: np.ndarray                # (4, 2) float32, tile pixel coords
+    quad_center_uv: np.ndarray           # (2,) float32, ERP quad centre
     tile_yaw: float
     tile_pitch: float
+    tile_fov_deg: float
     checker_normal_world: np.ndarray     # (3,) unit vector, checker face direction
     checker_normal_theta_deg: float      # polar angle of checker face
     checker_normal_phi_deg: float        # azimuth of checker face
     confidence: float                    # 0–1, based on patch colour error
     raw_swatches_bgr: np.ndarray         # (24, 3) uint8, from detector
+    detection_method: str = "unknown"
+    stage_label: str = "coarse"
+    crop_bounds: Optional[Tuple[int, int, int, int]] = None
 
 
 def _linear_to_u8_for_detection(img_linear: np.ndarray) -> np.ndarray:
@@ -353,301 +361,691 @@ def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
 
 
 
+
+def _get_detector_target_width() -> int:
+    """
+    Best-effort query of the detector's working width.
+
+    The library reformats the input image before returning the detected
+    quadrilateral. We need to invert that resize correctly, otherwise the
+    quad/crop/debug overlays drift. Fall back to 1440, matching the current
+    library defaults for the classic checker detector.
+    """
+    if not HAVE_CCD:
+        return 1440
+
+    settings = getattr(ccd, "SETTINGS_DETECTION_COLORCHECKER_CLASSIC", None)
+    if settings is None:
+        return 1440
+
+    for attr in ("target_width", "working_width"):
+        value = getattr(settings, attr, None)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(round(value))
+
+    return 1440
+
+
+def _detector_reformatted_size(src_w: int, src_h: int) -> Tuple[float, float]:
+    """
+    Return the detector's reformatted image size for the given input image.
+
+    `colour-checker-detection` rescales the input to a fixed target width while
+    preserving aspect ratio. Its reported quadrilateral coordinates are in that
+    reformatted image space.
+    """
+    target_w = float(_get_detector_target_width())
+    if src_w <= 0 or src_h <= 0:
+        return target_w, target_w
+
+    scale = target_w / float(src_w)
+    target_h = max(1.0, float(src_h) * scale)
+    return target_w, target_h
+
+
+def _quad_detector_to_pixels(quadrilateral: np.ndarray,
+                             src_w: int,
+                             src_h: int) -> np.ndarray:
+    """Map detector quadrilateral coordinates back into source-image pixels."""
+    quad = np.array(quadrilateral, dtype=np.float32)
+    det_w, det_h = _detector_reformatted_size(src_w, src_h)
+    scale_x = float(src_w) / max(det_w, 1e-6)
+    scale_y = float(src_h) / max(det_h, 1e-6)
+    quad_px = quad.copy()
+    quad_px[:, 0] *= scale_x
+    quad_px[:, 1] *= scale_y
+    return quad_px
+
+
+def _quad_bounds_with_padding(quad_px: np.ndarray,
+                              img_w: int,
+                              img_h: int,
+                              pad_frac: float = 0.35) -> Optional[Tuple[int, int, int, int]]:
+    """Compute a padded crop around a quadrilateral in image pixel coords."""
+    if quad_px.size == 0:
+        return None
+
+    qx0 = float(np.min(quad_px[:, 0]))
+    qx1 = float(np.max(quad_px[:, 0]))
+    qy0 = float(np.min(quad_px[:, 1]))
+    qy1 = float(np.max(quad_px[:, 1]))
+    qw = max(1.0, qx1 - qx0)
+    qh = max(1.0, qy1 - qy0)
+
+    pad_x = qw * pad_frac
+    pad_y = qh * pad_frac
+
+    cx0 = int(np.floor(max(0.0, qx0 - pad_x)))
+    cx1 = int(np.ceil(min(float(img_w), qx1 + pad_x)))
+    cy0 = int(np.floor(max(0.0, qy0 - pad_y)))
+    cy1 = int(np.ceil(min(float(img_h), qy1 + pad_y)))
+
+    if (cx1 - cx0) < 8 or (cy1 - cy0) < 8:
+        return None
+
+    return cx0, cy0, cx1, cy1
+
+
+def _save_intermediate_debug(debug_dir: Optional[str],
+                             basename: str,
+                             image_rgb: np.ndarray,
+                             quad: Optional[np.ndarray] = None,
+                             crop_bounds: Optional[Tuple[int, int, int, int]] = None,
+                             centres: Optional[np.ndarray] = None,
+                             note: Optional[str] = None) -> None:
+    """Save additive debug images without disturbing the GUI's expected files."""
+    if not debug_dir:
+        return
+
+    vis = cv2.cvtColor(np.clip(image_rgb, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+    if crop_bounds is not None:
+        x0, y0, x1, y1 = crop_bounds
+        cv2.rectangle(vis, (x0, y0), (x1, y1), (255, 128, 0), 2)
+
+    if quad is not None and len(quad) == 4:
+        cv2.polylines(vis, [np.round(quad).astype(np.int32)], True, (0, 200, 255), 2)
+
+    if centres is not None:
+        for i, (cx, cy) in enumerate(np.asarray(centres, dtype=np.float32)):
+            cv2.circle(vis, (int(round(cx)), int(round(cy))), 5, (0, 255, 0), -1)
+            cv2.circle(vis, (int(round(cx)), int(round(cy))), 6, (0, 0, 0), 1)
+            cv2.putText(vis, str(i + 1), (int(round(cx)) + 4, int(round(cy)) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 255), 1)
+
+    if note:
+        cv2.putText(vis, note, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    cv2.imwrite(os.path.join(debug_dir, basename), vis)
+
+
+
+
+def _order_quad_tl_tr_br_bl(poly: np.ndarray) -> np.ndarray:
+    """Return quadrilateral points ordered TL, TR, BR, BL."""
+    q = np.array(poly, dtype=np.float32).reshape(4, 2)
+    s = q.sum(axis=1)
+    d = q[:, 0] - q[:, 1]
+    tl = q[np.argmin(s)]
+    br = q[np.argmax(s)]
+    tr = q[np.argmin(d)]
+    bl = q[np.argmax(d)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def _sample_tile_bilinear(img: np.ndarray, x: float, y: float) -> np.ndarray:
+    """Bilinear sample from a float RGB tile in pixel coordinates."""
+    h, w = img.shape[:2]
+    x = float(np.clip(x, 0.0, max(w - 1, 0)))
+    y = float(np.clip(y, 0.0, max(h - 1, 0)))
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, w - 1)
+    y1 = min(y0 + 1, h - 1)
+    fx = x - x0
+    fy = y - y0
+    top = (1.0 - fx) * img[y0, x0] + fx * img[y0, x1]
+    bot = (1.0 - fx) * img[y1, x0] + fx * img[y1, x1]
+    return ((1.0 - fy) * top + fy * bot).astype(np.float32)
+
+
+def _sample_swatches_from_quad(tile_linear: np.ndarray,
+                               quad: np.ndarray,
+                               sample_frac: float = 0.18) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample CC24 swatches directly from a quadrilateral in tile space."""
+    quad = _order_quad_tl_tr_br_bl(quad)
+    tl, tr, br, bl = quad
+
+    centres = []
+    colours = []
+    rows, cols = 4, 6
+    for r in range(rows):
+        for c in range(cols):
+            s = (c + 0.5) / cols
+            t = (r + 0.5) / rows
+            top = tl + s * (tr - tl)
+            bottom = bl + s * (br - bl)
+            pt = top + t * (bottom - top)
+
+            left = tl + t * (bl - tl)
+            right = tr + t * (br - tr)
+            cell_w = (right - left) / cols
+            top_col = tl + s * (tr - tl)
+            bottom_col = bl + s * (br - bl)
+            cell_h = (bottom_col - top_col) / rows
+
+            half_w = np.linalg.norm(cell_w) * sample_frac
+            half_h = np.linalg.norm(cell_h) * sample_frac
+            ux = cell_w / max(np.linalg.norm(cell_w), 1e-8)
+            uy = cell_h / max(np.linalg.norm(cell_h), 1e-8)
+
+            samples = []
+            for oy in np.linspace(-half_h, half_h, 5):
+                for ox in np.linspace(-half_w, half_w, 5):
+                    p = pt + ux * ox + uy * oy
+                    samples.append(_sample_tile_bilinear(tile_linear, float(p[0]), float(p[1])))
+
+            colours.append(np.mean(np.asarray(samples, dtype=np.float32), axis=0))
+            centres.append((float(pt[0]), float(pt[1])))
+
+    return np.asarray(colours, dtype=np.float32), np.asarray(centres, dtype=np.float32)
+
+
+def _compute_detection_confidence(swatches_linear: np.ndarray,
+                                  cc24_ref: Optional[np.ndarray] = None) -> float:
+    """Score a swatch read using the neutral ramp agreement."""
+    if swatches_linear.shape != (24, 3):
+        return 0.0
+    ref = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
+    neutrals_meas = swatches_linear[18:24]
+    neutrals_ref = ref[18:24]
+    lum_meas = 0.2126 * neutrals_meas[:, 0] + 0.7152 * neutrals_meas[:, 1] + 0.0722 * neutrals_meas[:, 2]
+    lum_ref = 0.2126 * neutrals_ref[:, 0] + 0.7152 * neutrals_ref[:, 1] + 0.0722 * neutrals_ref[:, 2]
+    scale_n = np.clip(lum_ref / (lum_meas + 1e-8), 0.0, 20.0)[:, None]
+    chroma_err = float(np.mean(np.abs(neutrals_meas * scale_n - neutrals_ref)))
+    return float(np.clip(1.0 - chroma_err * 5.0, 0.0, 1.0))
+
+
+def _quad_agreement(quad_a: np.ndarray,
+                    quad_b: np.ndarray,
+                    img_w: int,
+                    img_h: int) -> float:
+    """Estimate how much two quads agree geometrically, 0..1."""
+    qa = _order_quad_tl_tr_br_bl(np.asarray(quad_a, dtype=np.float32))
+    qb = _order_quad_tl_tr_br_bl(np.asarray(quad_b, dtype=np.float32))
+    diag = math.hypot(float(img_w), float(img_h))
+    mean_dist = float(np.mean(np.linalg.norm(qa - qb, axis=1))) / max(diag, 1e-6)
+    agreement = 1.0 - mean_dist * 6.0
+    return float(np.clip(agreement, 0.0, 1.0))
+
+
+def _save_backend_debug(debug_dir,
+                        basename: str,
+                        tile_rgb_u8: np.ndarray,
+                        quad: Optional[np.ndarray],
+                        centres: Optional[np.ndarray],
+                        note: str):
+    """Write a backend-specific overlay image for detector comparison."""
+    if not debug_dir:
+        return
+    vis = cv2.cvtColor(tile_rgb_u8, cv2.COLOR_RGB2BGR)
+    if quad is not None:
+        cv2.polylines(vis, [np.round(np.asarray(quad)).astype(np.int32)], True, (0, 200, 255), 2)
+    if centres is not None:
+        for i, (cx, cy) in enumerate(np.asarray(centres, dtype=np.float32)):
+            cv2.circle(vis, (int(round(cx)), int(round(cy))), 5, (0, 255, 0), -1)
+            cv2.circle(vis, (int(round(cx)), int(round(cy))), 6, (0, 0, 0), 1)
+            cv2.putText(vis, str(i + 1), (int(round(cx)) + 4, int(round(cy)) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 255), 1)
+    cv2.putText(vis, note, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 0), 1)
+    cv2.imwrite(os.path.join(debug_dir, basename), vis)
+
+
+def _save_rectified_debug(debug_dir,
+                          basename: str,
+                          cc_img: np.ndarray,
+                          centres_xy: np.ndarray,
+                          note: str):
+    """Save one rectified checker image with its own swatch centres."""
+    if not debug_dir:
+        return
+    vis = cv2.cvtColor(np.clip(cc_img * 255, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    h, w = vis.shape[:2]
+    quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.int32)
+    cv2.polylines(vis, [quad], True, (255, 128, 0), 2)
+    for i, (cx, cy) in enumerate(np.asarray(centres_xy, dtype=np.float32)):
+        cv2.circle(vis, (int(round(cx)), int(round(cy))), 4, (0, 255, 0), -1)
+        cv2.putText(vis, str(i + 1), (int(round(cx)) + 3, int(round(cy)) - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, (0, 255, 255), 1)
+    cv2.putText(vis, note, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 0), 1)
+    cv2.imwrite(os.path.join(debug_dir, basename), vis)
+
+
+def _save_debug_swatch_strip(debug_dir,
+                             basename: str,
+                             swatches: np.ndarray,
+                             note: str):
+    """Save a simple 24-patch swatch strip for backend/pass comparison."""
+    if not debug_dir or swatches is None:
+        return
+    sw = np.asarray(swatches, dtype=np.float32)
+    if sw.shape != (24, 3):
+        return
+    patch_w = 40
+    patch_h = 40
+    label_h = 18
+    strip = np.zeros((patch_h + label_h, patch_w * 24, 3), dtype=np.uint8)
+    sw_u8 = np.clip(sw * 255, 0, 255).astype(np.uint8)
+    for i in range(24):
+        x0 = i * patch_w
+        strip[label_h:, x0:x0 + patch_w] = sw_u8[i][None, None, ::-1]
+        cv2.putText(strip, str(i + 1), (x0 + 10, 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.putText(strip, note, (6, strip.shape[0] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 255, 180), 1)
+    cv2.imwrite(os.path.join(debug_dir, basename), strip)
+
+
+def _map_rectified_points_to_tile(points_xy: np.ndarray,
+                                  H_cc2tile: Optional[np.ndarray],
+                                  out_w: int,
+                                  out_h: int) -> np.ndarray:
+    """Map points from rectified checker image space back into tile pixels."""
+    pts = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    if H_cc2tile is None or pts.size == 0:
+        return pts.copy()
+    pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float32)], axis=1)
+    mapped = (H_cc2tile @ pts_h.T).T
+    mapped = mapped[:, :2] / np.clip(mapped[:, 2:3], 1e-8, None)
+    mapped[:, 0] = np.clip(mapped[:, 0], 0, out_w - 1)
+    mapped[:, 1] = np.clip(mapped[:, 1], 0, out_h - 1)
+    return mapped.astype(np.float32)
+
 def _detect_in_tile(tile_linear: np.ndarray,
                     map_uv: np.ndarray,
                     erp_linear_hd: np.ndarray,
                     yaw: float, pitch: float,
+                    tile_fov_deg: float,
                     debug_dir,
                     tile_idx: int,
-                    cc24_ref: Optional[np.ndarray] = None):
-    """
-    Detect a ColorChecker in one rectilinear tile.
-
-    SIMPLE APPROACH:
-      1. Reinhard-tonemap the linear tile so the library can see the scene.
-      2. Run colour-checker-detection. It returns DataDetectionColourChecker with:
-           swatch_colours : (24,3) float, sampled from the perspective-corrected
-                            checker sub-image. These are in tonemapped [0,1] space.
-           quadrilateral  : (4,2) corners in library working-width (1024px) space.
-      3. Undo Reinhard on swatch_colours → linear values for WB.
-      4. Use quadrilateral (scaled to tile) for debug visualisation and pose only.
-      5. For ERP sampling: use the quadrilateral centre as a proxy UV to sample the
-         full-res HDR near the checker. But for WB we trust swatch_colours directly.
-    """
+                    stage_label: str,
+                    cc24_ref: Optional[np.ndarray] = None,
+                    read_backend: str = "colour",
+                    compare_backends: bool = True):
+    """Detect a ColorChecker in one rectilinear tile."""
     if not HAVE_CCD:
         return None
 
     out_h, out_w = tile_linear.shape[:2]
-
-    # Reinhard tonemap: maps [0, inf) → [0, 1)
     tile_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
+    tile_rgb_u8 = np.clip(tile_tm * 255, 0, 255).astype(np.uint8)
 
-    # ── Detection strategy: segmentation locates, YOLO extracts swatches ───
-    #
-    # Segmentation is reliable at FINDING the chart (returns quad corners).
-    # But its swatch sampling on small/tilted/dark charts is poor.
-    #
-    # Strategy:
-    #   1. Run segmentation to get the quad (chart location in tile)
-    #   2. Crop tightly around the quad + padding, upscale to ~800px
-    #   3. If YOLO available: run inference on that clean crop → better swatches
-    #   4. If YOLO unavailable or fails: use segmentation swatches from crop
-    #
-    # This way YOLO only runs once on a tight crop (fast), not on the full
-    # 1024px tile where the chart is tiny and inference fails.
-    det = None
-    _method_used = "none"
+    seg_det = None
+    chosen_det = None
+    chosen_sw_tm = None
+    chosen_quad_tile = None
+    crop_bounds = None
+    method_used = "none"
 
-    # Step 1: segmentation on full tile to locate chart
     try:
-        _seg_results = ccd.detect_colour_checkers_segmentation(
+        seg_results = ccd.detect_colour_checkers_segmentation(
             tile_tm,
             show=False,
             additional_data=True,
             apply_cctf_decoding=False,
         )
-        if _seg_results:
-            det = _seg_results[0]
-            _method_used = "segmentation"
+        if seg_results:
+            seg_det = seg_results[0]
+            chosen_det = seg_det
+            chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
+            method_used = "segmentation"
             print(f"[cc-erp] Segmentation located chart on tile yaw={yaw:.0f} pitch={pitch:.0f}")
     except Exception:
         pass
 
-    if det is None:
+    if seg_det is None:
         return None
 
-    # Step 2: crop tightly around detected quad
-    _quad_w = np.array(det.quadrilateral, dtype=np.float32)
-    WORKING_W = 1024.0
-    _qscale_x = out_w / WORKING_W
-    _qscale_y = out_h / WORKING_W
-    _quad_px = _quad_w.copy()
-    _quad_px[:, 0] *= _qscale_x
-    _quad_px[:, 1] *= _qscale_y
-    _qx0 = int(max(0, _quad_px[:, 0].min()))
-    _qx1 = int(min(out_w, _quad_px[:, 0].max()))
-    _qy0 = int(max(0, _quad_px[:, 1].min()))
-    _qy1 = int(min(out_h, _quad_px[:, 1].max()))
-    _qw = _qx1 - _qx0
-    _qh = _qy1 - _qy0
+    seg_quad_tile = _quad_detector_to_pixels(seg_det.quadrilateral, out_w, out_h)
+    chosen_quad_tile = seg_quad_tile.copy()
+    crop_bounds = _quad_bounds_with_padding(seg_quad_tile, out_w, out_h, pad_frac=0.40)
 
-    # Step 3: if YOLO available and chart is not already large, run on crop
-    if HAVE_CCD_INFERENCE and _qw > 10 and _qh > 10:
-        _pad_x = int(_qw * 0.5)
-        _pad_y = int(_qh * 0.5)
-        _cx0 = max(0, _qx0 - _pad_x)
-        _cx1 = min(out_w, _qx1 + _pad_x)
-        _cy0 = max(0, _qy0 - _pad_y)
-        _cy1 = min(out_h, _qy1 + _pad_y)
-        _crop_lin = tile_linear[_cy0:_cy1, _cx0:_cx1]
-        _crop_h, _crop_w = _crop_lin.shape[:2]
-        # Upscale to 800px wide so YOLO sees a large chart
-        _zoom_w = 800
-        _zoom_h = int(_crop_h * _zoom_w / (_crop_w + 1e-8))
-        _crop_up = cv2.resize(_crop_lin, (_zoom_w, _zoom_h), interpolation=cv2.INTER_LINEAR)
-        # YOLO expects uint8 sRGB
-        _crop_tm = (_crop_up / (_crop_up + 1.0)).astype(np.float32)
-        _crop_u8 = np.clip(_crop_tm * 255, 0, 255).astype(np.uint8)
+    _save_intermediate_debug(
+        debug_dir,
+        f"tile_{stage_label}_locator.jpg",
+        tile_rgb_u8,
+        quad=seg_quad_tile,
+        crop_bounds=crop_bounds,
+        note=f"{stage_label}: locate yaw={yaw:.1f} pitch={pitch:.1f} fov={tile_fov_deg:.1f}",
+    )
+
+    if HAVE_CCD_INFERENCE and crop_bounds is not None:
+        cx0, cy0, cx1, cy1 = crop_bounds
+        crop_lin = tile_linear[cy0:cy1, cx0:cx1]
+        crop_h, crop_w = crop_lin.shape[:2]
+        zoom_w = 800
+        zoom_h = max(1, int(round(crop_h * zoom_w / max(float(crop_w), 1e-8))))
+        crop_up = cv2.resize(crop_lin, (zoom_w, zoom_h), interpolation=cv2.INTER_LINEAR)
+        crop_tm = (crop_up / (crop_up + 1.0)).astype(np.float32)
+        crop_u8 = np.clip(crop_tm * 255, 0, 255).astype(np.uint8)
+
+        _save_intermediate_debug(
+            debug_dir,
+            f"tile_{stage_label}_crop.jpg",
+            crop_u8,
+            note=f"{stage_label}: crop {crop_w}x{crop_h} -> {zoom_w}x{zoom_h}",
+        )
+
         try:
-            _inf_results = ccd.detect_colour_checkers_inference(
-                _crop_u8,
+            inf_results = ccd.detect_colour_checkers_inference(
+                crop_u8,
                 additional_data=True,
             )
-            if _inf_results:
-                _idet = _inf_results[0]
-                _isw_tm = np.array(_idet.swatch_colours, dtype=np.float32)
-                if _isw_tm.shape == (24, 3):
-                    # Compare chroma error on neutral ramp
+            if inf_results:
+                inf_det = inf_results[0]
+                inf_sw_tm = np.array(inf_det.swatch_colours, dtype=np.float32)
+                if inf_sw_tm.shape == (24, 3):
                     def _cerr(sw, ref):
-                        n = sw[18:24]; r = ref[18:24]
-                        lm = 0.2126*n[:,0]+0.7152*n[:,1]+0.0722*n[:,2]
-                        lr = 0.2126*r[:,0]+0.7152*r[:,1]+0.0722*r[:,2]
-                        sc = np.clip(lr/(lm+1e-8),0,20)[:,None]
-                        return float(np.mean(np.abs(n*sc - r)))
-                    _ref_arr = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
-                    _seg_sw_safe = np.clip(np.array(det.swatch_colours, dtype=np.float32), 0, 0.9999)
-                    _seg_sw_lin  = _seg_sw_safe / (1.0 - _seg_sw_safe)
-                    _seg_err  = _cerr(_seg_sw_lin, _ref_arr)
-                    _isw_safe = np.clip(_isw_tm, 0, 0.9999)
-                    _isw_lin  = _isw_safe / (1.0 - _isw_safe)
-                    _yolo_err = _cerr(_isw_lin, _ref_arr)
-                    print(f"[cc-erp] YOLO on crop: seg_err={_seg_err:.4f}  yolo_err={_yolo_err:.4f}  "
-                          f"crop={_crop_w}×{_crop_h} → {_zoom_w}×{_zoom_h}px")
-                    if _yolo_err < _seg_err:
-                        # Patch the detection's swatch_colours with YOLO's better values
-                        # We keep segmentation's quad/pose, swap only the colour data
-                        import copy
-                        det = copy.copy(det)
-                        object.__setattr__(det, 'swatch_colours',
-                                           _isw_tm.tolist() if hasattr(_isw_tm, 'tolist') else _isw_tm)
-                        _method_used = "segmentation(locate)+YOLO(swatches)"
-                        print(f"[cc-erp] YOLO swatches better — using YOLO colours, segmentation quad")
+                        n = sw[18:24]
+                        r = ref[18:24]
+                        lm = 0.2126 * n[:, 0] + 0.7152 * n[:, 1] + 0.0722 * n[:, 2]
+                        lr = 0.2126 * r[:, 0] + 0.7152 * r[:, 1] + 0.0722 * r[:, 2]
+                        sc = np.clip(lr / (lm + 1e-8), 0, 20)[:, None]
+                        return float(np.mean(np.abs(n * sc - r)))
+
+                    ref_arr = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
+                    seg_sw_safe = np.clip(chosen_sw_tm, 0, 0.9999)
+                    seg_sw_lin = seg_sw_safe / (1.0 - seg_sw_safe)
+                    seg_err = _cerr(seg_sw_lin, ref_arr)
+                    inf_sw_safe = np.clip(inf_sw_tm, 0, 0.9999)
+                    inf_sw_lin = inf_sw_safe / (1.0 - inf_sw_safe)
+                    inf_err = _cerr(inf_sw_lin, ref_arr)
+                    print(f"[cc-erp] YOLO on crop: seg_err={seg_err:.4f}  yolo_err={inf_err:.4f}  crop={crop_w}x{crop_h} -> {zoom_w}x{zoom_h}px")
+
+                    if inf_err < seg_err:
+                        inf_quad_zoom = _quad_detector_to_pixels(inf_det.quadrilateral, zoom_w, zoom_h)
+                        inf_quad_tile = inf_quad_zoom.copy()
+                        inf_quad_tile[:, 0] *= crop_w / max(float(zoom_w), 1e-8)
+                        inf_quad_tile[:, 1] *= crop_h / max(float(zoom_h), 1e-8)
+                        inf_quad_tile[:, 0] += float(cx0)
+                        inf_quad_tile[:, 1] += float(cy0)
+
+                        chosen_det = inf_det
+                        chosen_sw_tm = inf_sw_tm
+                        chosen_quad_tile = inf_quad_tile.astype(np.float32)
+                        method_used = "segmentation(locate)+yolo(read)"
+                        print("[cc-erp] YOLO result better - using crop-local quadrilateral and swatches")
                     else:
-                        print(f"[cc-erp] Segmentation swatches better or equal — keeping segmentation")
+                        print("[cc-erp] Segmentation swatches better or equal - keeping segmentation")
             else:
-                print(f"[cc-erp] YOLO: no detection on crop — keeping segmentation swatches")
-        except Exception as _ye:
-            print(f"[cc-erp] YOLO on crop failed ({_ye}) — keeping segmentation swatches")
+                print("[cc-erp] YOLO: no detection on crop - keeping segmentation swatches")
+        except Exception as ye:
+            print(f"[cc-erp] YOLO on crop failed ({ye}) - keeping segmentation swatches")
 
-    print(f"[cc-erp] Detection method: {_method_used}")
-
-    # ── Swatch colours directly from the library ──────────────────────────
-    # The library perspective-corrects the checker and samples each patch.
-    # Values are in Reinhard-tonemapped space (same as our input).
-    # Undo Reinhard to get linear: L = T / (1 - T)
-    try:
-        sw_tm = np.array(det.swatch_colours, dtype=np.float32)  # (24,3)
-    except AttributeError:
-        return None
-    if sw_tm.shape != (24, 3):
-        return None
-
-    print(f"[cc-erp]   RAW swatch_colours from library (tonemapped, ALL 24 patches):")
-    for i in range(24):
-        print(f"[cc-erp]     patch {i+1:02d}: R={sw_tm[i,0]:.4f}  G={sw_tm[i,1]:.4f}  B={sw_tm[i,2]:.4f}")
-
-    print(f"[cc-erp]   RAW swatch_colours from library (tonemapped, patch 19-24):")
-    for i in range(18, 24):
-        print(f"[cc-erp]     patch {i+1:02d}: R={sw_tm[i,0]:.4f}  G={sw_tm[i,1]:.4f}  B={sw_tm[i,2]:.4f}")
-
-    sw_safe = np.clip(sw_tm, 0.0, 0.9999)
-    swatches_linear = sw_safe / (1.0 - sw_safe)   # (24,3) linear HDR
-
-    print(f"[cc-erp]   Linear (after undo Reinhard), patch 19-24:")
-    for i in range(18, 24):
-        print(f"[cc-erp]     patch {i+1:02d}: R={swatches_linear[i,0]:.4f}  G={swatches_linear[i,1]:.4f}  B={swatches_linear[i,2]:.4f}")
-
-    # ── Quadrilateral: working-width (1024) → tile pixel coords ──────────
-    quad_w = np.array(det.quadrilateral, dtype=np.float32)   # (4,2) in 1024-wide space
-    WORKING_W = 1024.0
-    scale_x = out_w / WORKING_W
-    scale_y = out_h / WORKING_W   # library uses square working space internally
-    quad_tile = quad_w.copy()
-    quad_tile[:, 0] *= scale_x
-    quad_tile[:, 1] *= scale_y
-
-    # ── Swatch centre positions: use swatch_masks in colour_checker space ─
-    # Then map through the homography quad_tile → colour_checker rectangle.
-    # This gives tile-pixel positions for each swatch → used for ERP backprojection.
-    cc_img = np.array(det.colour_checker, dtype=np.float32)
+    cc_img = np.array(chosen_det.colour_checker, dtype=np.float32)
     H_cc, W_cc = cc_img.shape[:2]
-    masks = np.array(det.swatch_masks, dtype=np.float32)  # (24,4) [y0,y1,x0,x1]
+    quad_tile = np.array(chosen_quad_tile, dtype=np.float32)
 
-    # Swatch centres in colour_checker (rectified) space
-    cx_cc = (masks[:, 2] + masks[:, 3]) * 0.5   # (24,)
-    cy_cc = (masks[:, 0] + masks[:, 1]) * 0.5   # (24,)
+    colour_sw_tm = np.array(chosen_sw_tm, dtype=np.float32)
+    if colour_sw_tm.shape != (24, 3):
+        return None
 
-    # The library warps the detected quad in working-width space into a
-    # canonical rectangle of size (H_cc, W_cc).
-    # We invert that: map colour_checker coords → working-width → tile.
-    # Sort quad_tile into TL, TR, BR, BL:
-    def _sort_tl_tr_br_bl(q):
-        c = q.mean(axis=0)
-        ang = np.arctan2(q[:,1]-c[1], q[:,0]-c[0])
-        q = q[np.argsort(ang)]       # CCW from right
-        i0 = np.argmin(q[:,0]+q[:,1])  # TL = min(x+y)
-        q = np.roll(q, -i0, axis=0)
-        if np.cross(q[1]-q[0], q[2]-q[0]) > 0:
-            q = q[[0,3,2,1]]
-        return q
-
-    quad_sorted_tile = _sort_tl_tr_br_bl(quad_tile.copy())
-
-    dst_rect = np.array([
-        [0.,    0.   ],
-        [W_cc,  0.   ],
-        [W_cc,  H_cc ],
-        [0.,    H_cc ],
+    # First-pass rectified view from the tile detection.
+    cc_first_img = cc_img
+    cc_first_h, cc_first_w = H_cc, W_cc
+    cc_first_rect = np.array([
+        [0.0, 0.0],
+        [cc_first_w, 0.0],
+        [cc_first_w, cc_first_h],
+        [0.0, cc_first_h],
     ], dtype=np.float32)
+    cc_first_masks = np.array(chosen_det.swatch_masks, dtype=np.float32)
+    cc_first_H_to_tile, _ = cv2.findHomography(cc_first_rect, quad_tile)
+    cc_first_centres = np.column_stack([
+        (cc_first_masks[:, 2] + cc_first_masks[:, 3]) * 0.5,
+        (cc_first_masks[:, 0] + cc_first_masks[:, 1]) * 0.5,
+    ]).astype(np.float32)
+    cc_first_sw_tm = colour_sw_tm.copy()
 
-    H_cc2tile, _ = cv2.findHomography(dst_rect, quad_sorted_tile)
+    cc_work_img = cc_first_img
+    cc_work_h, cc_work_w = cc_first_h, cc_first_w
+    cc_work_masks = cc_first_masks
+    cc_work_H_to_tile = cc_first_H_to_tile
+    cc_work_centres = cc_first_centres
+    cc_work_sw_tm = cc_first_sw_tm
 
-    swatch_centres_tile = []
-    if H_cc2tile is not None:
-        pts_h = np.stack([cx_cc, cy_cc, np.ones(24)], axis=1).astype(np.float32)
-        mapped = (H_cc2tile @ pts_h.T).T
-        mapped = mapped[:, :2] / mapped[:, 2:3]
-        for px, py in mapped:
-            swatch_centres_tile.append((
-                float(np.clip(px, 0, out_w-1)),
-                float(np.clip(py, 0, out_h-1)),
-            ))
-    else:
-        # fallback: use quad centre for all
+    rectified_det = None
+    try:
+        rectified_results = ccd.detect_colour_checkers_segmentation(
+            np.clip(cc_img, 0.0, 1.0).astype(np.float32),
+            show=False,
+            additional_data=True,
+            apply_cctf_decoding=False,
+        )
+        if rectified_results:
+            cand = rectified_results[0]
+            cand_sw = np.array(cand.swatch_colours, dtype=np.float32)
+            cand_masks = np.array(cand.swatch_masks, dtype=np.float32)
+            cand_img = np.array(cand.colour_checker, dtype=np.float32)
+            if cand_sw.shape == (24, 3) and cand_masks.shape[0] >= 24 and cand_img.ndim == 3:
+                rectified_det = cand
+                colour_sw_tm = cand_sw
+                cc_work_img = cand_img
+                cc_work_h, cc_work_w = cc_work_img.shape[:2]
+                cc_work_masks = cand_masks
+                cc_work_sw_tm = cand_sw.copy()
+                rectified_quad_cc = _quad_detector_to_pixels(cand.quadrilateral, W_cc, H_cc)
+                cc_work_rect = np.array([
+                    [0.0, 0.0],
+                    [cc_work_w, 0.0],
+                    [cc_work_w, cc_work_h],
+                    [0.0, cc_work_h],
+                ], dtype=np.float32)
+                H_work_to_cc, _ = cv2.findHomography(cc_work_rect, rectified_quad_cc.astype(np.float32))
+                H_cc_to_tile, _ = cv2.findHomography(cc_first_rect, quad_tile)
+                if H_work_to_cc is not None and H_cc_to_tile is not None:
+                    cc_work_H_to_tile = H_cc_to_tile @ H_work_to_cc
+                cc_work_centres = np.column_stack([
+                    (cc_work_masks[:, 2] + cc_work_masks[:, 3]) * 0.5,
+                    (cc_work_masks[:, 0] + cc_work_masks[:, 1]) * 0.5,
+                ]).astype(np.float32)
+                mapped_quad_tile = _map_rectified_points_to_tile(cc_work_rect, cc_work_H_to_tile, out_w, out_h)
+                if mapped_quad_tile.shape == (4, 2):
+                    quad_tile = mapped_quad_tile
+                method_used = f"{method_used}+rectified(seg)"
+                print("[cc-erp] Rectified re-detect succeeded - using full second-pass geometry")
+    except Exception as re:
+        print(f"[cc-erp] Rectified re-detect failed ({re}) - keeping first-pass geometry")
+
+    cx_cc = cc_work_centres[:, 0]
+    cy_cc = cc_work_centres[:, 1]
+
+    colour_centres_tile = _map_rectified_points_to_tile(
+        cc_work_centres,
+        cc_work_H_to_tile,
+        out_w,
+        out_h,
+    )
+    if colour_centres_tile.shape[0] != 24:
         ctr = quad_tile.mean(axis=0)
-        swatch_centres_tile = [(float(ctr[0]), float(ctr[1]))] * 24
+        colour_centres_tile = np.asarray([(float(ctr[0]), float(ctr[1]))] * 24, dtype=np.float32)
 
-    # ── Back-project swatch centres to ERP → sample full-res HDR ─────────
-    swatch_centres_uv = np.array([
+    colour_centres_uv = np.array([
         backproject_pixel_to_erp(cx, cy, map_uv)
-        for cx, cy in swatch_centres_tile
+        for cx, cy in colour_centres_tile
     ], dtype=np.float32)
+    colour_sw_safe = np.clip(colour_sw_tm, 0.0, 0.9999)
+    colour_swatches_linear = colour_sw_safe / (1.0 - colour_sw_safe)
+    colour_swatches_linear, colour_reorder = _reorder_swatches_to_cc24(colour_swatches_linear, cc24_ref)
+    colour_centres_uv = colour_centres_uv[colour_reorder]
+    colour_centres_tile = colour_centres_tile[colour_reorder]
+    colour_confidence = _compute_detection_confidence(colour_swatches_linear, cc24_ref)
 
-    # Note: swatches_linear (from library) is what we use for WB.
-    # swatches_hdr (from full-res ERP sample) is an alternative if needed.
-    swatches_hdr = np.array([
-        sample_erp_bilinear(erp_linear_hd, float(uv[0]), float(uv[1]))
-        for uv in swatch_centres_uv
-    ], dtype=np.float32)
+    contour_quad = _find_checker_polygon(cv2.cvtColor(tile_rgb_u8, cv2.COLOR_RGB2BGR), crop_bounds)
+    contour_centres_tile = None
+    contour_centres_uv = None
+    contour_swatches_hdr = None
+    contour_confidence = 0.0
+    contour_agreement = 0.0
+    if contour_quad is not None:
+        contour_swatches_tile, contour_centres_tile = _sample_swatches_from_quad(tile_linear, contour_quad)
+        contour_centres_tile = np.asarray(contour_centres_tile, dtype=np.float32)
+        contour_centres_uv = np.array([
+            backproject_pixel_to_erp(cx, cy, map_uv)
+            for cx, cy in contour_centres_tile
+        ], dtype=np.float32)
+        contour_swatches_linear, contour_reorder = _reorder_swatches_to_cc24(contour_swatches_tile, cc24_ref)
+        contour_centres_uv = contour_centres_uv[contour_reorder]
+        contour_centres_tile = contour_centres_tile[contour_reorder]
+        contour_confidence = _compute_detection_confidence(contour_swatches_linear, cc24_ref)
+        contour_agreement = _quad_agreement(contour_quad, quad_tile, out_w, out_h)
+        contour_swatches_hdr = contour_swatches_linear
+        print(f"[cc-erp] Backends: colour={colour_confidence:.3f} contour={contour_confidence:.3f} agreement={contour_agreement:.3f}")
+    else:
+        print(f"[cc-erp] Backends: colour={colour_confidence:.3f} contour=none")
 
-    # ── Pose from quad corners ────────────────────────────────────────────
+    if compare_backends:
+        lbl = tile_idx if isinstance(tile_idx, str) else (tile_idx if tile_idx >= 0 else stage_label)
+        _save_backend_debug(
+            debug_dir,
+            f"tile_{lbl}_backend_colour.jpg",
+            tile_rgb_u8,
+            quad_tile,
+            colour_centres_tile,
+            f"{stage_label} backend=colour conf={colour_confidence:.2f}",
+        )
+        _save_backend_debug(
+            debug_dir,
+            f"tile_{lbl}_backend_contour.jpg",
+            tile_rgb_u8,
+            contour_quad,
+            contour_centres_tile,
+            f"{stage_label} backend=contour conf={contour_confidence:.2f} agree={contour_agreement:.2f}",
+        )
+
+    selected_backend = "colour"
+    selected_quad = quad_tile
+    swatch_centres_tile = colour_centres_tile
+    swatch_centres_uv = colour_centres_uv
+    swatches_linear = colour_swatches_linear
+    confidence = colour_confidence
+
+    if read_backend == "contour":
+        if contour_swatches_hdr is not None:
+            selected_backend = "contour"
+            selected_quad = contour_quad.astype(np.float32)
+            swatch_centres_tile = contour_centres_tile
+            swatch_centres_uv = contour_centres_uv
+            swatches_linear = contour_swatches_hdr
+            confidence = contour_confidence
+            method_used = f"{method_used}+contour(read)"
+        else:
+            method_used = f"{method_used}+colour(fallback)"
+    elif read_backend == "auto" and contour_swatches_hdr is not None:
+        if contour_agreement >= 0.55 and contour_confidence > (colour_confidence + 0.03):
+            selected_backend = "contour"
+            selected_quad = contour_quad.astype(np.float32)
+            swatch_centres_tile = contour_centres_tile
+            swatch_centres_uv = contour_centres_uv
+            swatches_linear = contour_swatches_hdr
+            confidence = contour_confidence
+            method_used = f"{method_used}+contour(auto)"
+        else:
+            method_used = f"{method_used}+colour(auto)"
+    else:
+        method_used = f"{method_used}+colour(read)"
+
+    print(f"[cc-erp] Detection method: {method_used}")
+
+    quad_sorted_tile = _order_quad_tl_tr_br_bl(selected_quad.copy())
     checker_normal_world = _estimate_checker_pose(
         [(float(x), float(y)) for x, y in quad_sorted_tile],
-        out_w, out_h, yaw, pitch, is_corners=True)
-
-    # ── Confidence: chroma error on luma-normalised neutral ramp ─────────
-    neutrals_meas = swatches_linear[18:24]
-    _ref = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
-    neutrals_ref  = _ref[18:24]
-    lum_meas = 0.2126*neutrals_meas[:,0] + 0.7152*neutrals_meas[:,1] + 0.0722*neutrals_meas[:,2]
-    lum_ref  = 0.2126*neutrals_ref[:,0]  + 0.7152*neutrals_ref[:,1]  + 0.0722*neutrals_ref[:,2]
-    scale_n  = np.clip(lum_ref / (lum_meas + 1e-8), 0.0, 20.0)[:, None]
-    chroma_err = float(np.mean(np.abs(neutrals_meas * scale_n - neutrals_ref)))
-    confidence = float(np.clip(1.0 - chroma_err * 5.0, 0.0, 1.0))
+        out_w, out_h, yaw, pitch, fov_deg=tile_fov_deg, is_corners=True)
 
     n = checker_normal_world
     theta_n = float(np.degrees(np.arccos(np.clip(n[1], -1, 1))))
-    phi_n   = float(np.degrees(np.arctan2(n[0], n[2])))
+    phi_n = float(np.degrees(np.arctan2(n[0], n[2])))
 
-    # ── Debug image ───────────────────────────────────────────────────────
+    quad_center_tile = selected_quad.mean(axis=0)
+    quad_center_uv = np.array(
+        backproject_pixel_to_erp(float(quad_center_tile[0]), float(quad_center_tile[1]), map_uv),
+        dtype=np.float32,
+    )
+
     if debug_dir:
-        lbl = tile_idx if isinstance(tile_idx, str) else (tile_idx if tile_idx >= 0 else "refine")
-        vis_rgb = np.clip(tile_tm * 255, 0, 255).astype(np.uint8)
-        vis = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
-        # Draw quad (tile coords)
-        cv2.polylines(vis, [quad_tile.astype(np.int32)], True, (0, 200, 255), 2)
-        # Draw swatch centres
+        lbl = tile_idx if isinstance(tile_idx, str) else (tile_idx if tile_idx >= 0 else stage_label)
+        _save_rectified_debug(
+            debug_dir,
+            f"tile_{lbl}_rectified_pass1.jpg",
+            cc_first_img,
+            cc_first_centres,
+            f"{stage_label} rectified pass1",
+        )
+        _save_debug_swatch_strip(
+            debug_dir,
+            f"tile_{lbl}_swatches_pass1.jpg",
+            cc_first_sw_tm,
+            f"{stage_label} pass1 swatches",
+        )
+        if rectified_det is not None:
+            _save_rectified_debug(
+                debug_dir,
+                f"tile_{lbl}_rectified_pass2.jpg",
+                cc_work_img,
+                cc_work_centres,
+                f"{stage_label} rectified pass2",
+            )
+            _save_debug_swatch_strip(
+                debug_dir,
+                f"tile_{lbl}_swatches_pass2.jpg",
+                cc_work_sw_tm,
+                f"{stage_label} pass2 swatches",
+            )
+        _save_rectified_debug(
+            debug_dir,
+            f"tile_{lbl}_rectified_checker.jpg",
+            cc_work_img,
+            cc_work_centres,
+            f"{stage_label} rectified selected",
+        )
+
+        vis = cv2.cvtColor(tile_rgb_u8, cv2.COLOR_RGB2BGR)
+        if crop_bounds is not None:
+            x0, y0, x1, y1 = crop_bounds
+            cv2.rectangle(vis, (x0, y0), (x1, y1), (255, 128, 0), 1)
+        cv2.polylines(vis, [np.round(selected_quad).astype(np.int32)], True, (0, 200, 255), 2)
         for i, (cx, cy) in enumerate(swatch_centres_tile):
-            cv2.circle(vis, (int(cx), int(cy)), 6, (0, 255, 0), -1)
-            cv2.circle(vis, (int(cx), int(cy)), 7, (0, 0, 0), 1)
-            cv2.putText(vis, str(i+1), (int(cx)+4, int(cy)-4),
+            cv2.circle(vis, (int(round(cx)), int(round(cy))), 6, (0, 255, 0), -1)
+            cv2.circle(vis, (int(round(cx)), int(round(cy))), 7, (0, 0, 0), 1)
+            cv2.putText(vis, str(i + 1), (int(round(cx)) + 4, int(round(cy)) - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 255), 1)
-        cv2.putText(vis, f"yaw={yaw:.0f} pitch={pitch:.0f} conf={confidence:.2f}",
-                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(vis,
+                    f"{stage_label} yaw={yaw:.1f} pitch={pitch:.1f} fov={tile_fov_deg:.1f} conf={confidence:.2f}",
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 0), 1)
+        cv2.putText(vis, f"method={method_used}", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 0), 1)
         fname = (f"tile_{lbl:03d}_detected.jpg" if isinstance(lbl, int)
                  else f"tile_{lbl}_detected.jpg")
         cv2.imwrite(os.path.join(debug_dir, fname), vis)
 
-    # ── Reorder swatches to match CC24 row-major layout ──────────────────
-    # The library may return patches in a different order depending on how
-    # it detected the checker orientation. Find the permutation that best
-    # matches CC24_LINEAR by minimising total colour distance, then reorder.
-    swatches_linear, reorder_idx = _reorder_swatches_to_cc24(swatches_linear, cc24_ref)
-    swatch_centres_uv = swatch_centres_uv[reorder_idx]
-    swatch_centres_tile = [swatch_centres_tile[i] for i in reorder_idx]
-
     return CheckerDetection(
-        swatches_linear=swatches_linear,
-        swatch_centres_uv=swatch_centres_uv,
+        swatches_linear=swatches_linear.astype(np.float32),
+        swatch_centres_uv=swatch_centres_uv.astype(np.float32),
+        swatch_centres_tile=np.asarray(swatch_centres_tile, dtype=np.float32),
+        quad_tile=np.asarray(selected_quad, dtype=np.float32),
+        quad_center_uv=quad_center_uv,
         tile_yaw=yaw,
         tile_pitch=pitch,
+        tile_fov_deg=tile_fov_deg,
         checker_normal_world=checker_normal_world,
         checker_normal_theta_deg=theta_n,
         checker_normal_phi_deg=phi_n,
         confidence=confidence,
         raw_swatches_bgr=np.clip(swatches_linear * 255, 0, 255).astype(np.uint8),
+        detection_method=method_used,
+        stage_label=stage_label,
+        crop_bounds=crop_bounds,
     )
-
 
 def _reorder_swatches_to_cc24(swatches: np.ndarray,
                               cc24_ref: Optional[np.ndarray] = None) -> tuple:
@@ -703,81 +1101,72 @@ def _reorder_swatches_to_cc24(swatches: np.ndarray,
 
 
 
-    """
-    Find the ColorChecker's 4-corner polygon in the tile using contour detection.
+def _find_checker_polygon(tile_u8_bgr: np.ndarray,
+                          search_bounds: Optional[Tuple[int, int, int, int]] = None) -> Optional[np.ndarray]:
+    """Find a plausible 4-corner checker polygon using contour detection."""
+    h, w = tile_u8_bgr.shape[:2]
+    if search_bounds is not None:
+        x0, y0, x1, y1 = search_bounds
+        x0 = int(np.clip(x0, 0, w - 1))
+        y0 = int(np.clip(y0, 0, h - 1))
+        x1 = int(np.clip(x1, x0 + 1, w))
+        y1 = int(np.clip(y1, y0 + 1, h))
+        roi = tile_u8_bgr[y0:y1, x0:x1]
+        offset = np.array([x0, y0], dtype=np.float32)
+    else:
+        roi = tile_u8_bgr
+        offset = np.zeros(2, dtype=np.float32)
 
-    Works because in a rectilinear (gnomonic) projection, straight edges remain
-    straight — this is precisely why we project to rectilinear before detecting.
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    rh, rw = gray.shape[:2]
+    min_area = rw * rh * 0.02
+    max_area = rw * rh * 0.85
+    best_poly = None
+    best_score = -1.0
 
-    Tries multiple Canny thresholds to handle varying contrast/size.
-    """
-    gray    = cv2.cvtColor(tile_u8_bgr, cv2.COLOR_BGR2GRAY)
-    h, w    = tile_u8_bgr.shape[:2]
-    min_area = w * h * 0.005   # checker can be as small as 0.5% of tile area
-    max_area = w * h * 0.90
-
-    best_poly  = None
-    best_score = -1
-
-    # Try multiple Canny threshold pairs — checker contrast varies a lot
     for lo, hi in [(20, 60), (30, 90), (50, 150), (10, 40)]:
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
-        edges   = cv2.Canny(blurred, lo, hi)
-        edges   = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=2)
-
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-
+        edges = cv2.Canny(blurred, lo, hi)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_area or area > max_area:
                 continue
-            peri   = cv2.arcLength(cnt, True)
+            peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
             if len(approx) != 4:
                 continue
-            rect      = cv2.minAreaRect(approx)
+            rect = cv2.minAreaRect(approx)
             rect_area = rect[1][0] * rect[1][1]
-            if rect_area < 1:
+            if rect_area < 1.0:
                 continue
-            # Score: rectangularity × aspect ratio proximity to CC24 (6:4 = 1.5)
             rect_score = area / rect_area
-            rw = max(rect[1][0], rect[1][1])
-            rh = min(rect[1][0], rect[1][1])
-            aspect = rw / max(rh, 1)
+            rw2 = max(rect[1][0], rect[1][1])
+            rh2 = min(rect[1][0], rect[1][1])
+            aspect = rw2 / max(rh2, 1.0)
             aspect_score = 1.0 / (1.0 + abs(aspect - 1.5))
-            score = rect_score * aspect_score
+            centre = np.mean(approx.reshape(4, 2), axis=0)
+            centre_score = 1.0 - min(np.linalg.norm((centre / [max(rw,1), max(rh,1)]) - 0.5), 0.7)
+            score = rect_score * aspect_score * max(centre_score, 0.2)
             if score > best_score:
                 best_score = score
-                best_poly  = approx.reshape(4, 2).astype(np.float32)
+                best_poly = approx.reshape(4, 2).astype(np.float32)
 
-    return best_poly
+    if best_poly is None:
+        return None
+    return best_poly + offset
+
 
 
 def _order_polygon_tl_tr_br_bl(poly):
     """Reorder 4 corner points to top-left, top-right, bottom-right, bottom-left."""
-    poly = np.array(poly, dtype=np.float32)
-    centre = poly.mean(axis=0)
-    angles = np.arctan2(poly[:,1] - centre[1], poly[:,0] - centre[0])
-    idx = np.argsort(angles)
-    ordered = poly[idx]
-    # Find top-left: closest to (-inf, -inf)
-    tl_idx = np.argmin(ordered[:,0] + ordered[:,1])
-    ordered = np.roll(ordered, -tl_idx, axis=0)
-    return ordered  # TL, TR, BR, BL  (image coords, y-down)
+    return _order_quad_tl_tr_br_bl(poly)
+
 
 
 def _grid_from_polygon(poly):
-    """
-    Given the 4 corner polygon of the checker (TL, TR, BR, BL),
-    compute the 24 swatch centre positions using perspective-correct
-    bilinear interpolation (the checker is a planar quad).
-
-    CC24 layout: 4 rows × 6 cols.
-    Swatch centres are at (col+0.5)/6, (row+0.5)/4 in normalised quad coords.
-    """
+    """Compute the 24 swatch centres from a checker quadrilateral."""
     poly = _order_polygon_tl_tr_br_bl(poly)
     tl, tr, br, bl = poly
 
@@ -785,15 +1174,14 @@ def _grid_from_polygon(poly):
     rows, cols = 4, 6
     for r in range(rows):
         for c in range(cols):
-            # Normalised position within the quad
-            s = (c + 0.5) / cols   # horizontal [0,1]
-            t = (r + 0.5) / rows   # vertical   [0,1]
-            # Bilinear interpolation over the quad
-            top    = tl + s * (tr - tl)
+            s = (c + 0.5) / cols
+            t = (r + 0.5) / rows
+            top = tl + s * (tr - tl)
             bottom = bl + s * (br - bl)
-            pt     = top + t * (bottom - top)
+            pt = top + t * (bottom - top)
             centres.append((float(pt[0]), float(pt[1])))
-    return centres   # list of 24 (x,y) tuples
+    return centres
+
 
 
 def _uniform_grid_fallback(out_w, out_h):
@@ -803,12 +1191,13 @@ def _uniform_grid_fallback(out_w, out_h):
     centres = []
     for r in range(4):
         for c in range(6):
-            x = margin_x + (c + 0.5) / 6 * (out_w - 2*margin_x)
-            y = margin_y + (r + 0.5) / 4 * (out_h - 2*margin_y)
+            x = margin_x + (c + 0.5) / 6 * (out_w - 2 * margin_x)
+            y = margin_y + (r + 0.5) / 4 * (out_h - 2 * margin_y)
             centres.append((float(x), float(y)))
     return centres
 
 
+# ─── Pose estimation ──────────────────────────────────────────────────────────
 # ─── Pose estimation ──────────────────────────────────────────────────────────
 
 def _estimate_checker_pose(pts_px: list,
@@ -885,9 +1274,11 @@ def _estimate_checker_pose(pts_px: list,
 
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
+
+
 def find_colorchecker_in_erp(
     erp_linear: np.ndarray,
-    fov_deg: float = 70.0,
+    fov_deg: float = 110.0,
     tile_w: int = 900,
     tile_h: int = 675,
     yaw_step_deg: float = 40.0,
@@ -895,19 +1286,17 @@ def find_colorchecker_in_erp(
     min_confidence: float = 0.05,
     colorspace: str = "acescg",
     debug_dir: Optional[str] = None,
+    read_backend: str = "colour",
+    compare_backends: bool = True,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
-    Cubemap two-pass sweep to find a ColorChecker Classic 24 inside an ERP panorama.
+    Find a ColorChecker Classic 24 inside an ERP panorama.
 
-    colorspace: working colorspace of erp_linear.
-      "acescg" (default) — use for EXR inputs from VFX pipelines.
-      "srgb"             — use for LDR (JPG/PNG) inputs linearised from sRGB.
-      This affects which CC24 reference values are used for patch ordering,
-      confidence scoring, WB derivation, and the colour matrix solve.
-
-    Returns:
-      swatches_linear : (24,3) float32 in the same colorspace as erp_linear
-      info            : dict with detection metadata
+    Detection strategy:
+      1. Coarse cubemap sweep at 110° FOV for overlap between faces.
+      2. Re-extract a centred 90° tile using the detected quadrilateral centre.
+      3. Re-extract a tighter centred tile (about 50° FOV, adaptively derived
+         from checker coverage) so swatch extraction sees a larger checker.
     """
     if not HAVE_CCD:
         return None, {"error": "colour-checker-detection not installed. "
@@ -917,174 +1306,189 @@ def find_colorchecker_in_erp(
         os.makedirs(debug_dir, exist_ok=True)
 
     best: Optional[CheckerDetection] = None
-    all_detections = []
     total_tiles = 0
 
-    # Resolve reference array for this colorspace — used for reordering,
-    # confidence scoring, and WB derivation throughout.
     cc24_ref = get_cc24_reference(colorspace)
     print(f"[cc-erp] Colorspace: {colorspace}  "
           f"(CC24 reference patch 22: "
           f"R={cc24_ref[21,0]:.4f} G={cc24_ref[21,1]:.4f} B={cc24_ref[21,2]:.4f})")
 
-    # Cubemap two-pass strategy:
-    #   Pass 1 — standard cube: 6 faces at 90° FOV, axis-aligned
-    #     front/back/left/right at pitch=0°, top at pitch=+90°, bottom at pitch=-90°
-    #   Pass 2 — rotated cube: whole cube rotated 45° yaw + 35° pitch
-    #     so face edges land in completely different places than pass 1
-    # 12 tiles total, mathematically guaranteed full sphere coverage.
-    # 90° FOV faces are the gold standard for rectilinear projection —
-    # zero fisheye distortion at edges, exactly what the library expects.
-
-    def _cubemap_faces(yaw_offset=0.0, pitch_offset=0.0):
-        """6 cubemap faces. yaw_offset/pitch_offset rotate the whole cube."""
-        faces = [
-            # (yaw, pitch) in world space for each face centre
-            (0,    0),    # front
-            (90,   0),    # right
-            (180,  0),    # back
-            (270,  0),    # left
-            (0,    90),   # top
-            (0,   -90),   # bottom
-        ]
-        result = []
-        for yaw, pitch in faces:
-            y = (yaw + yaw_offset) % 360
-            p = np.clip(pitch + pitch_offset, -90, 90)
-            result.append((float(y), float(p), 90.0, 1024, 1024))
-        return result
-
-    sweep_passes = [
-        ("cube-standard", _cubemap_faces(yaw_offset=0,  pitch_offset=0)),
-        ("cube-rotated",  _cubemap_faces(yaw_offset=45, pitch_offset=35)),
+    coarse_faces = [
+        (0.0,   0.0),
+        (90.0,  0.0),
+        (180.0, 0.0),
+        (270.0, 0.0),
+        (0.0,  90.0),
+        (0.0, -90.0),
     ]
+    coarse_fov = float(np.clip(fov_deg, 90.0, 140.0))
+    coarse_size = 1024
 
-    for pass_label, tiles_with_fov in sweep_passes:
-        n = len(tiles_with_fov)
-        fov0 = tiles_with_fov[0][2]
-        print(f"[cc-erp] Pass {pass_label}: {n} tiles (FOV={fov0}°)")
-        total_tiles += n
+    print(f"[cc-erp] Pass cube-overlap: {len(coarse_faces)} tiles (FOV={coarse_fov:.0f}°)")
+    for idx, (yaw, pitch) in enumerate(coarse_faces):
+        total_tiles += 1
+        tile_linear, map_uv = erp_to_rectilinear(
+            erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
-        for idx, (yaw, pitch, pass_fov, pass_tw, pass_th) in enumerate(tiles_with_fov):
-            tile_linear, map_uv = erp_to_rectilinear(
-                erp_linear, yaw, pitch, pass_fov, pass_tw, pass_th)
+        if debug_dir:
+            tile_u8 = _linear_to_u8_for_detection(tile_linear)
+            tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
+            cv2.putText(tile_bgr,
+                        f"cube-overlap yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
+                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+            tile_fname = f"sweep_cube_overlap_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"
+            cv2.imwrite(os.path.join(debug_dir, tile_fname), tile_bgr)
 
-            # Save every tile as PNG so we can see what the library sees
-            if debug_dir:
-                tile_u8 = _linear_to_u8_for_detection(tile_linear)
-                tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
-                cv2.putText(tile_bgr,
-                            f"{pass_label} yaw={yaw:.0f} pitch={pitch:.0f} fov={pass_fov:.0f}",
-                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 1)
-                tile_fname = (f"sweep_{pass_label}_y{int(yaw):03d}_p{int(pitch):+03d}.jpg")
-                cv2.imwrite(os.path.join(debug_dir, tile_fname), tile_bgr)
+        det = _detect_in_tile(
+            tile_linear, map_uv, erp_linear,
+            yaw, pitch, coarse_fov,
+            debug_dir, tile_idx=idx,
+            stage_label=f"coarse_{idx:02d}",
+            cc24_ref=cc24_ref,
+            read_backend=read_backend,
+            compare_backends=compare_backends)
 
-            det = _detect_in_tile(
-                tile_linear, map_uv, erp_linear,
-                yaw, pitch, debug_dir,
-                tile_idx=total_tiles + idx,
-                cc24_ref=cc24_ref)
+        if det is None or det.confidence < min_confidence:
+            continue
 
-            if det is None or det.confidence < min_confidence:
-                continue
-
-            all_detections.append(det)
-            if best is None or det.confidence > best.confidence:
-                best = det
-                print(f"[cc-erp]  [{pass_label}] tile {idx} "
-                      f"yaw={yaw:.0f}° pitch={pitch:.0f}°  "
-                      f"confidence={det.confidence:.3f}")
-
-        if best is not None and best.confidence > 0.6:
-            print(f"[cc-erp] Good detection found in {pass_label} pass "
-                  f"(conf={best.confidence:.3f}) — skipping remaining passes.")
-            break
+        if best is None or det.confidence > best.confidence:
+            best = det
+            print(f"[cc-erp]  [cube-overlap] tile {idx} yaw={yaw:.0f}° pitch={pitch:.0f}° confidence={det.confidence:.3f}")
 
     if best is None:
-        print(f"[cc-erp] No ColorChecker found after full sweep ({total_tiles} tiles).")
+        print(f"[cc-erp] No ColorChecker found after coarse sweep ({total_tiles} tiles).")
         return None, {"found": False, "tiles_searched": total_tiles}
 
-    print(f"[cc-erp] Best detection: tile yaw={best.tile_yaw:.0f}° "
-          f"pitch={best.tile_pitch:.0f}° confidence={best.confidence:.3f}")
+    print(f"[cc-erp] Best coarse detection: tile yaw={best.tile_yaw:.0f}° pitch={best.tile_pitch:.0f}° confidence={best.confidence:.3f}")
 
-    # ── Targeted re-detection centred on the found checker ────────────────
-    # The coarse sweep uses fixed tile boundaries. If the checker straddles
-    # a tile edge it will be partially cropped, giving a low confidence score
-    # or wrong swatch positions. Now we know approximately where the checker
-    # is (its swatch centres in ERP space), so we re-extract a tile centred
-    # exactly on the checker's median UV position and re-run detection.
-    #
-    # This is a single targeted pass — no loop — and uses a wider FOV
-    # (90°) to ensure the whole checker fits even if our position estimate
-    # is slightly off.
-    centre_uv = np.median(best.swatch_centres_uv, axis=0)  # (2,) median u,v
-    u_c, v_c  = float(centre_uv[0]), float(centre_uv[1])
+    def _uv_to_yaw_pitch(uv: np.ndarray) -> Tuple[float, float]:
+        u_c, v_c = float(uv[0]), float(uv[1])
+        refine_yaw = (u_c - 0.5) * 360.0
+        refine_yaw = float((refine_yaw + 180.0) % 360.0 - 180.0)
+        refine_pitch = float(np.clip((0.5 - v_c) * 180.0, -85.0, 85.0))
+        return refine_yaw, refine_pitch
 
-    # Convert ERP (u,v) → yaw/pitch in degrees
-    refine_yaw   = (u_c - 0.5) * 360.0
-    refine_yaw   = float((refine_yaw + 180) % 360 - 180)
-    refine_pitch = float(np.clip((0.5 - v_c) * 180.0, -60.0, 60.0))
+    def _adaptive_tight_fov(det: CheckerDetection, img_w: int, img_h: int, current_fov: float) -> float:
+        quad = np.asarray(det.quad_tile, dtype=np.float32)
+        if quad.shape != (4, 2):
+            return 50.0
+        quad_w = float(np.max(quad[:, 0]) - np.min(quad[:, 0]))
+        quad_h = float(np.max(quad[:, 1]) - np.min(quad[:, 1]))
+        frac = max(quad_w / max(float(img_w), 1.0), quad_h / max(float(img_h), 1.0))
+        if frac <= 1e-4:
+            return 50.0
+        target_frac = 0.50
+        fov = current_fov * frac / target_frac
+        return float(np.clip(fov, 45.0, 65.0))
 
-    # Sanity check: if the back-projected UV is far from the coarse tile's
-    # own yaw/pitch, the swatch centres are from _uniform_grid_fallback
-    # (i.e. the quadrilateral wasn't extracted). Fall back to the coarse
-    # tile position in that case — it's always better than a wrong UV.
-    coarse_yaw_norm = float((best.tile_yaw + 180) % 360 - 180)
-    yaw_err = abs(((refine_yaw - coarse_yaw_norm) + 180) % 360 - 180)
-    if yaw_err > 60.0:
-        print(f"[cc-erp] Refinement UV implausible (yaw_err={yaw_err:.1f}°) — "
-              f"using coarse tile centre yaw={best.tile_yaw:.1f}° pitch={best.tile_pitch:.1f}°")
-        refine_yaw   = coarse_yaw_norm
-        refine_pitch = float(np.clip(best.tile_pitch, -60.0, 60.0))
+    locator_det = best
+    refinement_stage = "coarse"
+    refined = False
 
-    print(f"[cc-erp] Targeted re-detection at yaw={refine_yaw:.1f}° "
-          f"pitch={refine_pitch:.1f}° (centred on checker)")
+    wide_yaw, wide_pitch = _uv_to_yaw_pitch(locator_det.quad_center_uv)
+    print(f"[cc-erp] Recentered wide pass at yaw={wide_yaw:.1f}° pitch={wide_pitch:.1f}°")
+    tile_wide, map_uv_wide = erp_to_rectilinear(
+        erp_linear, wide_yaw, wide_pitch, 90.0, 1024, 1024)
+    det_wide = _detect_in_tile(
+        tile_wide, map_uv_wide, erp_linear,
+        wide_yaw, wide_pitch, 90.0,
+        debug_dir, tile_idx="recenter_wide",
+        stage_label="recenter_wide",
+        cc24_ref=cc24_ref,
+        read_backend=read_backend,
+        compare_backends=compare_backends)
 
-    refine_fov = 60.0   # tighter than coarse, looser than fine — centres on checker
-    tile_r, map_uv_r = erp_to_rectilinear(
-        erp_linear, refine_yaw, refine_pitch,
-        refine_fov, tile_w, tile_h)
-
-    det_refined = _detect_in_tile(
-        tile_r, map_uv_r, erp_linear,
-        refine_yaw, refine_pitch,
-        debug_dir, tile_idx=-1,
-        cc24_ref=cc24_ref)   # tile_idx=-1 flags this as the refinement tile
-
-    if det_refined is not None and det_refined.confidence >= best.confidence * 0.8:
-        # Accept refined result if it's not significantly worse.
-        # (It might be slightly lower confidence if the wider FOV makes the
-        #  checker smaller relative to the tile, but the swatch positions
-        #  will be more accurate because the checker is fully visible.)
-        improvement = det_refined.confidence - best.confidence
-        print(f"[cc-erp] Refined detection confidence={det_refined.confidence:.3f} "
-              f"({'↑' if improvement >= 0 else '↓'}{abs(improvement):.3f} vs coarse)")
-        best = det_refined
+    if det_wide is not None:
+        best = det_wide
         refined = True
+        refinement_stage = "recenter_wide"
+        print(f"[cc-erp] Wide centred detection selected for swatch read (conf={det_wide.confidence:.3f}; coarse locator={locator_det.confidence:.3f})")
     else:
-        _ref_conf_str = f"{det_refined.confidence:.3f}" if det_refined is not None else "N/A"
-        print(f"[cc-erp] Coarse detection kept (refined confidence={_ref_conf_str} "
-              f"vs coarse {best.confidence:.3f})")
-        refined = False
+        print(f"[cc-erp] Wide centred detection failed - keeping coarse locator result for now (conf={locator_det.confidence:.3f})")
 
-    print(f"[cc-erp] Final: confidence={best.confidence:.3f}  "
-          f"checker θ={best.checker_normal_theta_deg:.1f}° "
-          f"φ={best.checker_normal_phi_deg:.1f}°")
+    tight_source = det_wide if det_wide is not None else locator_det
+    tight_yaw, tight_pitch = _uv_to_yaw_pitch(tight_source.quad_center_uv)
+    tight_fov = _adaptive_tight_fov(tight_source, 1024, 1024, 90.0)
+    print(f"[cc-erp] Recentered tight pass at yaw={tight_yaw:.1f}° pitch={tight_pitch:.1f}° fov={tight_fov:.1f}°")
+    tile_tight, map_uv_tight = erp_to_rectilinear(
+        erp_linear, tight_yaw, tight_pitch, tight_fov, tile_w, tile_h)
+    det_tight = _detect_in_tile(
+        tile_tight, map_uv_tight, erp_linear,
+        tight_yaw, tight_pitch, tight_fov,
+        debug_dir, tile_idx="recenter_tight",
+        stage_label="recenter_tight",
+        cc24_ref=cc24_ref,
+        read_backend=read_backend,
+        compare_backends=compare_backends)
+
+    if det_tight is not None:
+        best = det_tight
+        refined = True
+        refinement_stage = "recenter_tight"
+        print(f"[cc-erp] Tight centred detection selected for final swatch read (conf={det_tight.confidence:.3f})")
+    elif det_wide is not None:
+        print(f"[cc-erp] Tight centred detection failed - keeping wide centred swatch read (conf={det_wide.confidence:.3f})")
+    else:
+        print(f"[cc-erp] Tight centred detection failed - falling back to coarse locator swatch read (conf={locator_det.confidence:.3f})")
+
+    print(f"[cc-erp] Final: confidence={best.confidence:.3f}  checker θ={best.checker_normal_theta_deg:.1f}° φ={best.checker_normal_phi_deg:.1f}°")
+
+    def _debug_label(det: CheckerDetection) -> str:
+        if det.stage_label.startswith("coarse_"):
+            try:
+                return str(int(det.stage_label.split("_")[-1]))
+            except Exception:
+                return det.stage_label
+        return det.stage_label
 
     if debug_dir:
         _save_final_debug(debug_dir, best, erp_linear, cc24_ref=cc24_ref)
 
+        locator_label = _debug_label(locator_det)
+        best_label = _debug_label(best)
+
+        locator_candidates = [
+            os.path.join(debug_dir, f"tile_{locator_label}_detected.jpg"),
+            os.path.join(debug_dir, f"tile_{locator_det.stage_label}_locator.jpg"),
+            os.path.join(debug_dir, f"tile_{locator_det.stage_label}_detected.jpg"),
+        ]
+        gui_tile = os.path.join(debug_dir, "cc_detected_tile.jpg")
+        for src in locator_candidates:
+            if os.path.exists(src):
+                shutil.copyfile(src, gui_tile)
+                break
+
+        rectified_candidates = [
+            os.path.join(debug_dir, f"tile_{best_label}_rectified_pass2.jpg"),
+            os.path.join(debug_dir, f"tile_{best_label}_rectified_checker.jpg"),
+            os.path.join(debug_dir, f"tile_{best_label}_rectified_pass1.jpg"),
+            os.path.join(debug_dir, f"tile_{best.stage_label}_rectified_pass2.jpg"),
+            os.path.join(debug_dir, f"tile_{best.stage_label}_rectified_checker.jpg"),
+            os.path.join(debug_dir, f"tile_{best.stage_label}_rectified_pass1.jpg"),
+        ]
+        for src in rectified_candidates:
+            if os.path.exists(src):
+                shutil.copyfile(src, os.path.join(debug_dir, "cc_rectified_final.jpg"))
+                break
+
     info = {
-        "found":                    True,
-        "tiles_searched":           total_tiles,
-        "refinement_pass":          refined,
-        "best_tile_yaw_deg":        best.tile_yaw,
-        "best_tile_pitch_deg":      best.tile_pitch,
-        "confidence":               best.confidence,
-        "checker_normal_world":     best.checker_normal_world.tolist(),
+        "found": True,
+        "tiles_searched": total_tiles,
+        "refinement_pass": refined,
+        "refinement_stage": refinement_stage,
+        "best_tile_yaw_deg": best.tile_yaw,
+        "best_tile_pitch_deg": best.tile_pitch,
+        "best_tile_fov_deg": best.tile_fov_deg,
+        "confidence": best.confidence,
+        "checker_normal_world": best.checker_normal_world.tolist(),
         "checker_normal_theta_deg": best.checker_normal_theta_deg,
-        "checker_normal_phi_deg":   best.checker_normal_phi_deg,
-        "swatch_centres_uv":        best.swatch_centres_uv.tolist(),
+        "checker_normal_phi_deg": best.checker_normal_phi_deg,
+        "swatch_centres_uv": best.swatch_centres_uv.tolist(),
+        "quad_center_uv": best.quad_center_uv.tolist(),
+        "detection_method": best.detection_method,
+        "stage_label": best.stage_label,
+        "read_backend": read_backend,
+        "compare_backends": bool(compare_backends),
     }
     return best.swatches_linear, info
 
