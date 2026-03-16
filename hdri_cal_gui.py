@@ -478,25 +478,56 @@ class ReportPanel(QWidget):
 
 
 class SliderField(QWidget):
-    def __init__(self, minimum: int, maximum: int, initial: int, formatter, parent=None):
+    def __init__(self, minimum: int, maximum: int, initial: int, formatter,
+                 *, decimals: int = 0, scale: float = 1.0, suffix: str = "", parent=None):
         super().__init__(parent)
         self._formatter = formatter
+        self._scale = float(scale)
+        self._syncing = False
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(minimum, maximum)
         self.slider.setValue(initial)
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(minimum / self._scale, maximum / self._scale)
+        self.spin.setDecimals(decimals)
+        self.spin.setSingleStep(max(1.0 / self._scale, 10 ** (-decimals)))
+        if suffix:
+            self.spin.setSuffix(suffix)
+        self.spin.setValue(initial / self._scale)
         self.label = QLabel()
         self.label.setMinimumWidth(72)
         self.label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lay.addWidget(self.slider, 1)
+        lay.addWidget(self.spin)
         lay.addWidget(self.label)
-        self.slider.valueChanged.connect(self._refresh_label)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        self.spin.valueChanged.connect(self._on_spin_changed)
         self._refresh_label(self.slider.value())
 
     def _refresh_label(self, value: int):
         self.label.setText(self._formatter(value))
+
+    def _on_slider_changed(self, value: int):
+        self._refresh_label(value)
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.spin.setValue(value / self._scale)
+        finally:
+            self._syncing = False
+
+    def _on_spin_changed(self, value: float):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.slider.setValue(int(round(value * self._scale)))
+        finally:
+            self._syncing = False
 
     def value(self) -> int:
         return int(self.slider.value())
@@ -510,6 +541,7 @@ class SliderField(QWidget):
 
     def setToolTip(self, text: str):
         self.slider.setToolTip(text)
+        self.spin.setToolTip(text)
         self.label.setToolTip(text)
         super().setToolTip(text)
 
@@ -568,13 +600,13 @@ class SettingsPanel(QScrollArea):
         self.center_hdri.setChecked(True)
         self.center_hdri.setToolTip("Shift azimuth so the sun sits at the centre column (phi=0)")
 
-        self.base_intensity = SliderField(1, 1600, 100, lambda v: f"{v / 100.0:.2f}x")
+        self.base_intensity = SliderField(1, 1600, 100, lambda v: f"{v / 100.0:.2f}x", decimals=2, scale=100.0)
         self.base_intensity.setToolTip("Base input intensity multiplier for preview and optional manual override")
 
-        self.base_temperature = SliderField(2000, 15000, 6500, lambda v: f"{v:d} K")
+        self.base_temperature = SliderField(2000, 15000, 6500, lambda v: f"{v:d} K", decimals=0, scale=1.0, suffix=" K")
         self.base_temperature.setToolTip("Photographic white balance temperature")
 
-        self.base_tint = SliderField(-100, 100, 0, lambda v: f"{v / 100.0:+.2f}")
+        self.base_tint = SliderField(-100, 100, 0, lambda v: f"{v / 100.0:+.2f}", decimals=2, scale=100.0)
         self.base_tint.setToolTip("Tint adjustment: +1.00 = magenta, -1.00 = green")
 
         f.addRow("Mode",            self.calibration_mode)
@@ -582,6 +614,13 @@ class SettingsPanel(QScrollArea):
         f.addRow("Intensity",       self.base_intensity)
         f.addRow("Temperature",     self.base_temperature)
         f.addRow("Tint",            self.base_tint)
+        reset_row = QHBoxLayout()
+        self.reset_base_btn = QPushButton("Reset Photographic")
+        self.reset_base_btn.setMaximumWidth(140)
+        self.reset_base_btn.clicked.connect(self._reset_photographic_controls)
+        reset_row.addWidget(self.reset_base_btn)
+        reset_row.addStretch()
+        f.addRow("",                reset_row)
         f.addRow("",                self.center_hdri)
         self._lay.addWidget(grp)
 
@@ -671,6 +710,11 @@ class SettingsPanel(QScrollArea):
         show_advanced = (self.calibration_mode.currentText() == "advanced")
         for grp in self._adv_groups:
             grp.setVisible(show_advanced)
+
+    def _reset_photographic_controls(self):
+        self._set_base_intensity_value(1.0)
+        self._set_base_temperature_value(6500.0)
+        self._set_base_tint_value(0.0)
 
     def _base_intensity_value(self) -> float:
         return self.base_intensity.value() / 100.0
