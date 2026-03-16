@@ -2,6 +2,7 @@
 numpy>=1.24
 opencv-python>=4.7
 imageio>=2.28          # EXR read/write — requires OpenEXR system library (see below)
+Pillow>=9.0           # explicit LDR/WebP support for imageio/Pillow backends
 scipy>=1.10
 
 # ── ColorChecker detection ────────────────────────────────────────────────────
