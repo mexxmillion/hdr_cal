@@ -58,10 +58,13 @@ This only happens once. Requires an internet connection on first run. Set `--wb-
 ## Quick Start
 
 ```bash
-# Auto mode — finds chart if present, falls back to sphere WB
+# Auto mode — if a chart is found, use it; otherwise leave WB/exposure alone
 python hdri_cal.py shot.exr --out shot_cal.exr
 
-# Check a file without processing (fast triage)
+# Treat a linear-sRGB HDR/EXR correctly and convert it to ACEScg on load
+python hdri_cal.py shot_srgb.exr --colorspace srgb --out shot_cal.exr
+
+# Validate only (no EXR written)
 python hdri_cal.py shot.exr --validate-only
 
 # GUI
@@ -70,84 +73,28 @@ python hdri_cal_gui.py
 
 ---
 
-## Algorithm
+## Current Pipeline
 
-The pipeline runs these stages in order:
+The pipeline now works in this order:
 
 ```
-load → colorspace detect → resolution scale → orientation validate
-  → ColorChecker search (gnomonic tile sweep)
-  → white balance (chart / sphere / dome / kelvin / manual)
-  → WB sanity check (irradiance cross-check)
-  → exposure solve (chart patch 22 / sphere render / metering)
-  → hot lobe extraction (sun disc mask)
-  → HDRI centering (azimuth shift → sun at φ=0)
-  → base dome irradiance integrate (sky with sun zeroed)
-  → sun lobe neutralise (desaturate to white)
-  → per-channel gain solve (card-up neutral method)
-  → apply gains → save EXR
-  → final sphere render (validation)
-  → report.json
+load -> input-primaries conversion -> ACEScg working space
+  -> orientation validate
+  -> optional ColorChecker search / rectified pass-2 read
+  -> WB source solve
+  -> exposure source solve
+  -> hot lobe extraction
+  -> HDRI centering
+  -> sun solve
+  -> optional final balance trim
+  -> save EXR + previews + report.json
 ```
 
-### White Balance
-
-White balance is derived from one of several sources and applied as per-channel RGB multipliers before any energy solve.
-
-**Chart (default when found):** The pipeline sweeps the equirectangular image as six gnomonic (rectilinear) cube-face tiles. Each tile is passed to `colour-checker-detection`:
-
-1. Segmentation detects the quad and returns 24 swatch colours
-2. If YOLOv8 is available, it runs on a tight crop of the detected quad — whichever result has lower neutral-ramp chroma error wins
-3. Patch 22 (18% grey neutral) is Reinhard-inverted from tonemapped space back to linear
-4. WB scale = `reference_linear / measured_linear` per channel, G-normalised
-5. A sanity check compares chart WB against sphere render WB — large disagreement (>0.15) raises a warning
-
-**Sphere render:** Renders a Lambertian grey sphere into the HDRI, takes the mean RGB of illuminated pixels, and solves for the scale that neutralises it.
-
-**Dome grey-world:** Cosine-weighted mean of the upper hemisphere, assumed achromatic.
-
-**Kelvin / Manual:** Direct colour temperature conversion or explicit R,G,B multipliers.
-
-### Exposure
-
-Exposure sets the absolute photometric scale — the relationship between pixel values and real-world irradiance.
-
-**Chart (patch 22):** After white balance, patch 22 should read `albedo × E_on_chart / π`. For a chart inside the HDRI facing upward, `E_on_chart = π` (full hemisphere irradiance), giving `exposure_scale = albedo / patch22_luma`. This is the most accurate method.
-
-**Sphere render:** Renders a grey sphere, compares mean luma to `albedo`, solves the scale directly.
-
-**Metering:** Measures median or irradiance-weighted luma of a region (lower dome, full scene, upper hemisphere) and scales to `meter_target`.
-
-### Sun Lobe Reconstruction (Card-Up Neutral Solve)
-
-Clipped HDRIs have their sun disc saturated at the sensor ceiling. The pipeline reconstructs physically plausible sun energy using the **card-up neutral method**:
-
-**Goal:** after reconstruction, a grey card (albedo = 0.18) facing directly upward should read exactly `[0.18, 0.18, 0.18]` — neutral on all channels.
-
-**Method:**
-
-1. Zero the sun lobe to get the base dome (sky only)
-2. Compute upper-hemisphere irradiance from the base dome per channel:
-   `E_base_c = Σ base[c] · cos+(y) · dΩ`
-3. What the base dome delivers to a card facing up:
-   `card_base_c = albedo × E_base_c / π`
-   (may be blue on a blue sky, warm on sunset — whatever the sky colour is)
-4. The sun lobe must supply the deficit per channel:
-   `E_needed_c = π - E_base_c`
-5. Neutralise the lobe to `[L, L, L]` white (removes sky contamination from clipped pixels)
-6. Per-channel gains on the neutralised lobe:
-   `gain_c = E_needed_c / E_lobe_neutral_c`
-
-**Result:**
-- Sky stays its natural colour (untouched)
-- Sun disc starts white, then gets warm gains (high R, low B on blue sky scenes) to fill what the sky is missing → sun appears physically warm/orange
-- Upward card reads `[0.18, 0.18, 0.18]` exactly on all channels
-
-Gains are soft-rolled above `--sun-gain-rolloff` and hard-capped at `--sun-gain-ceiling` to prevent runaway values on severely clipped inputs.
-
-### Validation
-
-After the gain solve the pipeline renders a Lambertian grey sphere into the final corrected HDRI and computes predicted vs analytical irradiance values. These are written to `report.json` and printed in the log.
+Important behavior:
+- Internal processing is always in `ACEScg`.
+- `--colorspace srgb` means: interpret HDR/EXR input as linear sRGB, then convert to linear ACEScg before any processing.
+- LDR inputs such as `.jpg`, `.jpeg`, `.png`, and `.webp` are treated as sRGB-encoded images, decoded to linear sRGB, then converted to ACEScg.
+- In `auto` mode, if no chart is found, WB and exposure both fall back to `none`.
 
 ---
 
@@ -156,207 +103,182 @@ After the gain solve the pipeline renders a Lambertian grey sphere into the fina
 ### Basic usage
 
 ```bash
-python hdri_cal.py INPUT.exr [options]
+python hdri_cal.py INPUT [options]
 ```
 
-### Essential flags
+Accepted inputs:
+- `.exr`
+- `.hdr`
+- `.jpg`
+- `.jpeg`
+- `.png`
+- `.webp`
+
+### Core flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--out PATH` | `input_cal.exr` | Output EXR path |
-| `--debug-dir DIR` | `debug_hdri` | Folder for preview images and report.json |
-| `--res` | `full` | Processing resolution: `full`, `half`, `quarter` |
-| `--validate-only` | off | Fast triage pass — no EXR written |
-| `--no-center-hdri` | off | Skip azimuth shift (keep sun where it is) |
+| `--out PATH` | `corrected.exr` | Output calibrated EXR |
+| `--debug-dir DIR` | `debug_hdri` | Debug previews and `report.json` |
+| `--res` | `full` | `full`, `half`, `quarter` |
+| `--colorspace` | auto | Force input primaries: `acescg` or `srgb` |
+| `--validate-only` | off | Validate only, no EXR output |
+| `--center-hdri` | on | Center azimuth on the dominant hot lobe |
+| `--no-center-hdri` | off | Disable centering |
 
-### White balance
-
-| Flag | Default | Description |
-|---|---|---|
-| `--wb-source` | `auto` | `auto` `chart` `sphere` `dome` `kelvin` `manual` `none` |
-| `--kelvin VALUE` | — | Colour temperature, used when `--wb-source kelvin` |
-| `--rgb-scale R,G,B` | — | Manual multipliers, used when `--wb-source manual` |
-| `--dome-wb MODE` | `upper_dome` | Sub-mode for `--wb-source dome`: `upper_dome` `full_dome` `hot_exclude` |
-
-**WB source fallback chain (auto):**
-```
-chart (found, conf ≥ 0.2) → sphere → none
-```
-
-### Exposure
+### White balance and exposure
 
 | Flag | Default | Description |
 |---|---|---|
-| `--exposure-source` | `auto` | `auto` `chart` `sphere` `metering` `none` |
-| `--metering-mode` | `bottom_dome` | Used when `--exposure-source metering`: `bottom_dome` `whole_scene` `upper_hemi_irradiance` `swatch` |
-| `--meter-target` | `0.18` | Target value for metering (0.18 = 18% grey) |
-| `--albedo` | `0.18` | Reflectance of the reference grey card / sphere |
+| `--wb-source` | `auto` | `auto`, `chart`, `none` |
+| `--exposure-source` | `auto` | `auto`, `chart`, `none` |
+| `--albedo` | `0.18` | Target grey reflectance |
 
-**Exposure source fallback chain (auto):**
-```
-chart (found, conf ≥ 0.2) → sphere
-```
+Auto behavior:
+- `WB`: chart if found, else none
+- `Exposure`: chart if found, else none
 
-### Sun lobe
+### Sun solve and final trim
 
 | Flag | Default | Description |
 |---|---|---|
-| `--sun-threshold` | `0.1` | Fraction below peak defining the lobe boundary. Lower = tighter disc |
-| `--lobe-neutralise` | `1.0` | Desaturate sun lobe before boost: `1.0` = fully white, `0.0` = keep colour |
-| `--sun-gain-ceiling` | `2000` | Hard cap on per-channel gain |
-| `--sun-gain-rolloff` | `500` | Gains above this value soft-roll (sqrt curve) to the ceiling |
-| `--sun-upper-only` | off | Restrict lobe search to upper hemisphere only |
+| `--sphere-solve` | `energy_conservation` | `energy_conservation`, `sun_facing_card`, `sun_facing_vertical`, `none` |
+| `--final-balance-target` | `none` | `none` or `auto` |
+| `--sun-threshold` | `0.1` | Lobe boundary fraction below peak |
+| `--lobe-neutralise` | `1.0` | White the lobe before gain solve |
+| `--sun-gain-ceiling` | `2000` | Hard cap on per-channel sun gain |
+| `--sun-gain-rolloff` | `500` | Soft rolloff start |
 
-### Advanced
+`--sphere-solve` meanings:
+- `energy_conservation`: upward-facing grey card target
+- `sun_facing_card`: grey card whose normal points at the sun
+- `sun_facing_vertical`: vertical grey card rotated toward the sun azimuth
+- `none`: skip sun solve
+
+`--final-balance-target auto`:
+- measures the imaginary target card implied by `--sphere-solve`
+- computes one final global RGB multiplier
+- trims the output so that target is neutral at `albedo`
+
+### ColorChecker options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--colorspace` | auto | Force `acescg` or `srgb` (auto-detected from extension) |
-| `--sphere-res` | `96` | Validation sphere render resolution |
-| `--ref-sphere PATH` | — | Grey ball plate photograph for physical exposure calibration |
+| `--colorchecker PATH` | — | Separate ColorChecker plate |
+| `--colorchecker-in-hdri` | off | Search chart inside the HDRI |
+| `--cc-read-backend` | `colour` | `auto`, `colour`, `contour` |
+| `--cc-compare-backends` | off | Save comparison overlays |
+
+Notes:
+- The current default read path is `colour`.
+- The detector uses a coarse tile sweep plus centered refinement.
+- Final swatch measurement comes from the rectified pass-2 checker read.
 
 ---
 
-## Common workflows
+## Common Workflows
 
-### Auto (recommended default)
+### Recommended auto mode
 ```bash
 python hdri_cal.py shot.exr --out shot_cal.exr
 ```
-Finds ColorChecker if present, derives WB and exposure from patch 22, reconstructs sun energy using card-up neutral solve.
 
-### Chart in shadow — use sphere for exposure only
+### Sun solve only, no chart WB/exposure
 ```bash
-python hdri_cal.py shot.exr --wb-source chart --exposure-source sphere
-```
-Chart WB is still valid (it's a ratio). Sphere exposure is more reliable when the chart isn't in direct sun.
-
-### No chart in shot
-```bash
-python hdri_cal.py shot.exr --wb-source sphere --exposure-source sphere
+python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve energy_conservation
 ```
 
-### Keep original azimuth (don't centre on sun)
+### Target a card facing the sun
 ```bash
-python hdri_cal.py shot.exr --no-center-hdri
+python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve sun_facing_card
 ```
 
-### Batch validate before processing
+### Target a vertical card facing the sun azimuth
 ```bash
-# PowerShell
-Get-ChildItem .\plates\*.exr | ForEach-Object {
-    python hdri_cal.py $_.FullName --validate-only --debug-dir .\validate_tmp
-}
-
-# bash
-for f in plates/*.exr; do
-    python hdri_cal.py "$f" --validate-only --debug-dir ./validate_tmp
-done
+python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve sun_facing_vertical
 ```
 
-### Severely clipped input — raise gain ceiling
+### Add the final post-balance trim
 ```bash
-python hdri_cal.py shot.exr --sun-gain-ceiling 5000 --sun-gain-rolloff 1000
+python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve sun_facing_vertical   --final-balance-target auto
 ```
 
-### Half resolution for faster turnaround
+### Validate only
 ```bash
-python hdri_cal.py shot.exr --res half
+python hdri_cal.py shot.exr --validate-only
 ```
 
 ---
 
 ## GUI
 
-```bash
-python hdri_cal_gui.py
-```
+The GUI now has two top-level modes:
+- `auto`
+- `advanced`
 
-The GUI wraps the same pipeline with a drag-and-drop queue, live preview tabs, and a simple/advanced settings toggle.
+### Auto mode
+- If a chart is found, use chart WB/exposure.
+- If no chart is found, leave WB/exposure unchanged.
+- You can still set:
+  - `Input primaries`
+  - `Intensity`
+  - `Temperature`
+  - `Tint`
+  - `Centre HDRI on sun`
 
-**Simple mode** exposes the three most common controls:
-- **WB source** — how to derive white balance
-- **Exposure source** — how to set photometric scale
-- **Centre HDRI on sun** — whether to shift azimuth
+### Advanced mode
+Advanced reveals explicit controls for:
+- `WB source`
+- `Exposure source`
+- `Sun solve`
+- `Final balance`
+- `Albedo`
+- `Sun threshold`
+- `Lobe neutralise`
+- `Gain ceiling`
+- `Gain rolloff`
 
-**Advanced mode** (click the toggle) reveals:
-- WB detail — kelvin value, manual RGB, dome sub-mode
-- Exposure detail — metering mode, meter target, albedo
-- Sun/lobe — threshold, neutralise strength, gain ceiling/rolloff
-- Misc — colorspace override, sphere resolution, reference sphere plate
+### Source preview
+The GUI provides an immediate `Source` preview on file drop/select.
+It is re-rendered when you change, per queued file:
+- `Input primaries`
+- `Intensity`
+- `Temperature`
+- `Tint`
 
-**Validate button** runs a fast triage pass on all queued files without processing them. Reports clip fraction, orientation, and chroma imbalance. Useful for checking a whole shoot before committing to full calibration.
+Each queued HDRI stores its own settings, so one file can be `acescg` and another `srgb` with different photographic adjustments.
 
-**Preview tabs:**
-| Tab | Contents |
-|---|---|
-| WB | HDRI after white balance |
-| Exposed | After exposure scale |
-| Lobe | Sun disc mask |
-| Chart | Detected ColorChecker swatches in ERP |
-| Swatches | Patch comparison: measured vs reference |
-| Final | Validation sphere render |
+### Photographic controls
+- `Intensity`: global preview/manual input multiplier
+- `Temperature`: photographic WB temperature
+- `Tint`: `+1.00 = magenta`, `-1.00 = green`
+- `Reset Photographic`: restore `1.0 / 6500 K / 0.0`
 
----
+The controls now support both:
+- slider scrubbing
+- direct typed numeric entry
 
-## Output files
+### Preview tabs
+The GUI preview tabs now include:
+- `Source`
+- `WB`
+- `Exposed`
+- `Lobe`
+- `Chart Tile`
+- `Rectified`
+- `Swatches`
+- `Solved`
+- `Balanced`
+- `Final`
 
-After processing, the `--debug-dir` folder contains:
-
-| File | Description |
-|---|---|
-| `01_wb_preview.png` | HDRI after white balance |
-| `02_exposed_preview.png` | After exposure scaling |
-| `03_hot_mask.png` | Sun lobe mask |
-| `07_corrected_preview.png` | After gain solve |
-| `08_verify_sphere_final.png` | Final validation sphere render |
-| `base_dome_calibrated.exr` | Base sky with sun zeroed (useful for debugging) |
-| `report.json` | Full JSON report with all metrics |
-| `colorchecker/` | Chart detection debug images (if chart found) |
-
-The calibrated EXR is written to `--out`.
-
----
-
-## report.json structure
-
-```json
-{
-  "input": "shot.exr",
-  "working_resolution": [2048, 4096],
-  "colorspace": "acescg",
-  "orientation_energy_ratio": 3.65,
-  "wb": {
-    "source": "colorchecker_patch22",
-    "rgb_scale": [0.77, 1.0, 1.21]
-  },
-  "exposure": {
-    "source": "chart",
-    "scale": 0.82
-  },
-  "sun": {
-    "theta_deg": 41.2,
-    "phi_deg": 0.0,
-    "elevation_deg": 48.8
-  },
-  "gain_solve": {
-    "mode": "card_up_neutral",
-    "gains": [198.1, 174.8, 132.2],
-    "card_base": [0.072, 0.085, 0.108],
-    "card_final": [0.180, 0.180, 0.180]
-  },
-  "energy_validation": {
-    "E_upper": 1.82,
-    "pred_flat_card_up": 0.18000,
-    "pred_sphere_mean": 0.04500,
-    "rendered_sphere_mean": 0.04487,
-    "rendered_vs_analytical_err": 0.0029
-  }
-}
-```
+### Queue actions
+You can now:
+- remove a selected file
+- requeue a selected file
+- clear all files
+- open the output folder
 
 ---
-
 ## Troubleshooting
 
 **ColorChecker not found**
