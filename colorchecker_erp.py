@@ -338,17 +338,22 @@ class CheckerDetection:
 
 
 def _linear_to_u8_for_detection(img_linear: np.ndarray) -> np.ndarray:
-    """Convert linear float HDR tile to uint8 sRGB for the detector."""
-    # Tonemap: exposure-normalise to a sensible display range
-    lum = 0.2126*img_linear[...,0] + 0.7152*img_linear[...,1] + 0.0722*img_linear[...,2]
+    """Convert linear ACEScg HDR to uint8 sRGB for detection/debug display."""
+    img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
+    if apply_matrix_3x3 is not None and M_ACESCG_TO_SRGB_LINEAR is not None:
+        img_disp = np.clip(apply_matrix_3x3(img_linear, M_ACESCG_TO_SRGB_LINEAR), 0.0, None)
+    else:
+        img_disp = img_linear
+    lum = 0.2126 * img_disp[..., 0] + 0.7152 * img_disp[..., 1] + 0.0722 * img_disp[..., 2]
     valid = lum[lum > 0]
     if valid.size:
         scale = 1.0 / max(float(np.percentile(valid, 99)), 1e-6)
     else:
         scale = 1.0
-    srgb = np.where(img_linear*scale <= 0.0031308,
-                    img_linear*scale * 12.92,
-                    1.055 * np.power(np.clip(img_linear*scale, 1e-9, None), 1/2.4) - 0.055)
+    disp = np.clip(img_disp * scale, 0.0, None)
+    srgb = np.where(disp <= 0.0031308,
+                    disp * 12.92,
+                    1.055 * np.power(np.clip(disp, 1e-9, None), 1 / 2.4) - 0.055)
     return np.clip(srgb * 255 + 0.5, 0, 255).astype(np.uint8)
 
 
@@ -360,6 +365,42 @@ def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
                     ((v + 0.055) / 1.055) ** 2.4).astype(np.float32)
 
 
+
+
+def _compute_detection_prebalance(img_linear: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, dict]:
+    """Build a temporary balanced view to help chart detection under strong casts."""
+    img = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
+    lum = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
+    valid = lum[np.isfinite(lum) & (lum > 1e-6)]
+    if valid.size < 64:
+        rgb_scale = np.ones(3, dtype=np.float32)
+        exposure_scale = 1.0
+        return img.copy(), rgb_scale, exposure_scale, {"rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
+
+    lo = float(np.percentile(valid, 10.0))
+    hi = float(np.percentile(valid, 98.0))
+    mask = np.isfinite(lum) & (lum >= lo) & (lum <= hi)
+    if np.count_nonzero(mask) < 64:
+        mask = np.isfinite(lum) & (lum > 1e-6)
+
+    samples = img[mask]
+    chan_mean = np.mean(samples, axis=0)
+    grey = float(np.mean(chan_mean))
+    rgb_scale = grey / np.clip(chan_mean, 1e-6, None)
+    rgb_scale = np.clip(rgb_scale, 0.4, 2.5).astype(np.float32)
+    rgb_scale /= max(float(np.mean(rgb_scale)), 1e-6)
+
+    p99 = float(np.percentile(valid, 99.0))
+    exposure_scale = float(np.clip(0.85 / max(p99, 1e-6), 0.25, 8.0))
+    balanced = np.clip(img * rgb_scale[None, None, :] * exposure_scale, 0.0, None).astype(np.float32)
+    info = {
+        "rgb_scale": rgb_scale.tolist(),
+        "exposure_scale": exposure_scale,
+        "lum_p10": lo,
+        "lum_p98": hi,
+        "lum_p99": p99,
+    }
+    return balanced, rgb_scale, exposure_scale, info
 
 
 def _get_detector_target_width() -> int:
@@ -677,8 +718,22 @@ def _detect_in_tile(tile_linear: np.ndarray,
         return None
 
     out_h, out_w = tile_linear.shape[:2]
-    tile_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
-    tile_rgb_u8 = np.clip(tile_tm * 255, 0, 255).astype(np.uint8)
+    tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
+    tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
+    tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
+    tile_detect_tm = (tile_detect_linear / (tile_detect_linear + 1.0)).astype(np.float32)
+    tile_detect_u8 = _linear_to_u8_for_detection(tile_detect_linear)
+
+    if debug_dir:
+        _save_intermediate_debug(
+            debug_dir,
+            f"tile_{stage_label}_prebalanced.jpg",
+            tile_detect_u8,
+            note=(f"{stage_label}: prebalance rgb={detect_rgb_scale[0]:.2f},{detect_rgb_scale[1]:.2f},{detect_rgb_scale[2]:.2f} "
+                  f"exp={detect_exposure_scale:.2f}"),
+        )
+
+    print(f"[cc-erp] Detection prebalance candidate: rgb={detect_rgb_scale[0]:.3f},{detect_rgb_scale[1]:.3f},{detect_rgb_scale[2]:.3f} exp={detect_exposure_scale:.3f}")
 
     seg_det = None
     chosen_det = None
@@ -686,10 +741,12 @@ def _detect_in_tile(tile_linear: np.ndarray,
     chosen_quad_tile = None
     crop_bounds = None
     method_used = "none"
+    detect_source_linear = tile_linear
+    detect_scale_vec = np.ones(3, dtype=np.float32)
 
     try:
         seg_results = ccd.detect_colour_checkers_segmentation(
-            tile_tm,
+            tile_raw_tm,
             show=False,
             additional_data=True,
             apply_cctf_decoding=False,
@@ -698,10 +755,29 @@ def _detect_in_tile(tile_linear: np.ndarray,
             seg_det = seg_results[0]
             chosen_det = seg_det
             chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
-            method_used = "segmentation"
-            print(f"[cc-erp] Segmentation located chart on tile yaw={yaw:.0f} pitch={pitch:.0f}")
+            method_used = "segmentation(raw)"
+            print(f"[cc-erp] Segmentation located chart on raw tile yaw={yaw:.0f} pitch={pitch:.0f}")
     except Exception:
         pass
+
+    if seg_det is None:
+        try:
+            seg_results = ccd.detect_colour_checkers_segmentation(
+                tile_detect_tm,
+                show=False,
+                additional_data=True,
+                apply_cctf_decoding=False,
+            )
+            if seg_results:
+                seg_det = seg_results[0]
+                chosen_det = seg_det
+                chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
+                method_used = "segmentation(prebalanced)"
+                detect_source_linear = tile_detect_linear
+                detect_scale_vec = (detect_rgb_scale * detect_exposure_scale).astype(np.float32)
+                print(f"[cc-erp] Segmentation located chart on prebalanced tile yaw={yaw:.0f} pitch={pitch:.0f}")
+        except Exception:
+            pass
 
     if seg_det is None:
         return None
@@ -721,7 +797,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
 
     if HAVE_CCD_INFERENCE and crop_bounds is not None:
         cx0, cy0, cx1, cy1 = crop_bounds
-        crop_lin = tile_linear[cy0:cy1, cx0:cx1]
+        crop_lin = detect_source_linear[cy0:cy1, cx0:cx1]
         crop_h, crop_w = crop_lin.shape[:2]
         zoom_w = 800
         zoom_h = max(1, int(round(crop_h * zoom_w / max(float(crop_w), 1e-8))))
@@ -733,7 +809,14 @@ def _detect_in_tile(tile_linear: np.ndarray,
             debug_dir,
             f"tile_{stage_label}_crop.jpg",
             crop_u8,
-            note=f"{stage_label}: crop {crop_w}x{crop_h} -> {zoom_w}x{zoom_h}",
+            note=f"{stage_label}: crop {method_used} {crop_w}x{crop_h} -> {zoom_w}x{zoom_h}",
+        )
+        crop_orig = tile_linear[cy0:cy1, cx0:cx1]
+        _save_intermediate_debug(
+            debug_dir,
+            f"tile_{stage_label}_crop_original.jpg",
+            _linear_to_u8_for_detection(crop_orig),
+            note=f"{stage_label}: crop original {crop_w}x{crop_h}",
         )
 
         try:
@@ -876,6 +959,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
     ], dtype=np.float32)
     colour_sw_safe = np.clip(colour_sw_tm, 0.0, 0.9999)
     colour_swatches_linear = colour_sw_safe / (1.0 - colour_sw_safe)
+    colour_swatches_linear = colour_swatches_linear / np.clip(detect_scale_vec[None, :], 1e-6, None)
     colour_swatches_linear, colour_reorder = _reorder_swatches_to_cc24(colour_swatches_linear, cc24_ref)
     colour_centres_uv = colour_centres_uv[colour_reorder]
     colour_centres_tile = colour_centres_tile[colour_reorder]
@@ -894,7 +978,8 @@ def _detect_in_tile(tile_linear: np.ndarray,
             backproject_pixel_to_erp(cx, cy, map_uv)
             for cx, cy in contour_centres_tile
         ], dtype=np.float32)
-        contour_swatches_linear, contour_reorder = _reorder_swatches_to_cc24(contour_swatches_tile, cc24_ref)
+        contour_swatches_linear = contour_swatches_tile / np.clip(detect_scale_vec[None, :], 1e-6, None)
+        contour_swatches_linear, contour_reorder = _reorder_swatches_to_cc24(contour_swatches_linear, cc24_ref)
         contour_centres_uv = contour_centres_uv[contour_reorder]
         contour_centres_tile = contour_centres_tile[contour_reorder]
         contour_confidence = _compute_detection_confidence(contour_swatches_linear, cc24_ref)

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem,
-    QComboBox, QCheckBox, QDoubleSpinBox, QSpinBox, QLineEdit,
+    QComboBox, QCheckBox, QDoubleSpinBox, QSpinBox, QLineEdit, QSlider,
     QGroupBox, QTextEdit, QFileDialog, QProgressBar,
     QScrollArea, QSizePolicy, QTabWidget, QFrame, QToolBar,
     QStatusBar, QMessageBox, QAbstractItemView,
@@ -28,6 +28,7 @@ from PySide6.QtCore import Qt, QSize, QTimer, QObject, QRunnable, QThreadPool, S
 from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QColor
 
 import numpy as np
+import cv2
 
 # ── Dark VFX palette ───────────────────────────────────────────────────────────
 VFX_STYLE = """
@@ -194,17 +195,14 @@ class PipelineConfig:
     validate_only:      bool = False
 
     # WB / exposure
+    calibration_mode:   str = "auto"
     wb_source:          str = "auto"
     exposure_source:    str = "auto"
-    kelvin:             Optional[float] = None
-    rgb_scale:          Optional[str] = None
-    dome_wb:            Optional[str] = None
-
-    # Metering (used when exposure_source=metering)
-    metering_mode:      str = "bottom_dome"
-    meter_stat:         str = "median"
-    meter_target:       float = 0.18
-    swatch_size:        int = 5
+    sphere_solve:       str = "auto"
+    final_balance_target: str = "none"
+    base_intensity:     float = 1.0
+    base_temperature:   float = 6500.0
+    base_tint:          float = 0.0
 
     # Hot lobe
     sun_threshold:      float = 0.1
@@ -212,7 +210,6 @@ class PipelineConfig:
 
     # Centering
     center_hdri:        bool = True
-    center_elevation:   bool = False
 
     # Gain / energy
     lobe_neutralise:    float = 1.0
@@ -221,12 +218,6 @@ class PipelineConfig:
     sun_gain_ceiling:   float = 2000.0
     sun_gain_rolloff:   float = 500.0
 
-    # Reference sphere plate
-    ref_sphere:         Optional[str] = None
-    ref_sphere_cx:      int = -1
-    ref_sphere_cy:      int = -1
-    ref_sphere_r:       int = -1
-    ref_sphere_albedo:  float = 0.18
 
 
 def config_to_namespace(cfg: PipelineConfig):
@@ -239,15 +230,39 @@ def config_to_namespace(cfg: PipelineConfig):
     ns.upper_only           = cfg.sun_upper_only
     ns.sun_blur_px          = 0
 
+    if getattr(ns, "sphere_solve", "auto") == "auto":
+        ns.sphere_solve = "energy_conservation"
+
     # Attrs not in PipelineConfig but referenced in pipeline
     _defaults = {
-        "wb_swatch":            None,
+        "kelvin":               None,
+        "rgb_scale":            None,
+        "dome_wb":              None,
+        "metering_mode":        "upper_hemi_irradiance",
+        "meter_stat":           "median",
+        "meter_target":         1.0,
+        "swatch_size":          5,
         "swatch":               None,
+        "wb_swatch":            None,
+        "sphere_target":        "irradiance",
+        "exposure_scale":       None,
+        "chart_facing":         "auto",
+        "sun_upper_only":       False,
+        "sun_blur_px":          0,
+        "center_elevation":     False,
+        "sphere_res":           96,
+        "direct_highlight_target": 0.32,
+        "final_balance_target": "none",
+        "target_peak_ratio":    2.5,
+        "ref_sphere":           None,
+        "ref_sphere_cx":        None,
+        "ref_sphere_cy":        None,
+        "ref_sphere_r":         None,
+        "ref_sphere_albedo":    0.18,
         "colorchecker":         None,
         "colorchecker_in_hdri": False,
         "cc_read_backend":      "colour",
         "cc_compare_backends":  False,
-        "sphere_solve":         "energy_conservation",
         "validate_only":        False,
     }
     for attr, default in _defaults.items():
@@ -293,6 +308,7 @@ class PipelineWorker(QRunnable):
                 "01_wb_preview.png", "02_exposed_preview.png",
                 "03_hot_mask.png",   "07_corrected_preview.png",
                 "08_verify_sphere_final.png",
+                "07b_final_balanced_preview.png",
                 "colorchecker/cc_detected_tile.jpg",
                 "colorchecker/cc_rectified_final.jpg",
                 "colorchecker/cc_swatch_comparison.jpg",
@@ -321,7 +337,7 @@ class DropZone(QFrame):
         lay = QVBoxLayout(self); lay.setAlignment(Qt.AlignCenter)
         icon = QLabel("⊕"); icon.setAlignment(Qt.AlignCenter)
         icon.setStyleSheet("font-size: 22px; color: #303050; border: none;")
-        text = QLabel("Drop EXR / HDR  ·  or click to browse")
+        text = QLabel("Drop EXR / HDR / PNG / WebP  ·  or click to browse")
         text.setAlignment(Qt.AlignCenter)
         text.setStyleSheet("color: #404060; font-size: 11px; border: none;")
         lay.addWidget(icon); lay.addWidget(text)
@@ -330,7 +346,7 @@ class DropZone(QFrame):
     def mousePressEvent(self, e):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select HDRI files", "",
-            "HDRI Images (*.exr *.hdr *.jpg *.jpeg *.png);;All Files (*.*)")
+            "HDRI Images (*.exr *.hdr *.jpg *.jpeg *.png *.webp);;All Files (*.*)")
         if paths: self.files_dropped.emit(paths)
 
     def dragEnterEvent(self, e: QDragEnterEvent):
@@ -347,7 +363,7 @@ class DropZone(QFrame):
         self.setProperty("dragover", "false")
         self.style().unpolish(self); self.style().polish(self)
         paths = [u.toLocalFile() for u in e.mimeData().urls()
-                 if u.toLocalFile().lower().endswith((".exr",".hdr",".jpg",".jpeg",".png"))]
+                 if u.toLocalFile().lower().endswith((".exr",".hdr",".jpg",".jpeg",".png",".webp"))]
         if paths: self.files_dropped.emit(paths)
 
 
@@ -356,6 +372,8 @@ class FileItem:
     def __init__(self, path):
         self.path = path; self.name = Path(path).name
         self.status = "waiting"; self.warnings = []; self.report = {}; self.previews = []
+        self.source_preview = None
+        self.config = None
 
     def icon(self):
         return {"waiting": ICON_WAIT, "running": ICON_RUNNING, "ok": ICON_OK,
@@ -374,12 +392,15 @@ class PreviewPanel(QWidget):
         self._tabs = QTabWidget(); lay.addWidget(self._tabs)
         self._labels: dict[str, QLabel] = {}
         for name, key in [
+            ("Source",     "source_preview.png"),
             ("WB",         "01_wb_preview.png"),
             ("Exposed",    "02_exposed_preview.png"),
             ("Lobe",       "03_hot_mask.png"),
             ("Chart Tile", "cc_detected_tile.jpg"),
             ("Rectified",  "cc_rectified_final.jpg"),
             ("Swatches",   "cc_swatch_comparison.jpg"),
+            ("Solved",     "07_corrected_preview.png"),
+            ("Balanced",   "07b_final_balanced_preview.png"),
             ("Final",      "08_verify_sphere_final.png"),
         ]:
             lbl = QLabel(); lbl.setAlignment(Qt.AlignCenter)
@@ -456,6 +477,75 @@ class ReportPanel(QWidget):
                 ok=(not clamp.get("likely_clipped")))
 
 
+class SliderField(QWidget):
+    def __init__(self, minimum: int, maximum: int, initial: int, formatter,
+                 *, decimals: int = 0, scale: float = 1.0, suffix: str = "", parent=None):
+        super().__init__(parent)
+        self._formatter = formatter
+        self._scale = float(scale)
+        self._syncing = False
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(minimum, maximum)
+        self.slider.setValue(initial)
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(minimum / self._scale, maximum / self._scale)
+        self.spin.setDecimals(decimals)
+        self.spin.setSingleStep(max(1.0 / self._scale, 10 ** (-decimals)))
+        if suffix:
+            self.spin.setSuffix(suffix)
+        self.spin.setValue(initial / self._scale)
+        self.label = QLabel()
+        self.label.setMinimumWidth(72)
+        self.label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(self.slider, 1)
+        lay.addWidget(self.spin)
+        lay.addWidget(self.label)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        self.spin.valueChanged.connect(self._on_spin_changed)
+        self._refresh_label(self.slider.value())
+
+    def _refresh_label(self, value: int):
+        self.label.setText(self._formatter(value))
+
+    def _on_slider_changed(self, value: int):
+        self._refresh_label(value)
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.spin.setValue(value / self._scale)
+        finally:
+            self._syncing = False
+
+    def _on_spin_changed(self, value: float):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.slider.setValue(int(round(value * self._scale)))
+        finally:
+            self._syncing = False
+
+    def value(self) -> int:
+        return int(self.slider.value())
+
+    def setValue(self, value: int):
+        self.slider.setValue(int(value))
+
+    @property
+    def valueChanged(self):
+        return self.slider.valueChanged
+
+    def setToolTip(self, text: str):
+        self.slider.setToolTip(text)
+        self.spin.setToolTip(text)
+        self.label.setToolTip(text)
+        super().setToolTip(text)
+
+
 # ── Settings panel ─────────────────────────────────────────────────────────────
 class SettingsPanel(QScrollArea):
     def __init__(self, parent=None):
@@ -471,18 +561,8 @@ class SettingsPanel(QScrollArea):
         self._build_simple()
         self._build_advanced_groups()
 
-        # Toggle button
-        self._adv_btn = QPushButton("⚙  Advanced Options  ▼")
-        self._adv_btn.setObjectName("adv_toggle")
-        self._adv_btn.setCheckable(True); self._adv_btn.setChecked(False)
-        self._adv_btn.toggled.connect(self._toggle_advanced)
-        self._lay.addWidget(self._adv_btn)
-
         self._lay.addStretch()
-
-        # Hide advanced initially
-        for grp in self._adv_groups:
-            grp.setVisible(False)
+        self._sync_calibration_mode()
 
     def _build_output(self):
         grp = QGroupBox("Output"); f = QFormLayout(grp)
@@ -497,128 +577,180 @@ class SettingsPanel(QScrollArea):
         self._lay.addWidget(grp)
 
     def _build_simple(self):
-        grp = QGroupBox("Calibration"); f = QFormLayout(grp)
+        grp = QGroupBox("Calibration")
+        f = QFormLayout(grp)
 
-        self.wb_source = QComboBox()
-        self.wb_source.addItems(["auto","chart","sphere","dome","kelvin","manual","none"])
-        self.wb_source.setToolTip(
-            "auto   — chart (if found, conf≥0.2) → sphere → none\n"
-            "chart  — search HDRI tiles for ColorChecker\n"
-            "sphere — neutralise grey sphere render\n"
-            "dome   — grey-world upper hemisphere\n"
-            "kelvin — colour temperature (set in Advanced)\n"
-            "manual — explicit R,G,B multipliers (set in Advanced)\n"
-            "none   — skip WB")
+        self.calibration_mode = QComboBox()
+        self.calibration_mode.addItems(["auto", "advanced"])
+        self.calibration_mode.setToolTip(
+            "auto     - if chart is found, use chart WB/exposure; otherwise leave WB/exposure untouched\n"
+            "advanced - reveal manual source and sun-solve controls below")
+        self.calibration_mode.currentTextChanged.connect(self._sync_calibration_mode)
 
-        self.exp_source = QComboBox()
-        self.exp_source.addItems(["auto","chart","sphere","metering","none"])
-        self.exp_source.setToolTip(
-            "auto     — chart if found, else sphere\n"
-            "chart    — patch 22 luma → absolute photometric\n"
-            "sphere   — render grey sphere, normalise to albedo\n"
-            "metering — dome metering (configure in Advanced)\n"
-            "none     — skip exposure scaling")
+        self.input_colorspace = QComboBox()
+        self.input_colorspace.addItems(["auto", "acescg", "srgb"])
+        self.input_colorspace.setToolTip(
+            "Input primaries of the source image.\n"
+            "auto   - EXR/HDR defaults to ACEScg, JPG/PNG to sRGB\n"
+            "acescg - treat input as linear ACEScg\n"
+            "srgb   - treat input as linear sRGB and convert to ACEScg before processing"
+        )
 
         self.center_hdri = QCheckBox("Centre HDRI on sun")
         self.center_hdri.setChecked(True)
-        self.center_hdri.setToolTip("Shift azimuth so the sun sits at the centre column (φ=0)")
+        self.center_hdri.setToolTip("Shift azimuth so the sun sits at the centre column (phi=0)")
 
-        f.addRow("WB source",       self.wb_source)
-        f.addRow("Exposure source", self.exp_source)
+        self.base_intensity = SliderField(1, 1600, 100, lambda v: f"{v / 100.0:.2f}x", decimals=2, scale=100.0)
+        self.base_intensity.setToolTip("Base input intensity multiplier for preview and optional manual override")
+
+        self.base_temperature = SliderField(2000, 15000, 6500, lambda v: f"{v:d} K", decimals=0, scale=1.0, suffix=" K")
+        self.base_temperature.setToolTip("Photographic white balance temperature")
+
+        self.base_tint = SliderField(-100, 100, 0, lambda v: f"{v / 100.0:+.2f}", decimals=2, scale=100.0)
+        self.base_tint.setToolTip("Tint adjustment: +1.00 = magenta, -1.00 = green")
+
+        f.addRow("Mode",            self.calibration_mode)
+        f.addRow("Input primaries", self.input_colorspace)
+        f.addRow("Intensity",       self.base_intensity)
+        f.addRow("Temperature",     self.base_temperature)
+        f.addRow("Tint",            self.base_tint)
+        reset_row = QHBoxLayout()
+        self.reset_base_btn = QPushButton("Reset Photographic")
+        self.reset_base_btn.setMaximumWidth(140)
+        self.reset_base_btn.clicked.connect(self._reset_photographic_controls)
+        reset_row.addWidget(self.reset_base_btn)
+        reset_row.addStretch()
+        f.addRow("",                reset_row)
         f.addRow("",                self.center_hdri)
         self._lay.addWidget(grp)
 
     def _build_advanced_groups(self):
         self._adv_groups: list[QWidget] = []
 
-        # ── WB detail ─────────────────────────────────────────────────────
-        grp = QGroupBox("White Balance — Detail"); f = QFormLayout(grp)
-        self.wb_kelvin = QDoubleSpinBox()
-        self.wb_kelvin.setRange(2000,12000); self.wb_kelvin.setValue(5600); self.wb_kelvin.setSuffix(" K")
-        self.wb_kelvin.setToolTip("Used when WB source = kelvin")
-        self.wb_rgb = QLineEdit("1.0,1.0,1.0")
-        self.wb_rgb.setPlaceholderText("R,G,B  e.g. 1.05,1.0,0.95")
-        self.wb_rgb.setToolTip("Used when WB source = manual")
-        self.dome_wb_mode = QComboBox()
-        self.dome_wb_mode.addItems(["upper_dome","full_dome","hot_exclude"])
-        self.dome_wb_mode.setToolTip("Sub-mode for WB source = dome")
-        f.addRow("Kelvin",    self.wb_kelvin)
-        f.addRow("RGB scale", self.wb_rgb)
-        f.addRow("Dome mode", self.dome_wb_mode)
-        self._adv_groups.append(grp)
+        grp = QGroupBox("Advanced Calibration")
+        f = QFormLayout(grp)
 
-        # ── Exposure detail ───────────────────────────────────────────────
-        grp = QGroupBox("Exposure — Detail"); f = QFormLayout(grp)
-        self.metering_mode = QComboBox()
-        self.metering_mode.addItems(["bottom_dome","whole_scene","swatch","upper_hemi_irradiance"])
-        self.metering_mode.setToolTip(
-            "Used when exposure source = metering\n"
-            "bottom_dome            — median of lower hemisphere\n"
-            "whole_scene            — median of full panorama\n"
-            "upper_hemi_irradiance  — cosine-weighted E_upper\n"
-            "swatch                 — sample a specific pixel")
-        self.meter_target = QDoubleSpinBox()
-        self.meter_target.setRange(0.001,100.0); self.meter_target.setValue(0.18); self.meter_target.setDecimals(4)
-        self.meter_target.setToolTip("0.18 = 18% grey.  1.0 for normalised IBL.")
+        self.wb_source = QComboBox()
+        self.wb_source.addItems(["auto", "chart", "none"])
+        self.wb_source.setToolTip(
+            "auto  - chart if found, else none\n"
+            "chart - require ColorChecker for WB\n"
+            "none  - skip WB")
+
+        self.exp_source = QComboBox()
+        self.exp_source.addItems(["auto", "chart", "none"])
+        self.exp_source.setToolTip(
+            "auto  - chart if found, else none\n"
+            "chart - use patch 22 for exposure\n"
+            "none  - skip exposure correction")
+
+        self.solver_mode = QComboBox()
+        self.solver_mode.addItems(["auto", "energy_conservation", "sun_facing_card", "sun_facing_vertical", "none"])
+        self.solver_mode.setCurrentText("auto")
+        self.solver_mode.setToolTip(
+            "auto                 - default sun solve\n"
+            "energy_conservation  - target an upward-facing grey card\n"
+            "sun_facing_card      - target a grey card whose normal points at the sun\n"
+            "sun_facing_vertical  - target a vertical card rotated toward the sun azimuth\n"
+            "none                 - disable sun solve")
+
+        self.final_balance_target = QComboBox()
+        self.final_balance_target.addItems(["none", "auto"])
+        self.final_balance_target.setToolTip(
+            "none - no final trim after sun solve\n"
+            "auto - measure the imaginary target card and apply one final RGB balance to make it neutral at albedo")
+
         self.albedo = QDoubleSpinBox()
-        self.albedo.setRange(0.01,1.0); self.albedo.setValue(0.18); self.albedo.setDecimals(4)
-        self.albedo.setToolTip("Reflectance of reference grey card / sphere (default 0.18)")
-        f.addRow("Metering mode", self.metering_mode)
-        f.addRow("Meter target",  self.meter_target)
-        f.addRow("Albedo",        self.albedo)
+        self.albedo.setRange(0.01, 1.0)
+        self.albedo.setValue(0.18)
+        self.albedo.setDecimals(4)
+        self.albedo.setToolTip("Reflectance of the target grey card / swatch")
+
+        f.addRow("WB source",       self.wb_source)
+        f.addRow("Exposure source", self.exp_source)
+        f.addRow("Sun solve",       self.solver_mode)
+        f.addRow("Final balance",   self.final_balance_target)
+        f.addRow("Albedo",          self.albedo)
         self._adv_groups.append(grp)
 
-        # ── Sun / Hot Lobe ────────────────────────────────────────────────
-        grp = QGroupBox("Sun / Hot Lobe"); f = QFormLayout(grp)
+        grp = QGroupBox("Sun / Hot Lobe")
+        f = QFormLayout(grp)
         self.sun_threshold = QDoubleSpinBox()
-        self.sun_threshold.setRange(0.01,0.99); self.sun_threshold.setValue(0.1); self.sun_threshold.setDecimals(3)
-        self.sun_threshold.setToolTip("Fraction below peak defining the lobe.\n0.1 → lobe = [0.9×peak … peak].  Lower = tighter disc.")
-        self.sun_upper_only = QCheckBox("Upper hemisphere only")
+        self.sun_threshold.setRange(0.01, 0.99)
+        self.sun_threshold.setValue(0.1)
+        self.sun_threshold.setDecimals(3)
+        self.sun_threshold.setToolTip("Fraction below peak defining the lobe")
         self.lobe_neutralise = QDoubleSpinBox()
-        self.lobe_neutralise.setRange(0.0,1.0); self.lobe_neutralise.setValue(1.0); self.lobe_neutralise.setDecimals(2)
-        self.lobe_neutralise.setToolTip("0 = keep sun colour  |  1 = fully desaturate to white before boost")
+        self.lobe_neutralise.setRange(0.0, 1.0)
+        self.lobe_neutralise.setValue(1.0)
+        self.lobe_neutralise.setDecimals(2)
+        self.lobe_neutralise.setToolTip("0 = keep sun colour, 1 = fully desaturate to white before boost")
         self.sun_gain_ceiling = QDoubleSpinBox()
-        self.sun_gain_ceiling.setRange(10,20000); self.sun_gain_ceiling.setValue(2000)
-        self.sun_gain_ceiling.setDecimals(0); self.sun_gain_ceiling.setSuffix("×")
+        self.sun_gain_ceiling.setRange(10, 20000)
+        self.sun_gain_ceiling.setValue(2000)
+        self.sun_gain_ceiling.setDecimals(0)
+        self.sun_gain_ceiling.setSuffix("×")
         self.sun_gain_ceiling.setToolTip("Hard cap on per-channel sun gain")
         self.sun_gain_rolloff = QDoubleSpinBox()
-        self.sun_gain_rolloff.setRange(10,10000); self.sun_gain_rolloff.setValue(500)
-        self.sun_gain_rolloff.setDecimals(0); self.sun_gain_rolloff.setSuffix("×")
-        self.sun_gain_rolloff.setToolTip("Gains above this soft-roll to the ceiling (sqrt curve)")
+        self.sun_gain_rolloff.setRange(10, 10000)
+        self.sun_gain_rolloff.setValue(500)
+        self.sun_gain_rolloff.setDecimals(0)
+        self.sun_gain_rolloff.setSuffix("×")
+        self.sun_gain_rolloff.setToolTip("Soft rolloff start before the gain ceiling")
         f.addRow("Sun threshold",   self.sun_threshold)
-        f.addRow("",                self.sun_upper_only)
         f.addRow("Lobe neutralise", self.lobe_neutralise)
         f.addRow("Gain ceiling",    self.sun_gain_ceiling)
         f.addRow("Gain rolloff",    self.sun_gain_rolloff)
         self._adv_groups.append(grp)
 
-        # ── Misc ──────────────────────────────────────────────────────────
-        grp = QGroupBox("Misc"); f = QFormLayout(grp)
-        self.center_elevation = QCheckBox("Centre elevation too")
-        self.center_elevation.setToolTip("Also shift vertically so sun sits on horizon")
-        self.colorspace = QComboBox(); self.colorspace.addItems(["auto","acescg","srgb"])
-        self.sphere_res = QSpinBox()
-        self.sphere_res.setRange(32,256); self.sphere_res.setValue(96); self.sphere_res.setSingleStep(16)
-        self.sphere_res.setToolTip("Validation sphere render resolution in pixels")
-        self.ref_sphere = QLineEdit(); self.ref_sphere.setPlaceholderText("Grey ball plate (optional)"); self.ref_sphere.setReadOnly(True)
-        btn_sp = QPushButton("…"); btn_sp.setMaximumWidth(26)
-        btn_sp.clicked.connect(lambda: self._browse(self.ref_sphere, "Sphere plate (*.jpg *.jpeg *.png)"))
-        row_sp = QHBoxLayout(); row_sp.addWidget(self.ref_sphere); row_sp.addWidget(btn_sp)
-        f.addRow("",           self.center_elevation)
-        f.addRow("Colorspace", self.colorspace)
-        f.addRow("Sphere res", self.sphere_res)
-        f.addRow("Ref sphere", row_sp)
-        self._adv_groups.append(grp)
-
-        # Insert all into layout (before the toggle button gets added)
         for grp in self._adv_groups:
             self._lay.addWidget(grp)
 
-    def _toggle_advanced(self, checked: bool):
+    def _sync_calibration_mode(self):
+        show_advanced = (self.calibration_mode.currentText() == "advanced")
         for grp in self._adv_groups:
-            grp.setVisible(checked)
-        self._adv_btn.setText(
-            "⚙  Advanced Options  ▲" if checked else "⚙  Advanced Options  ▼")
+            grp.setVisible(show_advanced)
+
+    def _reset_photographic_controls(self):
+        self._set_base_intensity_value(1.0)
+        self._set_base_temperature_value(6500.0)
+        self._set_base_tint_value(0.0)
+
+    def _base_intensity_value(self) -> float:
+        return self.base_intensity.value() / 100.0
+
+    def _base_temperature_value(self) -> float:
+        return float(self.base_temperature.value())
+
+    def _base_tint_value(self) -> float:
+        return self.base_tint.value() / 100.0
+
+    def _set_base_intensity_value(self, value: float):
+        self.base_intensity.setValue(int(round(max(0.01, min(16.0, value)) * 100.0)))
+
+    def _set_base_temperature_value(self, value: float):
+        self.base_temperature.setValue(int(round(max(2000.0, min(15000.0, value)))))
+
+    def _set_base_tint_value(self, value: float):
+        self.base_tint.setValue(int(round(max(-1.0, min(1.0, value)) * 100.0)))
+
+    def _photographic_rgb_scale(self, cfg: PipelineConfig):
+        import hdri_cal as hc
+        kelvin_scale = hc.kelvin_to_rgb_scale(float(cfg.base_temperature))
+        tint = float(cfg.base_tint)
+        tint_scale = np.array([
+            1.0 + 0.35 * tint,
+            1.0 - 0.70 * tint,
+            1.0 + 0.35 * tint,
+        ], dtype=np.float32)
+        tint_scale = np.clip(tint_scale, 0.05, None)
+        scale = kelvin_scale * tint_scale
+        scale /= max(float(np.mean(scale)), 1e-8)
+        return scale.astype(np.float32)
+
+    def _photographic_rgb_scale_string(self, cfg: PipelineConfig):
+        scale = self._photographic_rgb_scale(cfg)
+        return f"{scale[0]:.6f},{scale[1]:.6f},{scale[2]:.6f}"
 
     def _browse(self, line: QLineEdit, filt: str):
         p, _ = QFileDialog.getOpenFileName(self, "Select file", "", filt)
@@ -635,34 +767,43 @@ class SettingsPanel(QScrollArea):
         cfg.res         = self.res.currentText()
 
         # Simple
-        cfg.wb_source       = self.wb_source.currentText()
-        cfg.exposure_source = self.exp_source.currentText()
-        cfg.center_hdri     = self.center_hdri.isChecked()
+        cfg.calibration_mode = self.calibration_mode.currentText()
+        cfg.center_hdri = self.center_hdri.isChecked()
+        cs = self.input_colorspace.currentText()
+        cfg.colorspace = None if cs == "auto" else cs
 
-        # Advanced — WB detail
-        cfg.kelvin    = self.wb_kelvin.value()    if cfg.wb_source == "kelvin" else None
-        cfg.rgb_scale = self.wb_rgb.text().strip() if cfg.wb_source == "manual" else None
-        cfg.dome_wb   = self.dome_wb_mode.currentText() if cfg.wb_source == "dome" else None
+        # Advanced calibration choices
+        if cfg.calibration_mode == "auto":
+            cfg.wb_source = "auto"
+            cfg.exposure_source = "auto"
+            cfg.sphere_solve = "auto"
+            cfg.final_balance_target = "none"
+        else:
+            cfg.wb_source = self.wb_source.currentText()
+            cfg.exposure_source = self.exp_source.currentText()
+            cfg.sphere_solve = self.solver_mode.currentText()
+            cfg.final_balance_target = self.final_balance_target.currentText()
 
-        # Advanced — Exposure
-        cfg.metering_mode  = self.metering_mode.currentText()
-        cfg.meter_target   = self.meter_target.value()
-        cfg.albedo         = self.albedo.value()
+        cfg.base_intensity = self._base_intensity_value()
+        cfg.base_temperature = self._base_temperature_value()
+        cfg.base_tint = self._base_tint_value()
 
-        # Advanced — Lobe
-        cfg.sun_threshold    = self.sun_threshold.value()
-        cfg.sun_upper_only   = self.sun_upper_only.isChecked()
-        cfg.lobe_neutralise  = self.lobe_neutralise.value()
+        if cfg.calibration_mode == "advanced":
+            temp_override = abs(self._base_temperature_value() - 6500.0) > 1e-6
+            tint_override = abs(self._base_tint_value()) > 1e-6
+            intensity_override = abs(self._base_intensity_value() - 1.0) > 1e-6
+            if cfg.wb_source == "none" and (temp_override or tint_override):
+                cfg.wb_source = "manual"
+                cfg.rgb_scale = self._photographic_rgb_scale_string(cfg)
+            if cfg.exposure_source == "none" and intensity_override:
+                cfg.exposure_source = "manual"
+                cfg.exposure_scale = cfg.base_intensity
+
+        cfg.albedo = self.albedo.value()
+        cfg.sun_threshold = self.sun_threshold.value()
+        cfg.lobe_neutralise = self.lobe_neutralise.value()
         cfg.sun_gain_ceiling = self.sun_gain_ceiling.value()
         cfg.sun_gain_rolloff = self.sun_gain_rolloff.value()
-
-        # Advanced — Misc
-        cfg.center_elevation = self.center_elevation.isChecked()
-        cs = self.colorspace.currentText()
-        cfg.colorspace = None if cs == "auto" else cs
-        cfg.sphere_res = self.sphere_res.value()
-        ref = self.ref_sphere.text().strip()
-        cfg.ref_sphere = ref if ref else None
 
         return cfg
 
@@ -727,6 +868,7 @@ class MainWindow(QMainWindow):
         self._signals:      Optional[PipelineSignals] = None
         self._pool          = QThreadPool(); self._pool.setMaxThreadCount(1)
         self._running       = False; self._abort_flag = False
+        self._syncing_settings = False
         self._build_ui(); self._check_hdri_cal()
 
     def _build_ui(self):
@@ -759,6 +901,22 @@ class MainWindow(QMainWindow):
         qh = QHBoxLayout(); qh.addWidget(QLabel("Queue"))
         bc = QPushButton("Clear Files"); bc.setMinimumWidth(88); bc.setMaximumHeight(22)
         bc.clicked.connect(self._clear_queue); qh.addStretch(); qh.addWidget(bc); ll.addLayout(qh)
+
+        qh2 = QHBoxLayout()
+        self._remove_btn = QPushButton("Remove Selected")
+        self._remove_btn.setMaximumHeight(22)
+        self._remove_btn.clicked.connect(self._remove_selected)
+        self._requeue_btn = QPushButton("Requeue Selected")
+        self._requeue_btn.setMaximumHeight(22)
+        self._requeue_btn.clicked.connect(self._requeue_selected)
+        ll_btn = QPushButton("Open Output Folder")
+        ll_btn.setMaximumHeight(22)
+        ll_btn.clicked.connect(self._open_output_folder)
+        qh2.addWidget(self._remove_btn)
+        qh2.addWidget(self._requeue_btn)
+        ll.addLayout(qh2)
+        ll.addWidget(ll_btn)
+
         self._file_list = QListWidget()
         self._file_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._file_list.currentRowChanged.connect(self._on_file_selected)
@@ -781,15 +939,87 @@ class MainWindow(QMainWindow):
         self._settings = SettingsPanel(); rl.addWidget(self._settings); sp.addWidget(right)
         sp.setSizes([270, 780, 310])
 
+        self._source_preview_timer = QTimer(self)
+        self._source_preview_timer.setSingleShot(True)
+        self._source_preview_timer.timeout.connect(self._refresh_selected_source_preview)
+        self._connect_settings_signals()
+
         self._status = QStatusBar(); self.setStatusBar(self._status)
-        self._status.showMessage("Ready  ·  Drop EXR / HDR files to begin")
+        self._status.showMessage("Ready  ·  Drop EXR / HDR / PNG / WebP files to begin")
+
+    def _connect_settings_signals(self):
+        for signal in [
+            self._settings.calibration_mode.currentTextChanged,
+            self._settings.input_colorspace.currentTextChanged,
+            self._settings.center_hdri.toggled,
+            self._settings.base_intensity.valueChanged,
+            self._settings.base_temperature.valueChanged,
+            self._settings.base_tint.valueChanged,
+            self._settings.wb_source.currentTextChanged,
+            self._settings.exp_source.currentTextChanged,
+            self._settings.solver_mode.currentTextChanged,
+            self._settings.final_balance_target.currentTextChanged,
+            self._settings.albedo.valueChanged,
+            self._settings.sun_threshold.valueChanged,
+            self._settings.lobe_neutralise.valueChanged,
+            self._settings.sun_gain_ceiling.valueChanged,
+            self._settings.sun_gain_rolloff.valueChanged,
+        ]:
+            signal.connect(self._on_settings_changed)
+
+    def _apply_config_to_settings(self, cfg: PipelineConfig):
+        self._syncing_settings = True
+        try:
+            self._settings.calibration_mode.setCurrentText(cfg.calibration_mode or "auto")
+            cs = cfg.colorspace or "auto"
+            self._settings.input_colorspace.setCurrentText(cs)
+            self._settings.center_hdri.setChecked(bool(cfg.center_hdri))
+            self._settings._set_base_intensity_value(float(getattr(cfg, "base_intensity", 1.0)))
+            self._settings._set_base_temperature_value(float(getattr(cfg, "base_temperature", 6500.0)))
+            self._settings._set_base_tint_value(float(getattr(cfg, "base_tint", 0.0)))
+            self._settings.wb_source.setCurrentText(getattr(cfg, "wb_source", "auto"))
+            self._settings.exp_source.setCurrentText(getattr(cfg, "exposure_source", "auto"))
+            self._settings.solver_mode.setCurrentText(getattr(cfg, "sphere_solve", "auto"))
+            self._settings.final_balance_target.setCurrentText(getattr(cfg, "final_balance_target", "none"))
+            self._settings.albedo.setValue(float(getattr(cfg, "albedo", 0.18)))
+            self._settings.sun_threshold.setValue(float(getattr(cfg, "sun_threshold", 0.1)))
+            self._settings.lobe_neutralise.setValue(float(getattr(cfg, "lobe_neutralise", 1.0)))
+            self._settings.sun_gain_ceiling.setValue(float(getattr(cfg, "sun_gain_ceiling", 2000.0)))
+            self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
+            self._settings._sync_calibration_mode()
+        finally:
+            self._syncing_settings = False
+
+    def _current_config_for(self, fi: FileItem) -> PipelineConfig:
+        if fi.config is None:
+            fi.config = self._settings.build_config(fi.path)
+        return fi.config
+
+    def _store_current_settings_into_selected(self):
+        idx = self._selected_index()
+        if idx is None:
+            return None
+        fi = self._file_items[idx]
+        fi.config = self._settings.build_config(fi.path)
+        return fi
+
+    def _on_settings_changed(self, *_args):
+        if self._syncing_settings:
+            return
+        fi = self._store_current_settings_into_selected()
+        if fi is None:
+            return
+        self._request_source_preview_refresh()
 
     # ── File queue ────────────────────────────────────────────────────────
     def _on_files_dropped(self, paths):
         added = 0
         for p in paths:
             if not any(fi.path == p for fi in self._file_items):
-                fi = FileItem(p); self._file_items.append(fi)
+                fi = FileItem(p)
+                fi.config = self._settings.build_config(p)
+                self._file_items.append(fi)
+                self._ensure_source_preview(fi)
                 it = QListWidgetItem(f"{ICON_WAIT}  {fi.name}"); it.setForeground(QColor(fi.color()))
                 self._file_list.addItem(it); added += 1
         self._update_q()
@@ -797,10 +1027,144 @@ class MainWindow(QMainWindow):
             self._file_list.setCurrentRow(0)
         if added: self._status.showMessage(f"Added {added} file(s)")
 
+    def _request_source_preview_refresh(self, *_args):
+        if not hasattr(self, "_source_preview_timer"):
+            return
+        self._source_preview_timer.start(120)
+
+    def _refresh_selected_source_preview(self):
+        idx = self._selected_index()
+        if idx is None:
+            return
+        fi = self._file_items[idx]
+        self._ensure_source_preview(fi, force=True)
+        if self._current_item is fi:
+            self._on_file_selected(idx)
+
+    def _selected_index(self):
+        row = self._file_list.currentRow()
+        if row < 0 or row >= len(self._file_items):
+            return None
+        return row
+
+    def _remove_selected(self):
+        if self._running:
+            return
+        idx = self._selected_index()
+        if idx is None:
+            return
+        self._file_items.pop(idx)
+        self._file_list.takeItem(idx)
+        if not self._file_items:
+            self._current_item = None
+            self._preview.clear()
+            self._report.clear()
+        else:
+            self._file_list.setCurrentRow(min(idx, len(self._file_items) - 1))
+        self._update_q()
+        self._status.showMessage("Removed selected file")
+
+    def _requeue_selected(self):
+        idx = self._selected_index()
+        if idx is None:
+            return
+        fi = self._file_items[idx]
+        if fi.status == "running":
+            return
+        source_preview = fi.source_preview
+        fi.status = "waiting"
+        fi.warnings = []
+        fi.report = {}
+        fi.previews = [source_preview] if source_preview else []
+        self._refresh_item(idx)
+        if self._current_item is fi:
+            self._on_file_selected(idx)
+        self._update_q()
+        self._status.showMessage(f"Requeued: {fi.name}")
+
+    def _open_output_folder(self):
+        idx = self._selected_index()
+        if idx is None:
+            return
+        fi = self._file_items[idx]
+        cfg = self._current_config_for(fi)
+        out_dir = str(Path(cfg.out).parent)
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.startfile(out_dir)
+        except Exception as e:
+            QMessageBox.warning(self, "Open Folder", f"Could not open output folder:\n{e}")
+
     def _clear_queue(self):
         if self._running: return
         self._file_items.clear(); self._file_list.clear()
         self._preview.clear(); self._report.clear(); self._update_q()
+
+    def _photographic_rgb_scale(self, cfg: PipelineConfig):
+        import hdri_cal as hc
+        kelvin_scale = hc.kelvin_to_rgb_scale(float(cfg.base_temperature))
+        tint = float(cfg.base_tint)
+        tint_scale = np.array([
+            1.0 + 0.35 * tint,
+            1.0 - 0.70 * tint,
+            1.0 + 0.35 * tint,
+        ], dtype=np.float32)
+        tint_scale = np.clip(tint_scale, 0.05, None)
+        scale = kelvin_scale * tint_scale
+        scale /= max(float(np.mean(scale)), 1e-8)
+        return scale.astype(np.float32)
+
+    def _photographic_rgb_scale_string(self, cfg: PipelineConfig):
+        scale = self._photographic_rgb_scale(cfg)
+        return f"{scale[0]:.6f},{scale[1]:.6f},{scale[2]:.6f}"
+
+    def _source_preview_path(self, file_path: str, cfg: PipelineConfig) -> str:
+        p = Path(file_path)
+        cache_dir = Path.cwd() / ".gui_cache" / "source_previews"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            stamp = int(p.stat().st_mtime)
+        except OSError:
+            stamp = 0
+        cs = cfg.colorspace or "auto"
+        temp = f"{cfg.base_temperature:.0f}"
+        tint = f"{cfg.base_tint:+.1f}".replace(".", "p")
+        intensity = f"{cfg.base_intensity:.3f}".replace(".", "p")
+        safe_name = f"{p.stem}_{stamp}_{cs}_int{intensity}_temp{temp}_tint{tint}_source_preview.png"
+        return str(cache_dir / safe_name)
+
+    def _ensure_source_preview(self, fi: FileItem, force: bool = False):
+        try:
+            import hdri_cal as hc
+            cfg = self._current_config_for(fi)
+            preview_path = self._source_preview_path(fi.path, cfg)
+            if not force and fi.source_preview == preview_path and os.path.exists(preview_path):
+                return fi.source_preview
+            input_cs = cfg.colorspace
+            img, _ = hc.load_image_any(fi.path, target_colorspace="acescg", input_colorspace=input_cs)
+            base_img = np.clip(img, 0.0, None)
+            rgb_scale = self._photographic_rgb_scale(cfg)
+            img = base_img * rgb_scale[None, None, :] * float(cfg.base_intensity)
+            h, w = img.shape[:2]
+            max_w = 1400
+            if w > max_w:
+                scale = max_w / float(w)
+                new_size = (max(8, int(round(w * scale))), max(8, int(round(h * scale))))
+                img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
+            base_lum = 0.2126 * base_img[..., 0] + 0.7152 * base_img[..., 1] + 0.0722 * base_img[..., 2]
+            denom = max(float(np.percentile(base_lum, 99.5)), 1e-6)
+            display_linear = hc._to_display_srgb_linear(np.clip(img / denom, 0.0, None), "acescg")
+            view = hc.linear_to_srgb(np.clip(display_linear, 0.0, 1.0))
+            out = np.clip(view * 255.0, 0, 255).astype(np.uint8)
+            out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(preview_path, out_bgr)
+            if fi.source_preview and fi.source_preview in fi.previews:
+                fi.previews.remove(fi.source_preview)
+            fi.source_preview = preview_path
+            fi.previews.insert(0, preview_path)
+            return preview_path
+        except Exception:
+            return None
 
     def _update_q(self):
         n = len(self._file_items)
@@ -821,6 +1185,8 @@ class MainWindow(QMainWindow):
     def _on_file_selected(self, row):
         if row < 0 or row >= len(self._file_items): return
         fi = self._file_items[row]; self._current_item = fi
+        self._apply_config_to_settings(self._current_config_for(fi))
+        self._ensure_source_preview(fi)
         self._preview.clear()
         for p in fi.previews: self._preview.update_preview(p)
         self._report.update(fi.report, fi.warnings)
@@ -843,6 +1209,8 @@ class MainWindow(QMainWindow):
         self._running = state
         self._run_btn.setEnabled(not state); self._val_btn.setEnabled(not state)
         self._abort_btn.setEnabled(state); self._progress.setVisible(state)
+        self._remove_btn.setEnabled(not state)
+        self._requeue_btn.setEnabled(True)
 
     def _run_all(self, validate_only=False):
         self._abort_flag = False; self._set_running(True); self._log.clear()
@@ -858,7 +1226,7 @@ class MainWindow(QMainWindow):
             if self._abort_flag: break
             fi.status = "running"; self._refresh_item(i)
             self._file_list.setCurrentRow(i); QApplication.processEvents()
-            result = run_validate(fi.path, self._settings.build_config(fi.path))
+            result = run_validate(fi.path, self._current_config_for(fi))
             fi.warnings = result.get("warnings", []); fi.report = result
             if not result.get("ok"):
                 fi.status = "error"; self._log.append_error(f"{fi.name}: {result.get('error')}")
@@ -881,9 +1249,9 @@ class MainWindow(QMainWindow):
             self._status.showMessage("Aborted" if self._abort_flag else f"Done — {self._run_done} file(s)")
             self._update_q(); return
         idx = self._run_queue.pop(0); fi = self._file_items[idx]
-        fi.status = "running"; fi.warnings = []; fi.previews = []
+        fi.status = "running"; fi.warnings = []; fi.previews = [fi.source_preview] if fi.source_preview else []
         self._refresh_item(idx); self._file_list.setCurrentRow(idx)
-        cfg = self._settings.build_config(fi.path); cfg.validate_only = validate_only
+        cfg = self._current_config_for(fi); cfg.validate_only = validate_only
         os.makedirs(cfg.debug_dir, exist_ok=True)
         self._status.showMessage(f"Processing: {fi.name}")
         self._log.append(f"\n{'─'*60}\n▶  {fi.name}", "#6080b8")
@@ -932,7 +1300,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("HDRI Cal")
     win = MainWindow(); win.show()
-    cli = [a for a in sys.argv[1:] if a.lower().endswith((".exr",".hdr",".jpg",".jpeg",".png"))]
+    cli = [a for a in sys.argv[1:] if a.lower().endswith((".exr",".hdr",".jpg",".jpeg",".png",".webp"))]
     if cli: win._on_files_dropped(cli)
     sys.exit(app.exec())
 

@@ -75,16 +75,24 @@ def linear_to_srgb(x):
     x = np.clip(x, 0.0, None)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
 
+def _to_display_srgb_linear(img_linear, source_colorspace="acescg"):
+    """Convert a linear working image into linear sRGB for display."""
+    img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
+    cs = (source_colorspace or "acescg").lower().replace("-", "").replace("_", "")
+    if cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_ACESCG_TO_SRGB_LINEAR is not None:
+        return np.clip(apply_matrix_3x3(img_linear, M_ACESCG_TO_SRGB_LINEAR), 0.0, None)
+    return img_linear
+
 def luminance(rgb):
     return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
 
-def load_image_any(path, target_colorspace="acescg"):
+def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
     """
     Load any image to float32 linear RGB in the requested colorspace.
 
-    EXR / HDR inputs are assumed to already be in target_colorspace (no conversion).
-    LDR inputs (JPG/PNG) are linearised from sRGB and, if target_colorspace is
-    'acescg', converted to ACEScg via the sRGB→ACEScg matrix.
+    `input_colorspace` describes the source primaries for already-linear HDR data.
+    The pipeline now processes internally in ACEScg, so linear sRGB HDR inputs are
+    converted up front when requested.
     """
     ext = os.path.splitext(path)[1].lower()
     log(f"Loading: {path}")
@@ -96,13 +104,27 @@ def load_image_any(path, target_colorspace="acescg"):
             img = np.stack([img]*3, axis=-1)
         if img.shape[-1] > 3:
             img = img[..., :3]
-        log(f"Loaded EXR — assumed {target_colorspace} (no conversion)")
+        src_cs = (input_colorspace or target_colorspace or "acescg").lower().replace("-", "").replace("_", "")
+        dst_cs = (target_colorspace or src_cs).lower().replace("-", "").replace("_", "")
+        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
+            img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+            img = np.clip(img, 0.0, None)
+            log("Loaded EXR — interpreted as linear sRGB and converted to ACEScg")
+        else:
+            log(f"Loaded EXR — interpreted as {input_colorspace or target_colorspace or 'acescg'}")
         return img, True
     if ext == ".hdr":
         img = imageio.imread(path).astype(np.float32)
         if img.shape[-1] > 3:
             img = img[..., :3]
-        log(f"Loaded .hdr (linear Radiance) — assumed {target_colorspace}")
+        src_cs = (input_colorspace or target_colorspace or "acescg").lower().replace("-", "").replace("_", "")
+        dst_cs = (target_colorspace or src_cs).lower().replace("-", "").replace("_", "")
+        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
+            img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+            img = np.clip(img, 0.0, None)
+            log("Loaded .hdr — interpreted as linear sRGB and converted to ACEScg")
+        else:
+            log(f"Loaded .hdr — interpreted as {input_colorspace or target_colorspace or 'acescg'}")
         return img, True
     # LDR path — linearise from sRGB then optionally convert to ACEScg
     img = imageio.imread(path)
@@ -135,12 +157,13 @@ def save_exr(path, img):
     pyexr.write(path, img)
     log(f"Saved EXR: {path}")
 
-def save_png_preview(path, img_linear, percentile=99.5):
+def save_png_preview(path, img_linear, percentile=99.5, source_colorspace="acescg"):
     img_linear = np.clip(img_linear, 0.0, None)
     lum = luminance(img_linear)
     valid = lum[np.isfinite(lum)]
     denom = max(1e-6, np.percentile(valid, percentile)) if valid.size else 1.0
-    view = linear_to_srgb(np.clip(img_linear / denom, 0.0, 1.0))
+    display_linear = _to_display_srgb_linear(np.clip(img_linear / denom, 0.0, None), source_colorspace)
+    view = linear_to_srgb(np.clip(display_linear, 0.0, 1.0))
     imageio.imwrite(path, np.clip(view * 255 + 0.5, 0, 255).astype(np.uint8))
     log(f"Saved preview: {path}")
 
@@ -1097,15 +1120,17 @@ try:
         def get_cc24_reference(colorspace="acescg"):
             return CC24_LINEAR_SRGB
     try:
-        from colorchecker_erp import apply_matrix_3x3, M_SRGB_LINEAR_TO_ACESCG
+        from colorchecker_erp import apply_matrix_3x3, M_SRGB_LINEAR_TO_ACESCG, M_ACESCG_TO_SRGB_LINEAR
     except ImportError:
         apply_matrix_3x3 = None
         M_SRGB_LINEAR_TO_ACESCG = None
+        M_ACESCG_TO_SRGB_LINEAR = None
 except Exception as _cc_import_err:
     HAVE_CC_ERP = False
     CC24_LINEAR_SRGB = None
     apply_matrix_3x3 = None
     M_SRGB_LINEAR_TO_ACESCG = None
+    M_ACESCG_TO_SRGB_LINEAR = None
     import traceback as _tb
     warn(f"colorchecker_erp import failed: {_cc_import_err}")
     warn("Full traceback:")
@@ -1152,7 +1177,7 @@ def main():
 
     # ── Input / output ────────────────────────────────────────────────────
     ap.add_argument("input",
-                    help="Input latlong (.jpg/.png/.hdr/.exr)")
+                    help="Input latlong (.jpg/.jpeg/.png/.webp/.hdr/.exr)")
     ap.add_argument("--out", default="corrected.exr",
                     help="Output calibrated EXR")
     ap.add_argument("--debug-dir", default="debug_hdri",
@@ -1167,109 +1192,29 @@ def main():
                          "save at full then re-run at half for iteration.")
     ap.add_argument("--colorspace", default=None,
                     choices=["acescg", "srgb"],
-                    help="Working colorspace of the input. "
-                         "Default: auto — 'acescg' for .exr/.hdr, 'srgb' for .jpg/.png. "
-                         "Controls CC24 reference values for WB and colour matrix solve. "
-                         "Override only if your EXR is known to be in sRGB primaries.")
+                    help="Input primaries of the source image. "
+                         "Default: auto — 'acescg' for .exr/.hdr, 'srgb' for .jpg/.jpeg/.png/.webp/.tif/.tiff. "
+                         "The pipeline processes internally in ACEScg; choose 'srgb' for linear-sRGB EXR/HDR inputs so they are converted on load.")
 
     # ── White balance — primary source selectors ─────────────────────────
     # Two independent axes: --wb-source and --exposure-source.
     # Each can be set explicitly. 'auto' applies smart fallback logic.
     ap.add_argument("--wb-source", default="auto",
-                    choices=["auto", "chart", "sphere", "kelvin", "manual", "dome", "none"],
+                    choices=["auto", "chart", "none"],
                     help="White balance colour source. "
-                         "'auto' (default): chart if found+confident, else sphere, else none. "
-                         "'chart': use ColorChecker patch 22 — most accurate when chart is in scene light. "
-                         "'sphere': render a Lambertian grey sphere and neutralise RGB — "
-                         "  integrates the full environment, robust for coloured skies. "
-                         "'kelvin': use --kelvin colour temperature. "
-                         "'manual': use --rgb-scale explicit multiplier. "
-                         "'dome': grey-world estimate from dome pixels (see --dome-wb). "
+                         "'auto' (default): chart if found+confident, else none. "
+                         "'chart': use ColorChecker patch 22. "
                          "'none': no WB correction, passthrough.")
     ap.add_argument("--exposure-source", default="auto",
-                    choices=["auto", "chart", "sphere", "metering", "manual", "none"],
+                    choices=["auto", "chart", "none"],
                     help="Exposure magnitude source. "
-                         "'auto' (default): chart if found+confident, else sphere, else metering. "
-                         "'chart': use ColorChecker patch 22 luma — most accurate absolute reference. "
-                         "  Accounts for chart orientation via --chart-facing. "
-                         "'sphere': scale so rendered grey sphere mean = albedo (0.18). "
-                         "  Robust fallback when chart is missing or in shadow. "
-                         "'metering': use --metering-mode (dome/irradiance metering). "
-                         "'manual': use --exposure-scale explicit multiplier. "
+                         "'auto' (default): chart if found+confident, else none. "
+                         "'chart': use ColorChecker patch 22 luma as the absolute reference. "
                          "'none': no exposure correction.")
-    ap.add_argument("--exposure-scale", type=float, default=None,
-                    help="Manual exposure multiplier (linear). Only used with --exposure-source manual.")
-    ap.add_argument("--sphere-target", default="irradiance",
-                    choices=["sphere", "irradiance"],
-                    help="What 'correctly exposed' means when --exposure-source sphere. "
-                         "'irradiance' (default): scale so E_upper = π — a flat grey card "
-                         "facing the sky reads exactly albedo (0.18). This is the physical "
-                         "incident-light-meter model: grey card facing up = albedo. "
-                         "Matches what you measure with a Sekonic dome-up. "
-                         "'sphere': scale so rendered Lambertian grey sphere mean = albedo × π/4 "
-                         "(≈ 0.1414 for albedo=0.18). Use when you want the rendered sphere "
-                         "to read albedo rather than the flat card. "
-                         "Note: these differ when E_upper != π (low sun, overcast, interior). "
-                         "For a perfectly uniform hemisphere they are equivalent.")
-
-    # ── WB detail controls ────────────────────────────────────────────────
-    ap.add_argument("--kelvin", type=float, default=None,
-                    help="Colour temperature WB in Kelvin, e.g. 5600. Used when --wb-source kelvin.")
-    ap.add_argument("--rgb-scale", type=str, default=None,
-                    help="Manual RGB multiplier, e.g. 1.0,0.97,1.05. Used when --wb-source manual.")
-    ap.add_argument("--wb-swatch", type=str, default=None,
-                    help="Neutral swatch pixel UV for WB, e.g. 123,456.")
-    ap.add_argument("--dome-wb", type=str, default=None,
-                    choices=["upper_dome", "full_dome", "hot_exclude"],
-                    help="Grey-world WB mode when --wb-source dome. "
-                         "  upper_dome  — sky hemisphere only (recommended) "
-                         "  full_dome   — entire 360° sphere "
-                         "  hot_exclude — upper dome minus brightest 3%%")
-    ap.add_argument("--sphere-wb", action="store_true", default=False,
-                    help="Alias for --wb-source sphere. Kept for backward compatibility.")
-
-    # ── Chart orientation ─────────────────────────────────────────────────
-    ap.add_argument("--chart-facing", default="auto",
-                    choices=["auto", "up", "sun"],
-                    help="Physical orientation of the ColorChecker on set — used for exposure. "
-                         "'auto': use detected chart normal (theta<50=floor, 50-130=tripod, else E=pi). "
-                         "'up': chart flat on ground facing sky — E_incident=E_upper. "
-                         "  Use this for 99%% of outdoor HDRI shoots. "
-                         "'sun': chart on tripod facing the sun — E_incident=E_sun_dir. "
-                         "Correct orientation prevents exposure error when E_upper != pi "
-                         "(e.g. low sun, overcast).")
-
-    # ── Metering ──────────────────────────────────────────────────────────
-    ap.add_argument("--metering-mode", default="bottom_dome",
-                    choices=["whole_scene", "bottom_dome", "swatch", "upper_hemi_irradiance"],
-                    help="Exposure metering mode (used when --exposure-source metering). "
-                         "'bottom_dome': median luma of lower hemisphere (default). "
-                         "'whole_scene': median of all pixels. "
-                         "'swatch': sample a specific pixel (requires --swatch). "
-                         "'upper_hemi_irradiance': cosine-weighted integral of upper "
-                         "hemisphere onto a flat upward surface. Set --meter-target 1.0 "
-                         "for a normalised IBL. Good for overcast/diffuse skies. "
-                         "surface facing the dominant light (sun). Finds the hot-lobe "
-                         "direction first, then integrates the hemisphere around it. "
-                         "Set --meter-target 1.0 for normalised direct illumination. "
-                         "Good for sunny day HDRIs.")
-    ap.add_argument("--meter-stat", default="median",
-                    choices=["mean", "median"])
-    ap.add_argument("--meter-target", type=float, default=0.18,
-                    help="Target value for the chosen metering mode (linear). "
-                         "0.18 = 18%% grey (default, for bottom_dome/whole_scene). "
-                         "Use 1.0 with --metering-mode upper_hemi_irradiance for "
-                         "a physically normalised IBL where E_upper = 1.0.")
-    ap.add_argument("--swatch", type=str, default=None,
-                    help="Pixel for swatch metering, e.g. 123,456")
-    ap.add_argument("--swatch-size", type=int, default=5)
-
     # ── Hot lobe ──────────────────────────────────────────────────────────
     ap.add_argument("--sun-threshold", type=float, default=0.1,
                     help="Hot lobe width: 0..1 fraction below peak. "
                          "0.1 → low=0.9×peak, high=peak")
-    ap.add_argument("--sun-upper-only", action="store_true",
-                    help="Restrict hot lobe to upper hemisphere (y>0)")
     ap.add_argument("--sun-gain-ceiling", type=float, default=2000.0,
                     help="Maximum per-channel gain applied to the sun lobe during "
                          "irradiance reconstruction. Default 2000×. "
@@ -1286,8 +1231,6 @@ def main():
                          "are compressed toward --sun-gain-ceiling with a smooth "
                          "curve. Set equal to --sun-gain-ceiling to disable rolloff "
                          "(hard ceiling).")
-    ap.add_argument("--sun-blur-px", type=int, default=0,
-                    help="Gaussian blur on hot mask (odd px, 0=off)")
 
     # ── HDRI centering ────────────────────────────────────────────────────
     ap.add_argument("--center-hdri", action="store_true", default=True,
@@ -1296,24 +1239,24 @@ def main():
     ap.add_argument("--no-center-hdri", dest="center_hdri",
                     action="store_false",
                     help="Disable HDRI azimuth centering")
-    ap.add_argument("--center-elevation", action="store_true", default=False,
-                    help="Also shift vertically to place sun at equator row. "
-                         "Useful for turntables; changes sun elevation so "
-                         "use with care.")
 
     # ── Sphere solve ──────────────────────────────────────────────────────
     ap.add_argument("--albedo", type=float, default=0.18,
                     help="Grey ball albedo")
-    ap.add_argument("--sphere-res", type=int, default=96,
-                    help="Lambertian sphere render resolution")
     ap.add_argument("--sphere-solve", default="energy_conservation",
-                    choices=["energy_conservation", "direct_highlight",
-                             "iterative_peak_ratio", "none"],
-                    help="Sun gain solve mode. Default: energy_conservation — "
-                         "per-channel solve that restores missing integrated energy "
-                         "so the final sphere renders neutral grey at meter_target. "
-                         "direct_highlight / iterative_peak_ratio are legacy scalar "
-                         "modes kept for compatibility.")
+                    choices=["energy_conservation", "sun_facing_card",
+                             "sun_facing_vertical", "none"],
+                    help="Sun gain solve mode. Default: energy_conservation. "
+                         "energy_conservation targets an upward-facing grey card, "
+                         "sun_facing_card targets a grey card whose normal points at the sun, "
+                         "sun_facing_vertical targets a vertical card rotated toward the sun azimuth. "
+                         "none disables the sun solve.")
+    ap.add_argument("--final-balance-target", default="none",
+                    choices=["none", "auto"],
+                    help="Optional final post-balance target. "
+                         "'none' keeps the solved output unchanged. "
+                         "'auto' measures the imaginary card implied by the selected sun solve target, "
+                         "then applies one final RGB trim so it is neutral at albedo.")
     ap.add_argument("--lobe-neutralise", type=float, default=1.0,
                     metavar="0.0-1.0",
                     help="How strongly to desaturate hot lobe pixels before gain "
@@ -1321,24 +1264,6 @@ def main():
                          "0.8 = allow a hint of warmth. 0.0 = no neutralisation. "
                          "Physical basis: after white balance the sun should be "
                          "near-neutral; remaining colour is clipping artefact.")
-    ap.add_argument("--direct-highlight-target", type=float, default=0.32,
-                    help="Target bright-side mean for direct_highlight solve")
-    ap.add_argument("--target-peak-ratio", type=float, default=2.5,
-                    help="Target p95/mean ratio for iterative_peak_ratio solve")
-
-    # ── Reference sphere image ────────────────────────────────────────────
-    ap.add_argument("--ref-sphere", type=str, default=None,
-                    help="Path to photograph of grey/diffuse ball shot on-set. "
-                         "Enables physical photometric exposure calibration via "
-                         "WLS irradiance matching across all ball pixels.")
-    ap.add_argument("--ref-sphere-cx", type=int, default=None,
-                    help="Ball centre X in ref-sphere image (auto-detected if omitted)")
-    ap.add_argument("--ref-sphere-cy", type=int, default=None,
-                    help="Ball centre Y in ref-sphere image (auto-detected if omitted)")
-    ap.add_argument("--ref-sphere-r", type=int, default=None,
-                    help="Ball radius in px in ref-sphere image (auto-detected if omitted)")
-    ap.add_argument("--ref-sphere-albedo", type=float, default=0.18,
-                    help="Albedo of the reference ball (0.18 = 18%% grey)")
 
     # ── ColorChecker ──────────────────────────────────────────────────────
     ap.add_argument("--colorchecker", type=str, default=None,
@@ -1363,6 +1288,35 @@ def main():
                          "write a JSON report — no EXR output. Fast batch checking.")
 
     args = ap.parse_args()
+    _legacy_defaults = {
+        "exposure_scale": None,
+        "sphere_target": "irradiance",
+        "kelvin": None,
+        "rgb_scale": None,
+        "wb_swatch": None,
+        "dome_wb": None,
+        "sphere_wb": False,
+        "chart_facing": "auto",
+        "metering_mode": "upper_hemi_irradiance",
+        "meter_stat": "median",
+        "meter_target": 1.0,
+        "swatch": None,
+        "swatch_size": 5,
+        "sun_upper_only": False,
+        "sun_blur_px": 0,
+        "center_elevation": False,
+        "sphere_res": 96,
+        "direct_highlight_target": 0.32,
+        "target_peak_ratio": 2.5,
+        "ref_sphere": None,
+        "ref_sphere_cx": None,
+        "ref_sphere_cy": None,
+        "ref_sphere_r": None,
+        "ref_sphere_albedo": 0.18,
+    }
+    for _k, _v in _legacy_defaults.items():
+        if not hasattr(args, _k):
+            setattr(args, _k, _v)
     _run_pipeline(args)
 
 
@@ -1470,20 +1424,21 @@ def _run_pipeline(args):
     wb_swatch_xy    = parse_xy(args.wb_swatch)        if args.wb_swatch else None
     meter_swatch_xy = parse_xy(args.swatch)           if args.swatch    else None
 
-    # ── Colorspace auto-detect ────────────────────────────────────────────
-    # EXR / HDR from a VFX pipeline = ACEScg (AP1 primaries).
-    # LDR (JPG/PNG) = sRGB. User can override with --colorspace.
+    # ── Input colorspace / working space ─────────────────────────────────
+    # The pipeline now processes internally in ACEScg.
     if args.colorspace:
-        working_cs = args.colorspace
+        input_cs = args.colorspace
     else:
         ext = os.path.splitext(args.input)[1].lower()
-        working_cs = "srgb" if ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff") else "acescg"
+        input_cs = "srgb" if ext in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff") else "acescg"
+    working_cs = "acescg"
+    log(f"Input colorspace: {input_cs}")
     log(f"Working colorspace: {working_cs}")
 
-    meta = {"input": args.input, "args": vars(args), "colorspace": working_cs}
+    meta = {"input": args.input, "args": vars(args), "input_colorspace": input_cs, "colorspace": working_cs}
 
     # ── 1. Load ───────────────────────────────────────────────────────────
-    img, is_hdr = load_image_any(args.input, target_colorspace=working_cs)
+    img, is_hdr = load_image_any(args.input, target_colorspace=working_cs, input_colorspace=input_cs)
     img = np.clip(img, 0.0, None).astype(np.float32)
     if img.ndim != 3 or img.shape[2] != 3:
         raise RuntimeError("Input must be RGB")
@@ -1570,7 +1525,7 @@ def _run_pipeline(args):
             )
         else:
             log(f"Loading ColorChecker plate: {checker_src}")
-            cc_img_raw, _ = load_image_any(checker_src)
+            cc_img_raw, _ = load_image_any(checker_src, target_colorspace=working_cs)
             from colorchecker_erp import _linear_to_u8_for_detection
             import colour_checker_detection as _ccd_direct
             tile_u8_bgr = cv2.cvtColor(
@@ -1688,8 +1643,8 @@ def _run_pipeline(args):
     # --sphere-wb is a backward-compat alias for --wb-source sphere.
     #
     # 'auto' fallback chains:
-    #   WB:       chart (found+confident) → sphere → none
-    #   Exposure: chart (found+confident) → sphere → metering
+    #   WB:       chart (found+confident) → none
+    #   Exposure: chart (found+confident) → none
     #
     # Each axis is fully independent — you can mix and match freely:
     #   --wb-source chart --exposure-source sphere   (chart colour, sphere brightness)
@@ -1710,7 +1665,7 @@ def _run_pipeline(args):
 
     # ── Resolve sources with fallback chain ──────────────────────────────
     # Rules:
-    #   'auto'          → chart if found+confident, else sphere (wb) / sphere (exp)
+    #   'auto'          → chart if found+confident, else none
     #   explicit source → use it IF the required data is available, else fallback
     #                     with a loud warning (never silently do nothing)
     #
@@ -1719,8 +1674,8 @@ def _run_pipeline(args):
     #   sphere always available (just renders the env)
     #   kelvin/manual always available if args provided
 
-    FALLBACK_WB  = "sphere"    # when chart requested but unavailable
-    FALLBACK_EXP = "sphere"    # when chart requested but unavailable
+    FALLBACK_WB  = "none"      # when chart requested but unavailable
+    FALLBACK_EXP = "none"      # when chart requested but unavailable
 
     def _resolve_wb(src_raw, chart_ok):
         if src_raw == "auto":
@@ -2357,36 +2312,9 @@ def _run_pipeline(args):
            f"  (soft rolloff above {_gain_rolloff:.0f}×, sqrt curve to {_gain_ceiling:.0f}×)"))
 
     # ── Sun disc gain solve ───────────────────────────────────────────────
-    #
-    # Goal: base dome + reconstructed sun lobe → Lambertian grey card
-    #       facing UP reads neutral [0.18, 0.18, 0.18].
-    #
-    # Method:
-    #   1. Compute what the BASE DOME ALONE delivers to an upward card, per channel:
-    #        card_base_c = albedo × E_base_c_upper / π
-    #      This is what the sky/fill alone gives — may be blue, red, whatever.
-    #
-    #   2. Target is [albedo, albedo, albedo] = [0.18, 0.18, 0.18].
-    #      The sun lobe must supply the DIFFERENCE per channel:
-    #        card_needed_c = albedo - card_base_c
-    #        E_needed_c    = card_needed_c × π / albedo
-    #                      = π - E_base_c_upper
-    #
-    #   3. The lobe is neutralised to [L,L,L] white first (sky contamination removed).
-    #      Then per-channel gains are applied to the NEUTRALISED lobe to reach E_needed:
-    #        gain_c = E_needed_c / E_lobe_neutral_c_upper
-    #
-    #   Result:
-    #     - Sky stays whatever colour it is (not touched)
-    #     - Sun disc starts white, then gets WARM gains (high R, low B) to fill
-    #       what the blue sky is missing → sun appears warm/orange as expected
-    #     - Total upward card = albedo exactly on all channels ✓
-    #
-    # This is the correct physical model: the sun compensates for whatever
-    # colour the sky provides, so the combined illuminant is neutral.
+    # Solve the hot lobe against an explicit target card orientation.
 
     _dirs_lobe, _dOmega_lobe = latlong_dirs(exposed.shape[0], exposed.shape[1])
-    _cos_up = np.clip(_dirs_lobe[..., 1], 0.0, None)   # upper hemisphere weights
 
     # Base dome only (lobe zeroed)
     _base_env = exposed * (1.0 - hot["mask"][..., None])
@@ -2395,68 +2323,169 @@ def _run_pipeline(args):
     _lobe_env_neutral = neutralise_lobe(exposed, hot["mask"], strength=args.lobe_neutralise)
     _lobe_env_n = _lobe_env_neutral * hot["mask"][..., None]
 
-    # Per-channel irradiance from base dome toward upper hemisphere
-    _E_base_rgb = np.array([
-        float(np.sum(_base_env[..., c] * _cos_up * _dOmega_lobe))
-        for c in range(3)])
+    def _irradiance_rgb_toward(_env, _direction):
+        D = np.asarray(_direction, dtype=np.float32)
+        D /= np.linalg.norm(D) + 1e-8
+        _cos = np.clip((_dirs_lobe * D[None, None, :]).sum(axis=-1), 0.0, None)
+        return np.array([
+            float(np.sum(_env[..., c] * _cos * _dOmega_lobe))
+            for c in range(3)
+        ], dtype=np.float32)
 
-    # Per-channel irradiance from neutralised lobe toward upper hemisphere
-    _E_lobe_rgb = np.array([
-        float(np.sum(_lobe_env_n[..., c] * _cos_up * _dOmega_lobe))
-        for c in range(3)])
+    _solve_mode = getattr(args, "sphere_solve", "energy_conservation")
+    _sun_dir = np.asarray(hot["center_dir"], dtype=np.float32)
+    _sun_dir /= np.linalg.norm(_sun_dir) + 1e-8
+    _sun_vertical_dir = np.array([_sun_dir[0], 0.0, _sun_dir[2]], dtype=np.float32)
+    if float(np.linalg.norm(_sun_vertical_dir)) < 1e-6:
+        _sun_vertical_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    else:
+        _sun_vertical_dir /= np.linalg.norm(_sun_vertical_dir) + 1e-8
 
-    # What the base dome gives a grey card facing up, per channel
-    _card_base_rgb = args.albedo * _E_base_rgb / math.pi
-    log(f"Sun lobe solve — base dome card-up: "
-        f"R={_card_base_rgb[0]:.4f}  G={_card_base_rgb[1]:.4f}  B={_card_base_rgb[2]:.4f}  "
-        f"(target={args.albedo:.4f} each)")
+    _solve_target_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    _solve_target_key = "card_up"
+    _solve_target_summary = "grey card facing sky = albedo"
+    _solve_target_metric = "E_upper / pi"
 
-    # Solve per-channel gains on the neutralised lobe
-    _gains_solve = np.ones(3, dtype=np.float32)
-    for _c, _name in enumerate(('R', 'G', 'B')):
-        _E_needed = math.pi - _E_base_rgb[_c]
-        _E_lobe_c = _E_lobe_rgb[_c]
-        if _E_lobe_c < 1e-10:
-            log(f"  {_name}: lobe irradiance near zero — gain=1.0")
-            _gains_solve[_c] = 1.0
-        elif _E_needed <= 0:
-            log(f"  {_name}: base already ≥ π (E_base={_E_base_rgb[_c]:.4f}) — gain=1.0")
-            _gains_solve[_c] = 1.0
-        else:
-            _g_raw = _E_needed / _E_lobe_c
-            _g = apply_gain_ceiling(_g_raw, _gain_ceiling, _gain_rolloff)
-            _gains_solve[_c] = float(_g)
-            _card_final_c = args.albedo * (_E_base_rgb[_c] + _g * _E_lobe_c) / math.pi
-            if _g_raw > _gain_ceiling:
-                log(f"  {_name}: raw={_g_raw:.1f}× → ceiling={_g:.1f}×  card={_card_final_c:.4f}")
+    if _solve_mode == "sun_facing_card":
+        _solve_target_dir = _sun_dir
+        _solve_target_key = "card_sun"
+        _solve_target_summary = "grey card facing sun = albedo"
+        _solve_target_metric = "E_sun / pi"
+    elif _solve_mode == "sun_facing_vertical":
+        _solve_target_dir = _sun_vertical_dir
+        _solve_target_key = "card_vertical_sun"
+        _solve_target_summary = "vertical grey card facing sun azimuth = albedo"
+        _solve_target_metric = "E_vertical_sun / pi"
+
+    if _solve_mode == "none":
+        _gains_solve = np.ones(3, dtype=np.float32)
+        _E_base_rgb = _irradiance_rgb_toward(_base_env, _solve_target_dir)
+        _E_lobe_rgb = _irradiance_rgb_toward(_lobe_env_n, _solve_target_dir)
+        _card_base_rgb = args.albedo * _E_base_rgb / math.pi
+        _card_final_rgb = _card_base_rgb.copy()
+        log("Sun lobe solve disabled (--sphere-solve none)")
+        solution = {
+            "gain": 1.0,
+            "gains_per_channel": _gains_solve,
+            "metrics": {},
+            "gain_diag": {
+                "method": "disabled",
+                "E_base_rgb": _E_base_rgb.tolist(),
+                "E_lobe_rgb": _E_lobe_rgb.tolist(),
+                "E_target": math.pi,
+                "gains": _gains_solve.tolist(),
+                "card_base": _card_base_rgb.tolist(),
+                "card_final": _card_final_rgb.tolist(),
+                "mode": _solve_target_key,
+                "target_summary": _solve_target_summary,
+                "target_metric": _solve_target_metric,
+            },
+        }
+        corrected = exposed.copy()
+    else:
+        _E_base_rgb = _irradiance_rgb_toward(_base_env, _solve_target_dir)
+        _E_lobe_rgb = _irradiance_rgb_toward(_lobe_env_n, _solve_target_dir)
+        _card_base_rgb = args.albedo * _E_base_rgb / math.pi
+        log(f"Sun lobe solve — base dome {_solve_target_key}: "
+            f"R={_card_base_rgb[0]:.4f}  G={_card_base_rgb[1]:.4f}  B={_card_base_rgb[2]:.4f}  "
+            f"(target={args.albedo:.4f} each)")
+
+        _gains_solve = np.ones(3, dtype=np.float32)
+        for _c, _name in enumerate(('R', 'G', 'B')):
+            _E_needed = math.pi - _E_base_rgb[_c]
+            _E_lobe_c = _E_lobe_rgb[_c]
+            if _E_lobe_c < 1e-10:
+                log(f"  {_name}: lobe irradiance near zero — gain=1.0")
+                _gains_solve[_c] = 1.0
+            elif _E_needed <= 0:
+                log(f"  {_name}: base already ≥ π (E_base={_E_base_rgb[_c]:.4f}) — gain=1.0")
+                _gains_solve[_c] = 1.0
             else:
-                log(f"  {_name}: gain={_g:.2f}×  card={_card_final_c:.4f}")
+                _g_raw = _E_needed / _E_lobe_c
+                _g = apply_gain_ceiling(_g_raw, _gain_ceiling, _gain_rolloff)
+                _gains_solve[_c] = float(_g)
+                _card_final_c = args.albedo * (_E_base_rgb[_c] + _g * _E_lobe_c) / math.pi
+                if _g_raw > _gain_ceiling:
+                    log(f"  {_name}: raw={_g_raw:.1f}× → ceiling={_g:.1f}×  card={_card_final_c:.4f}")
+                else:
+                    log(f"  {_name}: gain={_g:.2f}×  card={_card_final_c:.4f}")
 
-    _card_final_rgb = args.albedo * (_E_base_rgb + _gains_solve * _E_lobe_rgb) / math.pi
-    log(f"Sun lobe solve — final card-up predicted: "
-        f"R={_card_final_rgb[0]:.4f}  G={_card_final_rgb[1]:.4f}  B={_card_final_rgb[2]:.4f}  "
-        f"(should be {args.albedo:.4f} each)")
+        _card_final_rgb = args.albedo * (_E_base_rgb + _gains_solve * _E_lobe_rgb) / math.pi
+        log(f"Sun lobe solve — final {_solve_target_key} predicted: "
+            f"R={_card_final_rgb[0]:.4f}  G={_card_final_rgb[1]:.4f}  B={_card_final_rgb[2]:.4f}  "
+            f"(should be {args.albedo:.4f} each)")
 
-    solution = {
-        "gain":             float(_gains_solve.mean()),
-        "gains_per_channel": _gains_solve,
-        "metrics":          {},   # filled after final sphere render below
-        "gain_diag": {
-            "E_base_rgb":   _E_base_rgb.tolist(),
-            "E_lobe_rgb":   _E_lobe_rgb.tolist(),
-            "E_target":     math.pi,
-            "gains":        _gains_solve.tolist(),
-            "card_base":    _card_base_rgb.tolist(),
-            "card_final":   _card_final_rgb.tolist(),
-            "mode":         "card_up_neutral",
-        },
-    }
+        solution = {
+            "gain": float(_gains_solve.mean()),
+            "gains_per_channel": _gains_solve,
+            "metrics": {},
+            "gain_diag": {
+                "method": "irradiance",
+                "E_base_rgb": _E_base_rgb.tolist(),
+                "E_lobe_rgb": _E_lobe_rgb.tolist(),
+                "E_target": math.pi,
+                "gains": _gains_solve.tolist(),
+                "card_base": _card_base_rgb.tolist(),
+                "card_final": _card_final_rgb.tolist(),
+                "mode": _solve_target_key,
+                "target_summary": _solve_target_summary,
+                "target_metric": _solve_target_metric,
+            },
+        }
+
+        corrected = apply_sun_gain_per_channel(exposed, hot["mask"], _gains_solve,
+                                               lobe_neutralise_strength=args.lobe_neutralise)
 
     # Apply per-channel gains (energy_conservation mode) or scalar (legacy modes)
     gains_pc = solution["gains_per_channel"]
-    corrected = apply_sun_gain_per_channel(exposed, hot["mask"], gains_pc,
-                                           lobe_neutralise_strength=args.lobe_neutralise)
     save_png_preview(os.path.join(args.debug_dir, "07_corrected_preview.png"), corrected)
+
+    _final_balance_target = getattr(args, "final_balance_target", "none")
+    final_balance_info = {
+        "applied": False,
+        "target": _final_balance_target,
+        "target_mode": _solve_target_key,
+        "target_summary": _solve_target_summary,
+    }
+    if _final_balance_target != "none":
+        _lum_w = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        _fb_E_rgb = _irradiance_rgb_toward(corrected, _solve_target_dir)
+        _fb_card_before = args.albedo * _fb_E_rgb / math.pi
+        _fb_luma_before = float(np.dot(_fb_card_before, _lum_w))
+
+        _neutral_level = max(_fb_luma_before, 1e-6)
+        _fb_wb_scale = (_neutral_level / np.clip(_fb_card_before, 1e-6, None)).astype(np.float32)
+
+        _fb_card_after_wb = _fb_card_before * _fb_wb_scale
+        _fb_luma_after_wb = float(np.dot(_fb_card_after_wb, _lum_w))
+
+        _fb_exposure_scale = float(args.albedo / max(_fb_luma_after_wb, 1e-6))
+
+        _fb_total_scale = (_fb_wb_scale * _fb_exposure_scale).astype(np.float32)
+        corrected = corrected * _fb_total_scale[None, None, :]
+        _fb_card_after = _fb_card_before * _fb_total_scale
+        _fb_luma_after = float(np.dot(_fb_card_after, _lum_w))
+
+        log(f"Final post-balance — target {_solve_target_key}: "
+            f"card before R={_fb_card_before[0]:.4f} G={_fb_card_before[1]:.4f} B={_fb_card_before[2]:.4f}  "
+            f"(luma={_fb_luma_before:.4f})")
+        log(f"  wb scale      : R={_fb_wb_scale[0]:.4f}  G={_fb_wb_scale[1]:.4f}  B={_fb_wb_scale[2]:.4f}")
+        log(f"  exposure scale: {_fb_exposure_scale:.4f}")
+        log(f"  total scale   : R={_fb_total_scale[0]:.4f}  G={_fb_total_scale[1]:.4f}  B={_fb_total_scale[2]:.4f}")
+        log(f"  card after    : R={_fb_card_after[0]:.4f}  G={_fb_card_after[1]:.4f}  B={_fb_card_after[2]:.4f}  "
+            f"(luma={_fb_luma_after:.4f}, target={args.albedo:.4f})")
+
+        save_png_preview(os.path.join(args.debug_dir, "07b_final_balanced_preview.png"), corrected)
+        final_balance_info.update({
+            "applied": True,
+            "card_before_rgb": _fb_card_before.tolist(),
+            "card_before_luma": _fb_luma_before,
+            "wb_scale": _fb_wb_scale.tolist(),
+            "exposure_scale": _fb_exposure_scale,
+            "total_scale": _fb_total_scale.tolist(),
+            "card_after_rgb": _fb_card_after.tolist(),
+            "card_after_luma": _fb_luma_after,
+        })
 
     # ── Validation render: final HDR → grey sphere ─────────────────────────
     # This is the ground truth check. If the pipeline is correct, the sphere
@@ -2492,14 +2521,15 @@ def _run_pipeline(args):
             abs(float(final_verify_rgb[2]) - float(final_verify_rgb[1])) < 0.01
         ),
     }
+    meta["final_balance"] = final_balance_info
 
     # ── 8. Reference sphere calibration ───────────────────────────────────
     sphere_cal_info = {"applied": False}
     if args.ref_sphere:
         log(f"Loading reference sphere image: {args.ref_sphere}")
-        ref_img_linear, _ = load_image_any(args.ref_sphere)
+        ref_img_linear, _ = load_image_any(args.ref_sphere, target_colorspace=working_cs)
         ref_bgr = cv2.cvtColor(
-            np.clip(linear_to_srgb(ref_img_linear) * 255, 0, 255).astype(np.uint8),
+            np.clip(linear_to_srgb(np.clip(_to_display_srgb_linear(ref_img_linear, working_cs), 0.0, 1.0)) * 255, 0, 255).astype(np.uint8),
             cv2.COLOR_RGB2BGR)
 
         # Auto-detect or use manual coords
@@ -2660,12 +2690,20 @@ def _run_pipeline(args):
     E_upper = _E_dir(( 0,  1,  0))
     E_lower = _E_dir(( 0, -1,  0))
     E_sun   = _E_dir(sun_dir)
+    sun_vertical_dir = np.array([sun_dir[0], 0.0, sun_dir[2]], dtype=np.float32)
+    if float(np.linalg.norm(sun_vertical_dir)) < 1e-6:
+        sun_vertical_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    else:
+        sun_vertical_dir /= np.linalg.norm(sun_vertical_dir) + 1e-8
+    E_vertical_sun = _E_dir(sun_vertical_dir)
     E_full  = float(np.sum(_lum_v * _dOmega_v))
 
     E_upper_rgb = _E_dir_rgb(( 0,  1,  0))
     E_sun_rgb   = _E_dir_rgb(sun_dir)
+    E_vertical_sun_rgb = _E_dir_rgb(sun_vertical_dir)
     E_upper_norm = E_upper_rgb / (np.mean(E_upper_rgb) + 1e-8)
     E_sun_norm   = E_sun_rgb   / (np.mean(E_sun_rgb)   + 1e-8)
+    E_vertical_sun_norm = E_vertical_sun_rgb / (np.mean(E_vertical_sun_rgb) + 1e-8)
     E_lower_rgb  = _E_dir_rgb(( 0, -1,  0))
 
     log(f"")
@@ -2809,11 +2847,14 @@ def _run_pipeline(args):
         log(f"  ── Sun gain solve summary ───────────────────────────────────────")
         log(f"  method    : {gd.get('method', '?')}")
         if gd.get("method") == "irradiance":
-            log(f"  E_base    : R={gd['E_base'][0]:.4f}  G={gd['E_base'][1]:.4f}  B={gd['E_base'][2]:.4f}")
-            log(f"  E_lobe×1  : R={gd['E_lobe'][0]:.6f}  G={gd['E_lobe'][1]:.6f}  B={gd['E_lobe'][2]:.6f}")
+            e_base = np.array(gd.get("E_base_rgb", gd.get("E_base", [0.0, 0.0, 0.0])), dtype=np.float32)
+            e_lobe = np.array(gd.get("E_lobe_rgb", gd.get("E_lobe", [0.0, 0.0, 0.0])), dtype=np.float32)
+            log(f"  target    : {gd.get('target_summary', gd.get('mode', '?'))}")
+            log(f"  E_base    : R={e_base[0]:.4f}  G={e_base[1]:.4f}  B={e_base[2]:.4f}")
+            log(f"  E_lobe×1  : R={e_lobe[0]:.6f}  G={e_lobe[1]:.6f}  B={e_lobe[2]:.6f}")
             log(f"  E_target  : {gd['E_target']:.5f}  ({gd.get('mode', '?')})")
-            E_b = np.array(gd['E_base'])
-            E_l = np.array(gd['E_lobe'])
+            E_b = e_base
+            E_l = e_lobe
             E_t = gd['E_target']
             E_final_per_ch = E_b + E_l * solution['gains_per_channel']
             log(f"  E_final   : R={E_final_per_ch[0]:.4f}  G={E_final_per_ch[1]:.4f}  "
@@ -2827,7 +2868,8 @@ def _run_pipeline(args):
     log(f"  ╔══════════════════════════════════════════════════════════════╗")
     log(f"  ║  CALIBRATION SUMMARY                                        ║")
     log(f"  ╠══════════════════════════════════════════════════════════════╣")
-    log(f"  ║  Target: grey card facing sun = albedo ({a:.4f})            ║")
+    _solve_summary_text = solution.get("gain_diag", {}).get("target_summary", "grey card facing sky = albedo")
+    log(f"  ║  Target: {_solve_summary_text} ({a:.4f})            ║")
     log(f"  ║                                                              ║")
     log(f"  ║  Predicted values (use to validate on-set references):      ║")
     log(f"  ║    Grey card facing ↑ sky   : {pred_card_up:>8.5f}                  ║")
@@ -2837,10 +2879,21 @@ def _run_pipeline(args):
     log(f"  ║    Grey sphere (upper only) : {pred_sphere_up:>8.5f}                  ║")
     log(f"  ║    Rendered sphere (actual) : {rendered_sphere_mean:>8.5f}                  ║")
     log(f"  ║                                                              ║")
-    e_pi_check = E_sun / math.pi
+    _solve_mode = solution.get("gain_diag", {}).get("mode", "card_up")
+    if _solve_mode == "card_sun":
+        e_pi_check = E_sun / math.pi
+        _solve_metric_label = "E_sun / pi"
+        chroma_ok_final = chroma_sun < 0.10
+    elif _solve_mode == "card_vertical_sun":
+        e_pi_check = E_vertical_sun / math.pi
+        _solve_metric_label = "E_vertical_sun / pi"
+        chroma_ok_final = float(np.max(np.abs(E_vertical_sun_norm - 1.0))) < 0.10
+    else:
+        e_pi_check = E_upper / math.pi
+        _solve_metric_label = "E_upper / pi"
+        chroma_ok_final = chroma_upper < 0.10
     solve_ok = abs(e_pi_check - 1.0) < 0.15
-    chroma_ok_final = chroma_sun < 0.10
-    log(f"  ║  E_sun / π  = {e_pi_check:.4f}  {'✓ calibrated' if solve_ok else '⚠ off — check solve'}            ║")
+    log(f"  ║  {_solve_metric_label} = {e_pi_check:.4f}  {'✓ calibrated' if solve_ok else '⚠ off — check solve'}            ║")
     log(f"  ║  Sun chroma = {chroma_sun:.4f}  {'✓ neutral' if chroma_ok_final else '⚠ coloured — expected for low sun'}        ║")
     log(f"  ║  Rendered vs analytical = {energy_err:.2%}   {'✓' if energy_err < 0.10 else '⚠'}                    ║")
     log(f"  ╚══════════════════════════════════════════════════════════════╝")
