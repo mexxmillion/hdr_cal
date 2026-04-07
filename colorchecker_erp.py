@@ -1477,9 +1477,13 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            # Simple Reinhard tonemap for debug — no auto-exposure surprises
-            _tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
-            _u8 = np.clip(_tm * 255 + 0.5, 0, 255).astype(np.uint8)
+            # ACEScg → linear sRGB → sRGB gamma → uint8
+            _srgb_lin = acescg_to_srgb_linear(tile_linear) if HAVE_COLOUR else tile_linear
+            _srgb_lin = np.clip(_srgb_lin, 0.0, 1.0)
+            _srgb = np.where(_srgb_lin <= 0.0031308,
+                             _srgb_lin * 12.92,
+                             1.055 * np.power(np.clip(_srgb_lin, 1e-9, None), 1.0 / 2.4) - 0.055)
+            _u8 = np.clip(_srgb * 255 + 0.5, 0, 255).astype(np.uint8)
             tile_bgr = cv2.cvtColor(_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
                         f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
