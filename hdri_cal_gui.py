@@ -1022,10 +1022,10 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.valueChanged,
             self._settings.sun_gain_ceiling.valueChanged,
             self._settings.sun_gain_rolloff.valueChanged,
-            self._settings.sweep_fov.valueChanged,
-            self._settings.sweep_overlap.valueChanged,
-            self._settings.sweep_min_pitch.valueChanged,
-            self._settings.sweep_max_pitch.valueChanged,
+            self._settings.sweep_fov.editingFinished,
+            self._settings.sweep_overlap.editingFinished,
+            self._settings.sweep_min_pitch.editingFinished,
+            self._settings.sweep_max_pitch.editingFinished,
         ]:
             signal.connect(self._on_settings_changed)
 
