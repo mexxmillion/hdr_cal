@@ -1,0 +1,77 @@
+SCL_DEVOPS_REZ_SEARCH_PATHS: \\inferno2\projects\common\home\quw\dev\temp_packages;
+Traceback (most recent call last):
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\colour_checker_detection\detection\..\scripts\inference.py", line 246, in <module>
+    segmentation()
+  File "\\s2\rez\packages\prod\packages\scan_py_external\0.3.3\platform-windows\arch-AMD64\python-3.11\Lib\site-packages\click\core.py", line 1157, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\s2\rez\packages\prod\packages\scan_py_external\0.3.3\platform-windows\arch-AMD64\python-3.11\Lib\site-packages\click\core.py", line 1078, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "\\s2\rez\packages\prod\packages\scan_py_external\0.3.3\platform-windows\arch-AMD64\python-3.11\Lib\site-packages\click\core.py", line 1434, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\s2\rez\packages\prod\packages\scan_py_external\0.3.3\platform-windows\arch-AMD64\python-3.11\Lib\site-packages\click\core.py", line 783, in invoke
+    return __callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\colour_checker_detection\detection\..\scripts\inference.py", line 206, in segmentation
+    from ultralytics import YOLO  # noqa: PLC0415  # pyright: ignore
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\ultralytics\__init__.py", line 38, in __getattr__
+    return getattr(importlib.import_module("ultralytics.models"), name)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python311\Lib\importlib\__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\ultralytics\models\__init__.py", line 6, in <module>
+    from .sam import SAM
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\ultralytics\models\sam\__init__.py", line 3, in <module>
+    from .model import SAM
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\ultralytics\models\sam\model.py", line 24, in <module>
+    from .predict import Predictor, SAM2Predictor, SAM3Predictor
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\ultralytics\models\sam\predict.py", line 40, in <module>
+    from .sam3.geometry_encoders import Prompt
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\ultralytics\models\sam\sam3\geometry_encoders.py", line 7, in <module>
+    import torchvision
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torchvision\__init__.py", line 8, in <module>
+    from torchvision import _meta_registrations, datasets, io, models, ops, transforms, utils  # usort:skip
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torchvision\models\__init__.py", line 2, in <module>
+    from .convnext import *
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torchvision\models\convnext.py", line 9, in <module>
+    from ..ops.misc import Conv2dNormActivation, Permute
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torchvision\ops\__init__.py", line 23, in <module>
+    from .poolers import MultiScaleRoIAlign
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torchvision\ops\poolers.py", line 10, in <module>
+    from .roi_align import roi_align
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torchvision\ops\roi_align.py", line 7, in <module>
+    from torch._dynamo.utils import is_compile_supported
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\_dynamo\__init__.py", line 13, in <module>
+    from . import (
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\_dynamo\aot_compile.py", line 15, in <module>
+    from torch._dynamo.convert_frame import GraphRuntimeEnv
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\_dynamo\convert_frame.py", line 62, in <module>
+    from torch._dynamo.symbolic_convert import TensorifyState
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\_dynamo\symbolic_convert.py", line 54, in <module>
+    from torch._dynamo.exc import ObservedException, TensorifyScalarRestartAnalysis
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\_dynamo\exc.py", line 44, in <module>
+    from .utils import counters
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\_dynamo\utils.py", line 70, in <module>
+    import torch.fx.experimental.symbolic_shapes
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\fx\experimental\symbolic_shapes.py", line 3, in <module>
+    import sympy
+ModuleNotFoundError: No module named 'sympy'
+Traceback (most recent call last):
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\cc_debug.py", line 139, in _run
+    res = ccd.detect_colour_checkers_inference(img_f, additional_data=True, apply_cctf_decoding=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\colour_checker_detection\detection\inference.py", line 562, in detect_colour_checkers_inference
+    inference_results = inferencer(image, **inferencer_kwargs)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\colour_checker_detection\detection\inference.py", line 221, in inferencer_default
+    results = np.load(output_results, allow_pickle=True)["results"]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "\\s2\rez\packages\prod\packages\numpy\1.26.4.post1\platform-windows\arch-AMD64\Python311\site-packages\numpy\lib\npyio.py", line 427, in load
+    fid = stack.enter_context(open(os_fspath(file), "rb"))
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'S:\\Temp\\tmp7if_gbuk\\output-results.npz'
