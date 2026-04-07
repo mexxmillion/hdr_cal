@@ -59,11 +59,6 @@ PATCH_NAMES = [
 
 def load_exr(path):
     try:
-        import pyexr
-        return pyexr.open(path).get().astype(np.float32)
-    except Exception:
-        pass
-    try:
         import OpenEXR, Imath
         f = OpenEXR.InputFile(path)
         h = f.header()
@@ -75,6 +70,11 @@ def load_exr(path):
         g = np.frombuffer(f.channel('G', pt), np.float32).reshape(hh, w)
         b = np.frombuffer(f.channel('B', pt), np.float32).reshape(hh, w)
         return np.stack([r,g,b], axis=-1)
+    except Exception:
+        pass
+    try:
+        import pyexr
+        return pyexr.open(path).get().astype(np.float32)
     except Exception as e:
         print(f"EXR load failed: {e}")
         sys.exit(1)

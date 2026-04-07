@@ -353,12 +353,32 @@ def main():
     )
 
     # Save the synthetic EXR for inspection
+    exr_path = os.path.join(args.out_dir, "synthetic_erp.exr")
     try:
-        import pyexr
-        pyexr.write(os.path.join(args.out_dir, "synthetic_erp.exr"), erp)
-        print(f"Saved EXR: {args.out_dir}/synthetic_erp.exr")
+        import OpenEXR, Imath
+        img = np.asarray(erp, dtype=np.float32)
+        height, width = img.shape[:2]
+        header = OpenEXR.Header(width, height)
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        header["channels"] = {"R": Imath.Channel(pt), "G": Imath.Channel(pt), "B": Imath.Channel(pt)}
+        if hasattr(OpenEXR, "ZIP_COMPRESSION"):
+            header["compression"] = OpenEXR.ZIP_COMPRESSION
+        exr = OpenEXR.OutputFile(exr_path, header)
+        exr.writePixels({
+            "R": np.ascontiguousarray(img[..., 0]).tobytes(),
+            "G": np.ascontiguousarray(img[..., 1]).tobytes(),
+            "B": np.ascontiguousarray(img[..., 2]).tobytes(),
+        })
+        if hasattr(exr, "close"):
+            exr.close()
+        print(f"Saved EXR: {exr_path}")
     except Exception:
-        pass
+        try:
+            import pyexr
+            pyexr.write(exr_path, erp)
+            print(f"Saved EXR: {exr_path}")
+        except Exception:
+            pass
 
     # Save a tonemapped preview
     preview = erp / (erp + 1.0)

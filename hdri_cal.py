@@ -18,7 +18,7 @@ Pipeline:
 
 Dependencies (all pip-installable):
   pip install numpy opencv-python imageio scipy
-  pip install pyexr                              # EXR I/O
+  pip install openexr                             # EXR I/O (or pyexr as fallback)
   pip install colour-science                     # colour correction
   pip install colour-checker-detection           # checker segmentation
 """
@@ -37,12 +37,31 @@ import imageio.v2 as imageio
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import least_squares
 
+# Point colour-checker-detection at bundled model so it never downloads
+_BUNDLED_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+if os.path.isdir(_BUNDLED_MODELS):
+    os.environ.setdefault(
+        "COLOUR_SCIENCE__COLOUR_CHECKER_DETECTION__REPOSITORY", _BUNDLED_MODELS
+    )
+
 # ── Optional heavy deps ────────────────────────────────────────────────────
 try:
     import pyexr
     HAVE_PYEXR = True
 except Exception:
     HAVE_PYEXR = False
+
+try:
+    import OpenEXR
+    HAVE_OPENEXR = True
+except Exception:
+    HAVE_OPENEXR = False
+
+try:
+    import Imath
+    HAVE_IMATH = True
+except Exception:
+    HAVE_IMATH = False
 
 try:
     import colour
@@ -86,6 +105,126 @@ def _to_display_srgb_linear(img_linear, source_colorspace="acescg"):
 def luminance(rgb):
     return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
 
+
+def _read_exr_with_openexr_file(path):
+    """Read EXR via the modern OpenEXR.File API (v3.3+)."""
+    with OpenEXR.File(path) as infile:
+        channels = infile.channels()
+        if "RGB" in channels:
+            return np.asarray(channels["RGB"].pixels)
+        if "RGBA" in channels:
+            return np.asarray(channels["RGBA"].pixels)[..., :3]
+        if all(name in channels for name in ("R", "G", "B")):
+            return np.stack([
+                np.asarray(channels["R"].pixels),
+                np.asarray(channels["G"].pixels),
+                np.asarray(channels["B"].pixels),
+            ], axis=-1)
+        if "Y" in channels:
+            return np.asarray(channels["Y"].pixels)
+        raise RuntimeError(f"Unsupported EXR channel layout in '{path}': {sorted(channels.keys())}")
+
+
+def _read_exr_with_openexr_legacy(path):
+    """Read EXR via the legacy OpenEXR.InputFile API."""
+    if not (HAVE_OPENEXR and HAVE_IMATH):
+        raise RuntimeError("Legacy OpenEXR EXR fallback requires both OpenEXR and Imath")
+
+    exr = OpenEXR.InputFile(path)
+    try:
+        header = exr.header()
+        dw = header["dataWindow"]
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+        pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+
+        channel_map = header.get("channels", {})
+        names = set(channel_map.keys())
+        if all(name in names for name in ("R", "G", "B")):
+            r = np.frombuffer(exr.channel("R", pixel_type), np.float32).reshape(height, width)
+            g = np.frombuffer(exr.channel("G", pixel_type), np.float32).reshape(height, width)
+            b = np.frombuffer(exr.channel("B", pixel_type), np.float32).reshape(height, width)
+            return np.stack([r, g, b], axis=-1)
+        if "Y" in names:
+            return np.frombuffer(exr.channel("Y", pixel_type), np.float32).reshape(height, width)
+        raise RuntimeError(f"Unsupported EXR channel layout in '{path}': {sorted(names)}")
+    finally:
+        close = getattr(exr, "close", None)
+        if callable(close):
+            close()
+
+
+def _read_exr(path):
+    """Read EXR using whichever backend is available in the environment."""
+    if HAVE_OPENEXR and hasattr(OpenEXR, "File"):
+        return _read_exr_with_openexr_file(path)
+
+    if HAVE_OPENEXR and hasattr(OpenEXR, "InputFile"):
+        return _read_exr_with_openexr_legacy(path)
+
+    if HAVE_PYEXR:
+        return pyexr.read(path)
+
+    raise RuntimeError("EXR requires OpenEXR or pyexr Python bindings")
+
+
+def _write_exr_with_openexr_file(path, img):
+    """Write EXR via the modern OpenEXR.File API (v3.3+)."""
+    header = {
+        "compression": OpenEXR.ZIP_COMPRESSION,
+        "type": OpenEXR.scanlineimage,
+    }
+    channels = {"RGB": np.asarray(img, dtype=np.float32)}
+    with OpenEXR.File(header, channels) as outfile:
+        outfile.write(path)
+
+
+def _write_exr_with_openexr_legacy(path, img):
+    """Write EXR via the legacy OpenEXR.OutputFile API."""
+    if not (HAVE_OPENEXR and HAVE_IMATH):
+        raise RuntimeError("Legacy OpenEXR EXR fallback requires both OpenEXR and Imath")
+
+    img = np.asarray(img, dtype=np.float32)
+    height, width = img.shape[:2]
+    header = OpenEXR.Header(width, height)
+    pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+    header["channels"] = {
+        "R": Imath.Channel(pixel_type),
+        "G": Imath.Channel(pixel_type),
+        "B": Imath.Channel(pixel_type),
+    }
+    if hasattr(OpenEXR, "ZIP_COMPRESSION"):
+        header["compression"] = OpenEXR.ZIP_COMPRESSION
+
+    exr = OpenEXR.OutputFile(path, header)
+    try:
+        exr.writePixels({
+            "R": np.ascontiguousarray(img[..., 0]).astype(np.float32).tobytes(),
+            "G": np.ascontiguousarray(img[..., 1]).astype(np.float32).tobytes(),
+            "B": np.ascontiguousarray(img[..., 2]).astype(np.float32).tobytes(),
+        })
+    finally:
+        close = getattr(exr, "close", None)
+        if callable(close):
+            close()
+
+
+def _write_exr(path, img):
+    """Write EXR using whichever backend is available in the environment."""
+    if HAVE_OPENEXR and hasattr(OpenEXR, "File"):
+        _write_exr_with_openexr_file(path, img)
+        return
+
+    if HAVE_OPENEXR and hasattr(OpenEXR, "OutputFile"):
+        _write_exr_with_openexr_legacy(path, img)
+        return
+
+    if HAVE_PYEXR:
+        pyexr.write(path, img)
+        return
+
+    raise RuntimeError("EXR output requires OpenEXR or pyexr Python bindings")
+
 def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
     """
     Load any image to float32 linear RGB in the requested colorspace.
@@ -97,9 +236,7 @@ def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
     ext = os.path.splitext(path)[1].lower()
     log(f"Loading: {path}")
     if ext == ".exr":
-        if not HAVE_PYEXR:
-            raise RuntimeError("EXR requires pyexr: pip install pyexr")
-        img = pyexr.read(path).astype(np.float32)
+        img = _read_exr(path).astype(np.float32)
         if img.ndim == 2:
             img = np.stack([img]*3, axis=-1)
         if img.shape[-1] > 3:
@@ -149,12 +286,10 @@ def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
     return img.astype(np.float32), False
 
 def save_exr(path, img):
-    if not HAVE_PYEXR:
-        raise RuntimeError("EXR output requires pyexr: pip install pyexr")
     img = np.asarray(img, dtype=np.float32)
     if not path.lower().endswith(".exr"):
         path += ".exr"
-    pyexr.write(path, img)
+    _write_exr(path, img)
     log(f"Saved EXR: {path}")
 
 def save_png_preview(path, img_linear, percentile=99.5, source_colorspace="acescg"):

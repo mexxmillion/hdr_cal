@@ -40,6 +40,13 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 
+# Point colour-checker-detection at bundled model so it never downloads
+_BUNDLED_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+if os.path.isdir(_BUNDLED_MODELS):
+    os.environ.setdefault(
+        "COLOUR_SCIENCE__COLOUR_CHECKER_DETECTION__REPOSITORY", _BUNDLED_MODELS
+    )
+
 try:
     import colour_checker_detection as ccd
     HAVE_CCD = True
