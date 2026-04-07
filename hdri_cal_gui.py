@@ -198,6 +198,7 @@ class PipelineConfig:
     calibration_mode:   str = "auto"
     wb_source:          str = "auto"
     exposure_source:    str = "auto"
+    integration_mode:   str = "full_sphere"
     sphere_solve:       str = "auto"
     final_balance_target: str = "none"
     base_intensity:     float = 1.0
@@ -631,18 +632,30 @@ class SettingsPanel(QScrollArea):
         f = QFormLayout(grp)
 
         self.wb_source = QComboBox()
-        self.wb_source.addItems(["auto", "chart", "none"])
+        self.wb_source.addItems(["auto", "chart", "sphere", "meter", "none"])
         self.wb_source.setToolTip(
-            "auto  - chart if found, else none\n"
-            "chart - require ColorChecker for WB\n"
-            "none  - skip WB")
+            "auto   - chart if found, else pixel-average meter\n"
+            "chart  - require ColorChecker for WB\n"
+            "sphere - neutralise rendered grey sphere\n"
+            "meter  - pixel-average neutralisation (camera meter)\n"
+            "none   - skip WB")
 
         self.exp_source = QComboBox()
-        self.exp_source.addItems(["auto", "chart", "none"])
+        self.exp_source.addItems(["auto", "chart", "sphere", "meter", "none"])
         self.exp_source.setToolTip(
-            "auto  - chart if found, else none\n"
-            "chart - use patch 22 for exposure\n"
-            "none  - skip exposure correction")
+            "auto   - chart if found, else pixel-average meter\n"
+            "chart  - use patch 22 for exposure\n"
+            "sphere - normalise sphere render to 18%% grey\n"
+            "meter  - pixel-average exposure to 18%% grey\n"
+            "none   - skip exposure correction")
+
+        self.integration_mode = QComboBox()
+        self.integration_mode.addItems(["full_sphere", "upper_dome", "sun_facing"])
+        self.integration_mode.setToolTip(
+            "Region used for meter/sphere WB and exposure:\n"
+            "full_sphere - all pixels\n"
+            "upper_dome  - sky hemisphere only\n"
+            "sun_facing  - hemisphere facing the dominant light")
 
         self.solver_mode = QComboBox()
         self.solver_mode.addItems(["auto", "energy_conservation", "sun_facing_card", "sun_facing_vertical", "none"])
@@ -666,9 +679,10 @@ class SettingsPanel(QScrollArea):
         self.albedo.setDecimals(4)
         self.albedo.setToolTip("Reflectance of the target grey card / swatch")
 
-        f.addRow("WB source",       self.wb_source)
-        f.addRow("Exposure source", self.exp_source)
-        f.addRow("Sun solve",       self.solver_mode)
+        f.addRow("WB source",        self.wb_source)
+        f.addRow("Exposure source",  self.exp_source)
+        f.addRow("Integration mode", self.integration_mode)
+        f.addRow("Sun solve",        self.solver_mode)
         f.addRow("Final balance",   self.final_balance_target)
         f.addRow("Albedo",          self.albedo)
         self._adv_groups.append(grp)
@@ -773,6 +787,7 @@ class SettingsPanel(QScrollArea):
         cfg.colorspace = None if cs == "auto" else cs
 
         # Advanced calibration choices
+        cfg.integration_mode = self.integration_mode.currentText()
         if cfg.calibration_mode == "auto":
             cfg.wb_source = "auto"
             cfg.exposure_source = "auto"
@@ -957,6 +972,7 @@ class MainWindow(QMainWindow):
             self._settings.base_tint.valueChanged,
             self._settings.wb_source.currentTextChanged,
             self._settings.exp_source.currentTextChanged,
+            self._settings.integration_mode.currentTextChanged,
             self._settings.solver_mode.currentTextChanged,
             self._settings.final_balance_target.currentTextChanged,
             self._settings.albedo.valueChanged,
@@ -979,6 +995,7 @@ class MainWindow(QMainWindow):
             self._settings._set_base_tint_value(float(getattr(cfg, "base_tint", 0.0)))
             self._settings.wb_source.setCurrentText(getattr(cfg, "wb_source", "auto"))
             self._settings.exp_source.setCurrentText(getattr(cfg, "exposure_source", "auto"))
+            self._settings.integration_mode.setCurrentText(getattr(cfg, "integration_mode", "full_sphere"))
             self._settings.solver_mode.setCurrentText(getattr(cfg, "sphere_solve", "auto"))
             self._settings.final_balance_target.setCurrentText(getattr(cfg, "final_balance_target", "none"))
             self._settings.albedo.setValue(float(getattr(cfg, "albedo", 0.18)))

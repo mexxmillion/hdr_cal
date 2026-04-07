@@ -495,7 +495,82 @@ def estimate_wb_from_dome(img, mode="upper_dome", lum_lo_pct=2.0, lum_hi_pct=97.
     return scale.astype(np.float32), info
 
 
-def estimate_wb_from_sphere_render(img, albedo=0.18, sphere_res=48):
+def estimate_wb_and_exposure_from_pixel_average(img, albedo=0.18,
+                                                integration_mode="full_sphere"):
+    """
+    Naive camera-style metering via pixel averaging.
+
+    No sphere rendering, no cosine weighting, no solid-angle correction —
+    just average the RGB values of pixels in the chosen region, like a
+    camera's built-in meter would see it.
+
+    WB:       neutralise the average so R=G=B
+    Exposure: scale so the average luminance = albedo (18% grey)
+
+    integration_mode controls which pixels to include:
+      full_sphere : all pixels
+      upper_dome  : upper hemisphere only (sky)
+      sun_facing  : hemisphere facing the brightest pixel
+    """
+    h, w = img.shape[:2]
+    dirs, _ = latlong_dirs(h, w)
+
+    # Build region mask
+    if integration_mode == "upper_dome":
+        region = dirs[..., 1] > 0.0
+    elif integration_mode == "sun_facing":
+        sun_dir = _find_peak_direction(img)
+        cos_sun = (dirs * sun_dir[None, None, :]).sum(axis=-1)
+        region = cos_sun > 0.0
+        log(f"Meter: sun_facing — peak at [{sun_dir[0]:.3f}, {sun_dir[1]:.3f}, {sun_dir[2]:.3f}]")
+    else:
+        region = np.ones((h, w), dtype=bool)
+
+    pixels = img[region]
+    if pixels.shape[0] < 100:
+        warn("Pixel-average meter: too few pixels in region.")
+        return (np.ones(3, dtype=np.float32), 1.0,
+                {"mode": "pixel_average", "applied": False, "reason": "too few pixels"})
+
+    mean_rgb = pixels.mean(axis=0).astype(np.float32)
+    L = float(0.2126 * mean_rgb[0] + 0.7152 * mean_rgb[1] + 0.0722 * mean_rgb[2])
+
+    if L < 1e-8:
+        warn("Pixel-average meter: mean luminance near zero.")
+        return (np.ones(3, dtype=np.float32), 1.0,
+                {"mode": "pixel_average", "applied": False, "reason": "zero luminance"})
+
+    # WB scale: neutralise to R=G=B
+    wb_scale_raw = L / np.clip(mean_rgb, 1e-8, None)
+    wb_scale_luma = float(0.2126 * wb_scale_raw[0] + 0.7152 * wb_scale_raw[1]
+                          + 0.0722 * wb_scale_raw[2])
+    wb_scale = (wb_scale_raw / max(wb_scale_luma, 1e-8)).astype(np.float32)
+
+    # Exposure scale: bring average luminance to albedo
+    exposure_scale = float(albedo / L)
+
+    log(f"Pixel-average meter ({integration_mode}):")
+    log(f"  mean RGB       : R={mean_rgb[0]:.5f}  G={mean_rgb[1]:.5f}  B={mean_rgb[2]:.5f}")
+    log(f"  mean luminance : {L:.5f}")
+    log(f"  WB scale       : R={wb_scale[0]:.4f}  G={wb_scale[1]:.4f}  B={wb_scale[2]:.4f}")
+    log(f"  exposure scale : {exposure_scale:.5f}  (target={albedo})")
+    log(f"  pixels used    : {pixels.shape[0]}")
+
+    info = {
+        "mode":              "pixel_average",
+        "integration_mode":  integration_mode,
+        "applied":           True,
+        "mean_rgb":          mean_rgb.tolist(),
+        "mean_luminance":    L,
+        "wb_scale":          wb_scale.tolist(),
+        "exposure_scale":    exposure_scale,
+        "pixel_count":       int(pixels.shape[0]),
+    }
+    return wb_scale, float(exposure_scale), info
+
+
+def estimate_wb_from_sphere_render(img, albedo=0.18, sphere_res=48,
+                                   integration_mode="full_sphere"):
     """
     White balance estimation via rendered Lambertian grey sphere mean.
 
@@ -518,10 +593,13 @@ def estimate_wb_from_sphere_render(img, albedo=0.18, sphere_res=48):
     This holds when the scene has a mix of light directions. It will overcorrect
     strongly coloured intentional lighting (stage lights, neon signs etc).
 
+    integration_mode: "full_sphere" | "upper_dome" | "sun_facing"
+
     Returns scale, info  (same interface as estimate_wb_from_dome)
     """
     # Render at low res — this is a metering operation, not a quality render
-    env = _env_for_sphere(img, max_w=256)
+    env = _mask_env_by_integration_mode(img, integration_mode)
+    env = _env_for_sphere(env, max_w=256)
     sphere, mask = render_gray_ball_vectorized(
         env, albedo=albedo, res=sphere_res, sphere_env_max_w=256)
 
@@ -567,6 +645,7 @@ def estimate_wb_from_sphere_render(img, albedo=0.18, sphere_res=48):
 
     info = {
         "mode":              "sphere_render",
+        "integration_mode":  integration_mode,
         "applied":           True,
         "sphere_mean_rgb":   mean_rgb.tolist(),
         "sphere_res":        sphere_res,
@@ -577,7 +656,8 @@ def estimate_wb_from_sphere_render(img, albedo=0.18, sphere_res=48):
 
 
 def apply_white_balance(img, kelvin=None, rgb_scale=None, swatch_xy=None,
-                        dome_wb_mode=None, sphere_wb=False):
+                        dome_wb_mode=None, sphere_wb=False,
+                        integration_mode="full_sphere"):
     """
     Apply white balance to a linear ERP image.
 
@@ -593,6 +673,8 @@ def apply_white_balance(img, kelvin=None, rgb_scale=None, swatch_xy=None,
                mean RGB as the WB reference. Better than dome averaging because
                it correctly weights by NdotL and solid angle.
     dome_wb_mode: "full_dome" | "upper_dome" | "hot_exclude" | None
+    integration_mode: "full_sphere" | "upper_dome" | "sun_facing" — region used
+                      for sphere WB integration.
     """
     out = img.copy()
     applied = np.array([1.0, 1.0, 1.0], dtype=np.float32)
@@ -616,7 +698,8 @@ def apply_white_balance(img, kelvin=None, rgb_scale=None, swatch_xy=None,
         log(f"WB swatch ({x},{y}) sample={mean_rgb.tolist()} → scale {applied.tolist()}")
 
     elif sphere_wb:
-        applied, dome_info = estimate_wb_from_sphere_render(img)
+        applied, dome_info = estimate_wb_from_sphere_render(
+            img, integration_mode=integration_mode)
         if not dome_info.get("applied", False):
             log("Sphere WB estimation failed — no WB applied.")
             applied = np.ones(3, dtype=np.float32)
@@ -900,6 +983,49 @@ def sphere_normals(res=160):
     n = np.stack([x, y, z], axis=-1)
     n /= (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-8)
     return n.astype(np.float32), mask
+
+def _find_peak_direction(env_linear):
+    """Find the direction of the brightest pixel in the environment map."""
+    h, w = env_linear.shape[:2]
+    lum = luminance(env_linear)
+    idx = np.argmax(lum)
+    row, col = divmod(idx, w)
+    theta = (row + 0.5) / h * np.pi
+    phi = ((col + 0.5) / w * 2.0 - 1.0) * np.pi
+    d = np.array([np.sin(theta) * np.cos(phi),
+                  np.cos(theta),
+                  np.sin(theta) * np.sin(phi)], dtype=np.float32)
+    return d / (np.linalg.norm(d) + 1e-8)
+
+
+def _mask_env_by_integration_mode(env_linear, mode="full_sphere"):
+    """
+    Mask environment map pixels based on integration mode.
+
+    Returns a copy of env_linear with masked pixels zeroed out.
+      full_sphere : no masking — all pixels contribute
+      upper_dome  : zero out below-horizon pixels (y < 0)
+      sun_facing  : find peak luminance direction, zero out the opposite hemisphere
+    """
+    if mode == "full_sphere":
+        return env_linear
+    h, w = env_linear.shape[:2]
+    dirs, _ = latlong_dirs(h, w)
+    out = env_linear.copy()
+    if mode == "upper_dome":
+        mask = dirs[..., 1] < 0.0  # y < 0 = below horizon
+        out[mask] = 0.0
+        log(f"Integration mode: upper_dome — zeroed {int(mask.sum())} below-horizon pixels")
+    elif mode == "sun_facing":
+        sun_dir = _find_peak_direction(env_linear)
+        cos_sun = (dirs * sun_dir[None, None, :]).sum(axis=-1)
+        mask = cos_sun < 0.0  # opposite hemisphere from sun
+        out[mask] = 0.0
+        log(f"Integration mode: sun_facing — sun at "
+            f"[{sun_dir[0]:.3f}, {sun_dir[1]:.3f}, {sun_dir[2]:.3f}], "
+            f"zeroed {int(mask.sum())} pixels in opposite hemisphere")
+    return out
+
 
 def _env_for_sphere(env_linear, max_w=512):
     """
@@ -1333,19 +1459,27 @@ def main():
     # Two independent axes: --wb-source and --exposure-source.
     # Each can be set explicitly. 'auto' applies smart fallback logic.
     ap.add_argument("--wb-source", default="auto",
-                    choices=["auto", "chart", "sphere", "none"],
+                    choices=["auto", "chart", "sphere", "meter", "none"],
                     help="White balance colour source. "
-                         "'auto' (default): chart if found+confident, else sphere. "
+                         "'auto' (default): chart if found+confident, else meter. "
                          "'chart': use ColorChecker patch 22. "
                          "'sphere': neutralise rendered grey sphere to achromatic. "
+                         "'meter': pixel-average neutralisation (like a camera meter). "
                          "'none': no WB correction, passthrough.")
     ap.add_argument("--exposure-source", default="auto",
-                    choices=["auto", "chart", "sphere", "none"],
+                    choices=["auto", "chart", "sphere", "meter", "none"],
                     help="Exposure magnitude source. "
-                         "'auto' (default): chart if found+confident, else sphere. "
+                         "'auto' (default): chart if found+confident, else meter. "
                          "'chart': use ColorChecker patch 22 luma as the absolute reference. "
                          "'sphere': render grey sphere and normalise to 18%% grey. "
+                         "'meter': pixel-average exposure to 18%% grey (like a camera meter). "
                          "'none': no exposure correction.")
+    ap.add_argument("--integration-mode", default="full_sphere",
+                    choices=["full_sphere", "upper_dome", "sun_facing"],
+                    help="Region of the HDRI used for sphere WB and exposure integration. "
+                         "'full_sphere': integrate entire environment (default). "
+                         "'upper_dome': sky hemisphere only, excludes ground bounce. "
+                         "'sun_facing': hemisphere facing the dominant light direction.")
     # ── Hot lobe ──────────────────────────────────────────────────────────
     ap.add_argument("--sun-threshold", type=float, default=0.1,
                     help="Hot lobe width: 0..1 fraction below peak. "
@@ -1809,14 +1943,14 @@ def _run_pipeline(args):
     #   sphere always available (just renders the env)
     #   kelvin/manual always available if args provided
 
-    FALLBACK_WB  = "sphere"    # when chart unavailable: neutralise sphere render
-    FALLBACK_EXP = "sphere"    # when chart unavailable: normalise sphere to grey
+    FALLBACK_WB  = "meter"     # when chart unavailable: pixel-average WB
+    FALLBACK_EXP = "meter"     # when chart unavailable: pixel-average exposure
 
     def _resolve_wb(src_raw, chart_ok):
         if src_raw == "auto":
             if chart_ok:
                 return "chart"
-            log(f"WB auto: no chart found — falling back to sphere integration")
+            log(f"WB auto: no chart found — falling back to pixel-average metering")
             return FALLBACK_WB
         if src_raw == "chart" and not chart_ok:
             warn(f"⚠ --wb-source chart requested but chart not found or low confidence "
@@ -1830,7 +1964,7 @@ def _run_pipeline(args):
         if src_raw == "auto":
             if chart_ok:
                 return "chart"
-            log(f"Exposure auto: no chart found — falling back to sphere integration")
+            log(f"Exposure auto: no chart found — falling back to pixel-average metering")
             return FALLBACK_EXP
         if src_raw == "chart" and not chart_ok:
             warn(f"⚠ --exposure-source chart requested but chart not found or low confidence "
@@ -1862,10 +1996,27 @@ def _run_pipeline(args):
     if not chart_use_exp and wb_from_chart and _exp_src_raw not in ("chart", "auto"):
         log(f"  note: chart found but exposure-source={exp_src!r} explicitly set — chart exposure suppressed by user")
 
+    # ── Pixel-average metering (shared by WB and/or exposure) ──────────
+    _meter_info_pixel = None
+    _meter_wb_scale   = None
+    _meter_exp_scale  = None
+    _integration_mode = getattr(args, "integration_mode", "full_sphere")
+    if wb_src == "meter" or exp_src == "meter":
+        _meter_wb_scale, _meter_exp_scale, _meter_info_pixel = \
+            estimate_wb_and_exposure_from_pixel_average(
+                img, albedo=args.albedo, integration_mode=_integration_mode)
+
     # ── Resolve WB colour ─────────────────────────────────────────────────
     if chart_use_wb:
         wb_source  = "colorchecker_patch22"
         _wb_rgb    = rgb_scale   # already set from chart detection above
+        _wb_kelvin = None
+        _wb_dome   = None
+        _wb_sphere = False
+        _wb_swatch = None
+    elif wb_src == "meter":
+        wb_source  = f"pixel_average_{_integration_mode}"
+        _wb_rgb    = _meter_wb_scale
         _wb_kelvin = None
         _wb_dome   = None
         _wb_sphere = False
@@ -1922,7 +2073,8 @@ def _run_pipeline(args):
         rgb_scale   = _wb_rgb,
         swatch_xy   = _wb_swatch,
         dome_wb_mode= _wb_dome,
-        sphere_wb   = _wb_sphere)
+        sphere_wb   = _wb_sphere,
+        integration_mode= _integration_mode)
 
     save_png_preview(os.path.join(args.debug_dir, "01_wb_preview.png"), wb_img)
     meta["white_balance"] = {
@@ -2361,6 +2513,41 @@ def _run_pipeline(args):
             log(f"  sphere target    = {sphere_exp_target:.5f}  (albedo × π/4 = {args.albedo:.4f} × π/4)")
             log(f"  exposure_scale   = {exposure_scale:.5f}  (target / mean)")
 
+        exposed = wb_img * exposure_scale
+
+    elif exp_src == "meter":
+        # ── Pixel-average exposure ────────────────────────────────────────
+        # The WB was already applied, so re-meter the WB'd image for exposure.
+        # If WB also used meter, the colour is already neutral — just need brightness.
+        _wb_lum = luminance(wb_img)
+        _int_mode = getattr(args, "integration_mode", "full_sphere")
+        _h, _w = wb_img.shape[:2]
+        _dirs_m, _ = latlong_dirs(_h, _w)
+        if _int_mode == "upper_dome":
+            _region_m = _dirs_m[..., 1] > 0.0
+        elif _int_mode == "sun_facing":
+            _sun_d = _find_peak_direction(wb_img)
+            _region_m = (_dirs_m * _sun_d[None, None, :]).sum(axis=-1) > 0.0
+        else:
+            _region_m = np.ones((_h, _w), dtype=bool)
+        _region_lum = _wb_lum[_region_m]
+        if _region_lum.size > 0:
+            _avg_lum = float(_region_lum.mean())
+            exposure_scale = float(args.albedo / max(_avg_lum, 1e-8))
+        else:
+            exposure_scale = 1.0
+            _avg_lum = 0.0
+        log(f"Exposure from pixel-average meter ({_int_mode}):")
+        log(f"  mean luminance (post-WB) = {_avg_lum:.5f}")
+        log(f"  target                   = {args.albedo:.5f}")
+        log(f"  exposure_scale           = {exposure_scale:.5f}")
+        meter_info = {
+            "mode":              "pixel_average",
+            "integration_mode":  _int_mode,
+            "mean_luminance":    _avg_lum,
+            "target":            args.albedo,
+            "exposure_scale":    exposure_scale,
+        }
         exposed = wb_img * exposure_scale
 
     elif exp_src == "manual":
