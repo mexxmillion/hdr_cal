@@ -739,7 +739,7 @@ class SettingsPanel(QScrollArea):
         self.sweep_overlap.setToolTip("Overlap between adjacent sweep tiles")
         self.sweep_min_pitch = QDoubleSpinBox()
         self.sweep_min_pitch.setRange(-90.0, 0.0)
-        self.sweep_min_pitch.setValue(-70.0)
+        self.sweep_min_pitch.setValue(-90.0)
         self.sweep_min_pitch.setDecimals(0)
         self.sweep_min_pitch.setSuffix("°")
         self.sweep_min_pitch.setToolTip("Lowest pitch to sweep (-90 = nadir)")
@@ -1047,7 +1047,7 @@ class MainWindow(QMainWindow):
             self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
             self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 90.0)))
             self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 20.0)))
-            self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -70.0)))
+            self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -90.0)))
             self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 30.0)))
             self._settings._sync_calibration_mode()
         finally:
