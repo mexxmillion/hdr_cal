@@ -3089,7 +3089,7 @@ def _run_pipeline(args):
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, default=str)
     log(f"Report: {report_path}")
-    log("Done.")
+    log(f"Done. Output: {os.path.abspath(args.out)}")
 
 
 if __name__ == "__main__":
