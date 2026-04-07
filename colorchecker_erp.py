@@ -215,7 +215,7 @@ def erp_to_rectilinear(erp_img: np.ndarray,
     Args:
         erp_img   : (H, W, C) equirectangular image (any dtype)
         yaw_deg   : horizontal look direction, degrees. 0=forward(φ=0), +90=right
-        pitch_deg : vertical look direction, degrees. 0=horizon, +90=up, -90=down
+        pitch_deg : vertical look direction, degrees. 0=horizon, +90=down(nadir), -90=up(zenith)
         fov_deg   : horizontal field of view of the output window
         out_w/out_h: output resolution
 
@@ -1397,8 +1397,8 @@ def find_colorchecker_in_erp(
     compare_backends: bool = True,
     sweep_fov: float = 50.0,
     sweep_overlap: float = 10.0,
-    sweep_min_pitch: float = -90.0,
-    sweep_max_pitch: float = 30.0,
+    sweep_min_pitch: float = -30.0,
+    sweep_max_pitch: float = 90.0,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Find a ColorChecker Classic 24 inside an ERP panorama.
@@ -1412,10 +1412,10 @@ def find_colorchecker_in_erp(
          from checker coverage) so swatch extraction sees a larger checker.
 
     Sweep parameters:
-      sweep_fov       : tile field of view in degrees (default 90)
-      sweep_overlap   : overlap between tiles in degrees (default 20)
-      sweep_min_pitch : lowest pitch to sweep, -90 = nadir (default -70)
-      sweep_max_pitch : highest pitch to sweep (default 30, skips top dome)
+      sweep_fov       : tile field of view in degrees (default 50)
+      sweep_overlap   : overlap between tiles in degrees (default 10)
+      sweep_min_pitch : lowest pitch to sweep (default -30, skips top dome)
+      sweep_max_pitch : highest pitch, +90 = nadir/ground (default 90)
     """
     if not HAVE_CCD:
         return None, {"error": "colour-checker-detection not installed. "
@@ -1434,22 +1434,23 @@ def find_colorchecker_in_erp(
           f"(CC24 reference patch 22: "
           f"R={cc24_ref[21,0]:.4f} G={cc24_ref[21,1]:.4f} B={cc24_ref[21,2]:.4f})")
 
-    # Build sweep grid: bottom-up, full 360° azimuth with overlap.
-    coarse_fov = float(np.clip(sweep_fov, 45.0, 140.0))
+    # Build sweep grid: ground first (high pitch = nadir), full 360° azimuth.
+    coarse_fov = float(np.clip(sweep_fov, 30.0, 140.0))
     _step = coarse_fov - sweep_overlap
     if _step < 10.0:
         _step = 10.0
 
-    # Pitch rows from ground up (chart is most likely near ground level)
+    # Pitch rows: start from max (ground/nadir) down to min (sky).
+    # +90=nadir, 0=horizon, -90=zenith
     _pitch_lo = float(np.clip(sweep_min_pitch, -90.0, 89.0))
     _pitch_hi = float(np.clip(sweep_max_pitch, _pitch_lo + 1.0, 90.0))
     _pitch_rows = []
-    _p = _pitch_lo
-    while _p <= _pitch_hi:
+    _p = _pitch_hi
+    while _p >= _pitch_lo:
         _pitch_rows.append(_p)
-        _p += _step
-    if _pitch_rows[-1] < _pitch_hi:
-        _pitch_rows.append(_pitch_hi)
+        _p -= _step
+    if _pitch_rows[-1] > _pitch_lo:
+        _pitch_rows.append(_pitch_lo)
 
     # Yaw columns: full 360° with overlap
     _yaw_cols = []

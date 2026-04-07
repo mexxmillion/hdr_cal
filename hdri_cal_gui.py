@@ -222,8 +222,8 @@ class PipelineConfig:
     # Chart sweep
     sweep_fov:          float = 50.0
     sweep_overlap:      float = 10.0
-    sweep_min_pitch:    float = -90.0
-    sweep_max_pitch:    float = 30.0
+    sweep_min_pitch:    float = -30.0
+    sweep_max_pitch:    float = 90.0
 
 
 
@@ -738,17 +738,17 @@ class SettingsPanel(QScrollArea):
         self.sweep_overlap.setSuffix("°")
         self.sweep_overlap.setToolTip("Overlap between adjacent sweep tiles")
         self.sweep_min_pitch = QDoubleSpinBox()
-        self.sweep_min_pitch.setRange(-90.0, 0.0)
-        self.sweep_min_pitch.setValue(-90.0)
+        self.sweep_min_pitch.setRange(-90.0, 45.0)
+        self.sweep_min_pitch.setValue(-30.0)
         self.sweep_min_pitch.setDecimals(0)
         self.sweep_min_pitch.setSuffix("°")
-        self.sweep_min_pitch.setToolTip("Lowest pitch to sweep (-90 = nadir)")
+        self.sweep_min_pitch.setToolTip("Lowest pitch (-90=zenith, 0=horizon, default -30)")
         self.sweep_max_pitch = QDoubleSpinBox()
-        self.sweep_max_pitch.setRange(-30.0, 90.0)
-        self.sweep_max_pitch.setValue(30.0)
+        self.sweep_max_pitch.setRange(0.0, 90.0)
+        self.sweep_max_pitch.setValue(90.0)
         self.sweep_max_pitch.setDecimals(0)
         self.sweep_max_pitch.setSuffix("°")
-        self.sweep_max_pitch.setToolTip("Highest pitch to sweep (skip top dome)")
+        self.sweep_max_pitch.setToolTip("Highest pitch (+90=nadir/ground, default 90)")
         f.addRow("Sweep FOV",       self.sweep_fov)
         f.addRow("Sweep overlap",   self.sweep_overlap)
         f.addRow("Min pitch",       self.sweep_min_pitch)
@@ -1051,8 +1051,8 @@ class MainWindow(QMainWindow):
             self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
             self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 50.0)))
             self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 10.0)))
-            self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -90.0)))
-            self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 30.0)))
+            self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -30.0)))
+            self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 90.0)))
             self._settings._sync_calibration_mode()
         finally:
             self._syncing_settings = False
