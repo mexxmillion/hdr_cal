@@ -73,13 +73,21 @@ if HAVE_CCD:
 def _log_detection_backends():
     """Log which chart detection backends are available. Call once at detection time."""
     print(f"[cc-erp] Detection backends:")
-    print(f"[cc-erp]   colour-checker-detection : {'yes' if HAVE_CCD else 'NO — segmentation unavailable'}")
-    print(f"[cc-erp]   YOLO inference           : {'yes' if HAVE_CCD_INFERENCE else 'no (ultralytics not installed)'}")
+    print(f"[cc-erp]   colour-checker-detection : {'yes' if HAVE_CCD else 'NO — pip install colour-checker-detection'}")
+    print(f"[cc-erp]   YOLO inference API       : {'yes' if HAVE_CCD_INFERENCE else 'no (ultralytics not installed)'}")
+    _repo = os.environ.get("COLOUR_SCIENCE__COLOUR_CHECKER_DETECTION__REPOSITORY", "(default)")
+    print(f"[cc-erp]   Model repo               : {_repo}")
     if HAVE_CCD_INFERENCE:
         if _YOLO_MODEL_PATH:
-            print(f"[cc-erp]   YOLO model               : {_YOLO_MODEL_PATH}")
+            _sz = os.path.getsize(_YOLO_MODEL_PATH) / (1024 * 1024)
+            print(f"[cc-erp]   YOLO model FOUND         : {_YOLO_MODEL_PATH} ({_sz:.1f} MB)")
         else:
-            print(f"[cc-erp]   YOLO model               : NOT FOUND — will attempt download at runtime")
+            _expected = os.path.join(
+                os.environ.get("COLOUR_SCIENCE__COLOUR_CHECKER_DETECTION__REPOSITORY",
+                               os.path.join(os.path.expanduser("~"), ".colour-science", "colour-checker-detection")),
+                "colour-checker-detection-l-seg.pt")
+            print(f"[cc-erp]   YOLO model NOT FOUND     : expected at {_expected}")
+            print(f"[cc-erp]                               Will attempt download from HuggingFace on first inference")
 
 try:
     import colour
@@ -359,24 +367,27 @@ class CheckerDetection:
     crop_bounds: Optional[Tuple[int, int, int, int]] = None
 
 
-def _linear_to_u8_for_detection(img_linear: np.ndarray) -> np.ndarray:
-    """Convert linear ACEScg HDR to uint8 sRGB for detection/debug display."""
-    img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
+def _linear_to_u8_for_display(img_linear: np.ndarray) -> np.ndarray:
+    """ACEScg linear HDR → sRGB uint8 for debug display.
+    Exposure: maps median luminance to 0.18 (mid-grey), like a camera meter.
+    Then ACEScg→sRGB primaries, sRGB gamma, clip."""
+    img = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
     if HAVE_COLOUR:
-        img_disp = np.clip(acescg_to_srgb_linear(img_linear), 0.0, None)
-    else:
-        img_disp = img_linear
-    lum = 0.2126 * img_disp[..., 0] + 0.7152 * img_disp[..., 1] + 0.0722 * img_disp[..., 2]
-    valid = lum[lum > 0]
+        img = np.clip(acescg_to_srgb_linear(img), 0.0, None)
+    lum = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
+    valid = lum[lum > 1e-6]
     if valid.size:
-        scale = 1.0 / max(float(np.percentile(valid, 99)), 1e-6)
+        scale = 0.18 / max(float(np.median(valid)), 1e-6)
     else:
         scale = 1.0
-    disp = np.clip(img_disp * scale, 0.0, None)
+    disp = np.clip(img * scale, 0.0, 1.0)
     srgb = np.where(disp <= 0.0031308,
                     disp * 12.92,
                     1.055 * np.power(np.clip(disp, 1e-9, None), 1 / 2.4) - 0.055)
     return np.clip(srgb * 255 + 0.5, 0, 255).astype(np.uint8)
+
+# Keep old name as alias for any external callers
+_linear_to_u8_for_detection = _linear_to_u8_for_display
 
 
 def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
