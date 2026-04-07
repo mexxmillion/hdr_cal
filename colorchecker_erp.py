@@ -389,45 +389,18 @@ def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
 
 
 
-def _linear_to_srgb_display(img_linear: np.ndarray) -> np.ndarray:
-    """Apply sRGB EOTF inverse (linear → display gamma). No clamping of input."""
-    x = np.clip(img_linear, 0.0, None)
-    return np.where(x <= 0.0031308,
-                    x * 12.92,
-                    1.055 * np.power(np.clip(x, 1e-9, None), 1.0 / 2.4) - 0.055
-                    ).astype(np.float32)
-
-
-def _compute_detection_prebalance(img_linear: np.ndarray,
-                                   target_mid: float = 0.18,
-                                   ) -> Tuple[np.ndarray, np.ndarray, float, dict]:
-    """
-    Per-tile exposure and WB normalization for chart detection.
-
-    All metering and scaling happens in linear space (physically correct).
-    The output is converted to sRGB display space because the detection
-    model was trained on normal sRGB photos.
-
-    In sRGB display space, 0.18 linear maps to ~0.46 — comfortably in
-    mid-range for the detector. The gamma curve naturally compresses
-    highlights (bright ground) while expanding shadows, which is exactly
-    what a camera does.
-
-    The rgb_scale and exposure_scale are tracked so swatch values can be
-    un-scaled after detection to recover the original linear values.
-    """
+def _compute_detection_prebalance(img_linear: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, dict]:
+    """Build a temporary balanced view to help chart detection under strong casts."""
     img = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
     lum = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
     valid = lum[np.isfinite(lum) & (lum > 1e-6)]
     if valid.size < 64:
         rgb_scale = np.ones(3, dtype=np.float32)
         exposure_scale = 1.0
-        return _linear_to_srgb_display(img), rgb_scale, exposure_scale, {
-            "rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
+        return img.copy(), rgb_scale, exposure_scale, {"rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
 
-    # WB: neutralise colour cast using trimmed mean (10th-90th percentile)
     lo = float(np.percentile(valid, 10.0))
-    hi = float(np.percentile(valid, 90.0))
+    hi = float(np.percentile(valid, 98.0))
     mask = np.isfinite(lum) & (lum >= lo) & (lum <= hi)
     if np.count_nonzero(mask) < 64:
         mask = np.isfinite(lum) & (lum > 1e-6)
@@ -439,27 +412,17 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
     rgb_scale = np.clip(rgb_scale, 0.4, 2.5).astype(np.float32)
     rgb_scale /= max(float(np.mean(rgb_scale)), 1e-6)
 
-    # Exposure: use the mean of the mid-range pixels (p10-p90).
-    # This excludes the sun disc and deep shadows — the part of
-    # the tile where the chart would be. Scale that to target_mid.
-    mid_lum = float(np.mean(lum[mask]))
-    exposure_scale = float(np.clip(target_mid / max(mid_lum, 1e-6), 0.001, 100.0))
-
-    # Scale in linear, then convert to sRGB display space.
-    # The sRGB gamma curve compresses highlights naturally (no clamping needed)
-    # and the detector sees an image that looks like a normal camera photo.
-    balanced_linear = np.clip(img * rgb_scale[None, None, :] * exposure_scale, 0.0, None)
-    balanced_display = _linear_to_srgb_display(balanced_linear)
-
+    p99 = float(np.percentile(valid, 99.0))
+    exposure_scale = float(np.clip(0.85 / max(p99, 1e-6), 0.25, 8.0))
+    balanced = np.clip(img * rgb_scale[None, None, :] * exposure_scale, 0.0, None).astype(np.float32)
     info = {
         "rgb_scale": rgb_scale.tolist(),
         "exposure_scale": exposure_scale,
-        "lum_mid_mean": mid_lum,
         "lum_p10": lo,
-        "lum_p90": hi,
-        "target_mid": target_mid,
+        "lum_p98": hi,
+        "lum_p99": p99,
     }
-    return balanced_display, rgb_scale, exposure_scale, info
+    return balanced, rgb_scale, exposure_scale, info
 
 
 def _get_detector_target_width() -> int:
@@ -771,9 +734,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
                     stage_label: str,
                     cc24_ref: Optional[np.ndarray] = None,
                     read_backend: str = "colour",
-                    compare_backends: bool = True,
-                    global_rgb_scale: Optional[np.ndarray] = None,
-                    global_exp_scale: float = 1.0):
+                    compare_backends: bool = True):
     """Detect a ColorChecker in one rectilinear tile."""
     if not HAVE_CCD:
         return None
@@ -781,30 +742,20 @@ def _detect_in_tile(tile_linear: np.ndarray,
     out_h, out_w = tile_linear.shape[:2]
     tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
     tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
-
-    # Apply global metering (same scale for every tile) then convert to
-    # sRGB display space. This preserves relative brightness across tiles
-    # so the detector sees them as one consistent camera exposure.
-    if global_rgb_scale is not None:
-        balanced_linear = np.clip(
-            tile_linear * global_rgb_scale[None, None, :] * global_exp_scale,
-            0.0, None)
-    else:
-        balanced_linear = tile_linear.copy()
-    tile_detect_display = _linear_to_srgb_display(balanced_linear)
-    detect_rgb_scale = global_rgb_scale if global_rgb_scale is not None else np.ones(3, dtype=np.float32)
-    detect_exposure_scale = global_exp_scale
-    tile_detect_tm = tile_detect_display
-    tile_detect_u8 = np.clip(tile_detect_display * 255 + 0.5, 0, 255).astype(np.uint8)
+    tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
+    tile_detect_tm = (tile_detect_linear / (tile_detect_linear + 1.0)).astype(np.float32)
+    tile_detect_u8 = _linear_to_u8_for_detection(tile_detect_linear)
 
     if debug_dir:
         _save_intermediate_debug(
             debug_dir,
             f"tile_{stage_label}_prebalanced.jpg",
             tile_detect_u8,
-            note=(f"{stage_label}: global wb=[{detect_rgb_scale[0]:.2f},{detect_rgb_scale[1]:.2f},{detect_rgb_scale[2]:.2f}] "
+            note=(f"{stage_label}: prebalance rgb={detect_rgb_scale[0]:.2f},{detect_rgb_scale[1]:.2f},{detect_rgb_scale[2]:.2f} "
                   f"exp={detect_exposure_scale:.2f}"),
         )
+
+    print(f"[cc-erp] Detection prebalance candidate: rgb={detect_rgb_scale[0]:.3f},{detect_rgb_scale[1]:.3f},{detect_rgb_scale[2]:.3f} exp={detect_exposure_scale:.3f}")
 
     seg_det = None
     chosen_det = None
@@ -815,17 +766,26 @@ def _detect_in_tile(tile_linear: np.ndarray,
     detect_source_linear = tile_linear
     detect_scale_vec = np.ones(3, dtype=np.float32)
 
-    # Try globally-metered version first (sRGB display space, same exposure
-    # as every other tile), then raw Reinhard as fallback.
-    _bracket_attempts = [
-        ("global",  tile_detect_tm,  (detect_rgb_scale * detect_exposure_scale).astype(np.float32)),
-        ("raw",     tile_raw_tm,     np.ones(3, dtype=np.float32)),
-    ]
+    try:
+        seg_results = ccd.detect_colour_checkers_segmentation(
+            tile_raw_tm,
+            show=False,
+            additional_data=True,
+            apply_cctf_decoding=False,
+        )
+        if seg_results:
+            seg_det = seg_results[0]
+            chosen_det = seg_det
+            chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
+            method_used = "segmentation(raw)"
+            print(f"[cc-erp] Segmentation located chart on raw tile yaw={yaw:.0f} pitch={pitch:.0f}")
+    except Exception:
+        pass
 
-    for _attempt_name, _attempt_img, _attempt_scale in _bracket_attempts:
+    if seg_det is None:
         try:
             seg_results = ccd.detect_colour_checkers_segmentation(
-                _attempt_img,
+                tile_detect_tm,
                 show=False,
                 additional_data=True,
                 apply_cctf_decoding=False,
@@ -834,12 +794,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
                 seg_det = seg_results[0]
                 chosen_det = seg_det
                 chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
-                method_used = f"segmentation({_attempt_name})"
-                detect_source_linear = tile_linear
-                detect_scale_vec = _attempt_scale
-                print(f"[cc-erp] Segmentation located chart on {_attempt_name} tile "
-                      f"yaw={yaw:.0f} pitch={pitch:.0f} exp_scale={detect_exposure_scale:.3f}")
-                break
+                method_used = "segmentation(prebalanced)"
+                detect_source_linear = tile_detect_linear
+                detect_scale_vec = (detect_rgb_scale * detect_exposure_scale).astype(np.float32)
+                print(f"[cc-erp] Segmentation located chart on prebalanced tile yaw={yaw:.0f} pitch={pitch:.0f}")
         except Exception:
             pass
 
@@ -1464,15 +1422,6 @@ def find_colorchecker_in_erp(
           f"(CC24 reference patch 22: "
           f"R={cc24_ref[21,0]:.4f} G={cc24_ref[21,1]:.4f} B={cc24_ref[21,2]:.4f})")
 
-    # Global metering: compute ONE exposure + WB scale from the full ERP.
-    # Every tile gets the same adjustment so relative brightness is preserved
-    # (bright ground stays bright, dark sky stays dark — like a single camera exposure).
-    _, _global_rgb_scale, _global_exp_scale, _global_balance_info = \
-        _compute_detection_prebalance(erp_linear, target_mid=0.18)
-    print(f"[cc-erp] Global metering: mid_mean_lum={_global_balance_info.get('lum_mid_mean', 0):.4f} "
-          f"exp_scale={_global_exp_scale:.3f} "
-          f"wb=[{_global_rgb_scale[0]:.3f},{_global_rgb_scale[1]:.3f},{_global_rgb_scale[2]:.3f}]")
-
     coarse_faces = [
         (0.0,   0.0),
         (90.0,  0.0),
@@ -1491,15 +1440,13 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            # Show the globally-metered sRGB view — same as what the detector sees.
-            tile_balanced = np.clip(
-                tile_linear * _global_rgb_scale[None, None, :] * _global_exp_scale,
-                0.0, None)
-            tile_disp = _linear_to_srgb_display(tile_balanced)
-            tile_u8 = np.clip(tile_disp * 255 + 0.5, 0, 255).astype(np.uint8)
-            tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
+            # Show prebalanced view — matches what the detector actually sees.
+            _pb_lin, _pb_rgb, _pb_exp, _ = _compute_detection_prebalance(tile_linear)
+            _pb_u8 = _linear_to_u8_for_detection(_pb_lin)
+            tile_bgr = cv2.cvtColor(_pb_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
-                        f"cube-overlap yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
+                        f"cube-overlap yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f} "
+                        f"exp={_pb_exp:.2f}",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
             tile_fname = f"sweep_cube_overlap_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"
             cv2.imwrite(os.path.join(debug_dir, tile_fname), tile_bgr)
@@ -1511,9 +1458,7 @@ def find_colorchecker_in_erp(
             stage_label=f"coarse_{idx:02d}",
             cc24_ref=cc24_ref,
             read_backend=read_backend,
-            compare_backends=compare_backends,
-            global_rgb_scale=_global_rgb_scale,
-            global_exp_scale=_global_exp_scale)
+            compare_backends=compare_backends)
 
         if det is None or det.confidence < min_confidence:
             continue
@@ -1563,9 +1508,7 @@ def find_colorchecker_in_erp(
         stage_label="recenter_wide",
         cc24_ref=cc24_ref,
         read_backend=read_backend,
-        compare_backends=compare_backends,
-        global_rgb_scale=_global_rgb_scale,
-        global_exp_scale=_global_exp_scale)
+        compare_backends=compare_backends)
 
     if det_wide is not None:
         best = det_wide
@@ -1588,9 +1531,7 @@ def find_colorchecker_in_erp(
         stage_label="recenter_tight",
         cc24_ref=cc24_ref,
         read_backend=read_backend,
-        compare_backends=compare_backends,
-        global_rgb_scale=_global_rgb_scale,
-        global_exp_scale=_global_exp_scale)
+        compare_backends=compare_backends)
 
     if det_tight is not None:
         best = det_tight
