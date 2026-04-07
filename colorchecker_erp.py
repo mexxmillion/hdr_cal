@@ -741,15 +741,19 @@ def _detect_in_tile(tile_linear: np.ndarray,
 
     out_h, out_w = tile_linear.shape[:2]
 
-    # Reinhard tonemap x/(x+1) maps HDR linear to [0,1] for the detector.
-    # The library's segmenter applies sRGB gamma internally, so it expects
-    # roughly linear [0,1] input (apply_cctf_decoding=False).
-    tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
+    # ACEScg → sRGB linear (proper primaries for the detector which was
+    # trained on sRGB photos), then Reinhard to compress HDR to [0,1].
+    # The library's segmenter applies sRGB gamma internally.
+    tile_srgb_lin = acescg_to_srgb_linear(tile_linear) if HAVE_COLOUR else tile_linear
+    tile_srgb_lin = np.clip(tile_srgb_lin, 0.0, None).astype(np.float32)
+    tile_raw_tm = (tile_srgb_lin / (tile_srgb_lin + 1.0)).astype(np.float32)
     tile_rgb_u8 = np.clip(tile_raw_tm * 255 + 0.5, 0, 255).astype(np.uint8)
 
-    # Prebalanced: WB + exposure adjust in linear, then Reinhard
+    # Prebalanced: WB + exposure adjust in ACEScg linear, convert to sRGB, then Reinhard
     tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
-    tile_detect_tm = (tile_detect_linear / (tile_detect_linear + 1.0)).astype(np.float32)
+    tile_detect_srgb = acescg_to_srgb_linear(tile_detect_linear) if HAVE_COLOUR else tile_detect_linear
+    tile_detect_srgb = np.clip(tile_detect_srgb, 0.0, None).astype(np.float32)
+    tile_detect_tm = (tile_detect_srgb / (tile_detect_srgb + 1.0)).astype(np.float32)
     tile_detect_u8 = np.clip(tile_detect_tm * 255 + 0.5, 0, 255).astype(np.uint8)
 
     if debug_dir:
@@ -1492,8 +1496,10 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            # Reinhard tonemap — same as what the detector sees
-            _tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
+            # ACEScg → sRGB linear → Reinhard — same as what detector sees
+            _srgb = acescg_to_srgb_linear(tile_linear) if HAVE_COLOUR else tile_linear
+            _srgb = np.clip(_srgb, 0.0, None)
+            _tm = (_srgb / (_srgb + 1.0)).astype(np.float32)
             _u8 = np.clip(_tm * 255 + 0.5, 0, 255).astype(np.uint8)
             tile_bgr = cv2.cvtColor(_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
