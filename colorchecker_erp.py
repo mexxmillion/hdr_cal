@@ -771,7 +771,9 @@ def _detect_in_tile(tile_linear: np.ndarray,
                     stage_label: str,
                     cc24_ref: Optional[np.ndarray] = None,
                     read_backend: str = "colour",
-                    compare_backends: bool = True):
+                    compare_backends: bool = True,
+                    global_rgb_scale: Optional[np.ndarray] = None,
+                    global_exp_scale: float = 1.0):
     """Detect a ColorChecker in one rectilinear tile."""
     if not HAVE_CCD:
         return None
@@ -779,11 +781,20 @@ def _detect_in_tile(tile_linear: np.ndarray,
     out_h, out_w = tile_linear.shape[:2]
     tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
     tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
-    tile_detect_display, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
-    # Prebalanced output is already in sRGB display space (gamma applied).
-    # Feed it directly to the detector — no tonemapping or second gamma.
+
+    # Apply global metering (same scale for every tile) then convert to
+    # sRGB display space. This preserves relative brightness across tiles
+    # so the detector sees them as one consistent camera exposure.
+    if global_rgb_scale is not None:
+        balanced_linear = np.clip(
+            tile_linear * global_rgb_scale[None, None, :] * global_exp_scale,
+            0.0, None)
+    else:
+        balanced_linear = tile_linear.copy()
+    tile_detect_display = _linear_to_srgb_display(balanced_linear)
+    detect_rgb_scale = global_rgb_scale if global_rgb_scale is not None else np.ones(3, dtype=np.float32)
+    detect_exposure_scale = global_exp_scale
     tile_detect_tm = tile_detect_display
-    # For the debug JPEG, just scale to uint8 — it's already in display space.
     tile_detect_u8 = np.clip(tile_detect_display * 255 + 0.5, 0, 255).astype(np.uint8)
 
     if debug_dir:
@@ -791,15 +802,9 @@ def _detect_in_tile(tile_linear: np.ndarray,
             debug_dir,
             f"tile_{stage_label}_prebalanced.jpg",
             tile_detect_u8,
-            note=(f"{stage_label}: prebalance rgb={detect_rgb_scale[0]:.2f},{detect_rgb_scale[1]:.2f},{detect_rgb_scale[2]:.2f} "
+            note=(f"{stage_label}: global wb=[{detect_rgb_scale[0]:.2f},{detect_rgb_scale[1]:.2f},{detect_rgb_scale[2]:.2f}] "
                   f"exp={detect_exposure_scale:.2f}"),
         )
-
-    _mid_lum = detect_balance_info.get("lum_mid_mean", 0)
-    print(f"[cc-erp] Tile {stage_label} metering: mid_mean_lum={_mid_lum:.4f} "
-          f"exp_scale={detect_exposure_scale:.3f} "
-          f"wb=[{detect_rgb_scale[0]:.3f},{detect_rgb_scale[1]:.3f},{detect_rgb_scale[2]:.3f}] "
-          f"({'BRIGHT' if detect_exposure_scale < 0.5 else 'DARK' if detect_exposure_scale > 4.0 else 'ok'})")
 
     seg_det = None
     chosen_det = None
@@ -810,24 +815,12 @@ def _detect_in_tile(tile_linear: np.ndarray,
     detect_source_linear = tile_linear
     detect_scale_vec = np.ones(3, dtype=np.float32)
 
-    # Try prebalanced first (handles both bright and dark tiles),
-    # then raw, then a second bracket at 2 stops darker/brighter.
-    # Prebalanced images are in sRGB display space (gamma applied) — looks
-    # like a normal photo to the detector. Raw uses Reinhard tonemap.
-    # Each attempt: (name, detect_image, scale_vec)
+    # Try globally-metered version first (sRGB display space, same exposure
+    # as every other tile), then raw Reinhard as fallback.
     _bracket_attempts = [
-        ("prebalanced",  tile_detect_tm,  (detect_rgb_scale * detect_exposure_scale).astype(np.float32)),
-        ("raw",          tile_raw_tm,     np.ones(3, dtype=np.float32)),
+        ("global",  tile_detect_tm,  (detect_rgb_scale * detect_exposure_scale).astype(np.float32)),
+        ("raw",     tile_raw_tm,     np.ones(3, dtype=np.float32)),
     ]
-    # Extra brackets for extreme tiles.
-    if detect_exposure_scale < 0.5:
-        _dark_disp, _dark_rgb, _dark_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.08)
-        _bracket_attempts.append(
-            ("bracket_dark", _dark_disp, (_dark_rgb * _dark_exp).astype(np.float32)))
-    elif detect_exposure_scale > 4.0:
-        _bright_disp, _bright_rgb, _bright_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.5)
-        _bracket_attempts.append(
-            ("bracket_bright", _bright_disp, (_bright_rgb * _bright_exp).astype(np.float32)))
 
     for _attempt_name, _attempt_img, _attempt_scale in _bracket_attempts:
         try:
@@ -1471,6 +1464,15 @@ def find_colorchecker_in_erp(
           f"(CC24 reference patch 22: "
           f"R={cc24_ref[21,0]:.4f} G={cc24_ref[21,1]:.4f} B={cc24_ref[21,2]:.4f})")
 
+    # Global metering: compute ONE exposure + WB scale from the full ERP.
+    # Every tile gets the same adjustment so relative brightness is preserved
+    # (bright ground stays bright, dark sky stays dark — like a single camera exposure).
+    _, _global_rgb_scale, _global_exp_scale, _global_balance_info = \
+        _compute_detection_prebalance(erp_linear, target_mid=0.18)
+    print(f"[cc-erp] Global metering: mid_mean_lum={_global_balance_info.get('lum_mid_mean', 0):.4f} "
+          f"exp_scale={_global_exp_scale:.3f} "
+          f"wb=[{_global_rgb_scale[0]:.3f},{_global_rgb_scale[1]:.3f},{_global_rgb_scale[2]:.3f}]")
+
     coarse_faces = [
         (0.0,   0.0),
         (90.0,  0.0),
@@ -1504,7 +1506,9 @@ def find_colorchecker_in_erp(
             stage_label=f"coarse_{idx:02d}",
             cc24_ref=cc24_ref,
             read_backend=read_backend,
-            compare_backends=compare_backends)
+            compare_backends=compare_backends,
+            global_rgb_scale=_global_rgb_scale,
+            global_exp_scale=_global_exp_scale)
 
         if det is None or det.confidence < min_confidence:
             continue
@@ -1554,7 +1558,9 @@ def find_colorchecker_in_erp(
         stage_label="recenter_wide",
         cc24_ref=cc24_ref,
         read_backend=read_backend,
-        compare_backends=compare_backends)
+        compare_backends=compare_backends,
+        global_rgb_scale=_global_rgb_scale,
+        global_exp_scale=_global_exp_scale)
 
     if det_wide is not None:
         best = det_wide
@@ -1577,7 +1583,9 @@ def find_colorchecker_in_erp(
         stage_label="recenter_tight",
         cc24_ref=cc24_ref,
         read_backend=read_backend,
-        compare_backends=compare_backends)
+        compare_backends=compare_backends,
+        global_rgb_scale=_global_rgb_scale,
+        global_exp_scale=_global_exp_scale)
 
     if det_tight is not None:
         best = det_tight
