@@ -1,5 +1,12 @@
 SCL_DEVOPS_REZ_SEARCH_PATHS: \\inferno2\projects\common\home\quw\dev\temp_packages;
 Traceback (most recent call last):
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\sympy\__init__.py", line 23, in <module>
+    import mpmath
+ModuleNotFoundError: No module named 'mpmath'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
   File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\colour_checker_detection\detection\..\scripts\inference.py", line 246, in <module>
     segmentation()
   File "\\s2\rez\packages\prod\packages\scan_py_external\0.3.3\platform-windows\arch-AMD64\python-3.11\Lib\site-packages\click\core.py", line 1157, in __call__
@@ -60,7 +67,9 @@ Traceback (most recent call last):
     import torch.fx.experimental.symbolic_shapes
   File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\torch\fx\experimental\symbolic_shapes.py", line 3, in <module>
     import sympy
-ModuleNotFoundError: No module named 'sympy'
+  File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\sympy\__init__.py", line 25, in <module>
+    raise ImportError("SymPy now depends on mpmath as an external library. "
+ImportError: SymPy now depends on mpmath as an external library. See https://docs.sympy.org/latest/install.html#mpmath for more information.
 Traceback (most recent call last):
   File "\\inferno2\projects\common\home\quw\dev\temp_packages\cc_debug.py", line 139, in _run
     res = ccd.detect_colour_checkers_inference(img_f, additional_data=True, apply_cctf_decoding=True)
@@ -74,4 +83,4 @@ Traceback (most recent call last):
   File "\\s2\rez\packages\prod\packages\numpy\1.26.4.post1\platform-windows\arch-AMD64\Python311\site-packages\numpy\lib\npyio.py", line 427, in load
     fid = stack.enter_context(open(os_fspath(file), "rb"))
                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-FileNotFoundError: [Errno 2] No such file or directory: 'S:\\Temp\\tmp7if_gbuk\\output-results.npz'
+FileNotFoundError: [Errno 2] No such file or directory: 'S:\\Temp\\tmp5npuocmq\\output-results.npz'
