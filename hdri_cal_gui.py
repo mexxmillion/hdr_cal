@@ -220,9 +220,9 @@ class PipelineConfig:
     sun_gain_rolloff:   float = 500.0
 
     # Chart sweep
-    sweep_fov:          float = 90.0
-    sweep_overlap:      float = 20.0
-    sweep_min_pitch:    float = -70.0
+    sweep_fov:          float = 50.0
+    sweep_overlap:      float = 10.0
+    sweep_min_pitch:    float = -90.0
     sweep_max_pitch:    float = 30.0
 
 
@@ -726,14 +726,14 @@ class SettingsPanel(QScrollArea):
         grp = QGroupBox("Chart Sweep")
         f = QFormLayout(grp)
         self.sweep_fov = QDoubleSpinBox()
-        self.sweep_fov.setRange(45.0, 140.0)
-        self.sweep_fov.setValue(90.0)
+        self.sweep_fov.setRange(30.0, 140.0)
+        self.sweep_fov.setValue(50.0)
         self.sweep_fov.setDecimals(0)
         self.sweep_fov.setSuffix("°")
         self.sweep_fov.setToolTip("Tile field of view for chart sweep")
         self.sweep_overlap = QDoubleSpinBox()
         self.sweep_overlap.setRange(0.0, 60.0)
-        self.sweep_overlap.setValue(20.0)
+        self.sweep_overlap.setValue(10.0)
         self.sweep_overlap.setDecimals(0)
         self.sweep_overlap.setSuffix("°")
         self.sweep_overlap.setToolTip("Overlap between adjacent sweep tiles")
@@ -1022,6 +1022,10 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.valueChanged,
             self._settings.sun_gain_ceiling.valueChanged,
             self._settings.sun_gain_rolloff.valueChanged,
+            self._settings.sweep_fov.valueChanged,
+            self._settings.sweep_overlap.valueChanged,
+            self._settings.sweep_min_pitch.valueChanged,
+            self._settings.sweep_max_pitch.valueChanged,
         ]:
             signal.connect(self._on_settings_changed)
 
@@ -1045,8 +1049,8 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.setValue(float(getattr(cfg, "lobe_neutralise", 1.0)))
             self._settings.sun_gain_ceiling.setValue(float(getattr(cfg, "sun_gain_ceiling", 2000.0)))
             self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
-            self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 90.0)))
-            self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 20.0)))
+            self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 50.0)))
+            self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 10.0)))
             self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -90.0)))
             self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 30.0)))
             self._settings._sync_calibration_mode()

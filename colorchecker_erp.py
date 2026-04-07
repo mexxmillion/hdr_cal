@@ -1395,8 +1395,8 @@ def find_colorchecker_in_erp(
     debug_dir: Optional[str] = None,
     read_backend: str = "colour",
     compare_backends: bool = True,
-    sweep_fov: float = 90.0,
-    sweep_overlap: float = 20.0,
+    sweep_fov: float = 50.0,
+    sweep_overlap: float = 10.0,
     sweep_min_pitch: float = -90.0,
     sweep_max_pitch: float = 30.0,
 ) -> Tuple[Optional[np.ndarray], dict]:
