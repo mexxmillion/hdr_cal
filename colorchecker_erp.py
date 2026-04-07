@@ -1477,8 +1477,10 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            tile_u8 = _linear_to_u8_for_detection(tile_linear)
-            tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
+            # Simple Reinhard tonemap for debug — no auto-exposure surprises
+            _tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
+            _u8 = np.clip(_tm * 255 + 0.5, 0, 255).astype(np.uint8)
+            tile_bgr = cv2.cvtColor(_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
                         f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
