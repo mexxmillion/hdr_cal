@@ -1477,15 +1477,12 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            # Show prebalanced view — matches what the detector actually sees.
-            _pb_lin, _pb_rgb, _pb_exp, _ = _compute_detection_prebalance(tile_linear)
-            _pb_u8 = _linear_to_u8_for_detection(_pb_lin)
-            tile_bgr = cv2.cvtColor(_pb_u8, cv2.COLOR_RGB2BGR)
+            tile_u8 = _linear_to_u8_for_detection(tile_linear)
+            tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
-                        f"cube-overlap yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f} "
-                        f"exp={_pb_exp:.2f}",
+                        f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-            tile_fname = f"sweep_cube_overlap_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"
+            tile_fname = f"sweep_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"
             cv2.imwrite(os.path.join(debug_dir, tile_fname), tile_bgr)
 
         det = _detect_in_tile(
