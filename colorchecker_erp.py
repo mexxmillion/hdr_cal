@@ -389,24 +389,29 @@ def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
 
 
 
+def _linear_to_srgb_display(img_linear: np.ndarray) -> np.ndarray:
+    """Apply sRGB EOTF inverse (linear → display gamma). No clamping of input."""
+    x = np.clip(img_linear, 0.0, None)
+    return np.where(x <= 0.0031308,
+                    x * 12.92,
+                    1.055 * np.power(np.clip(x, 1e-9, None), 1.0 / 2.4) - 0.055
+                    ).astype(np.float32)
+
+
 def _compute_detection_prebalance(img_linear: np.ndarray,
                                    target_mid: float = 0.18,
                                    ) -> Tuple[np.ndarray, np.ndarray, float, dict]:
     """
     Per-tile exposure and WB normalization for chart detection.
 
-    Goal: make every tile look like a normally-exposed camera photo so the
-    detector can find the chart. The chart patches should land in a
-    comfortable mid-range, not crushed into highlights or lost in shadows.
+    All metering and scaling happens in linear space (physically correct).
+    The output is converted to sRGB display space because the detection
+    model was trained on normal sRGB photos.
 
-    Strategy:
-      1. Compute per-channel mean of the mid-range pixels → WB scale to
-         neutralise colour cast.
-      2. Find the median luminance → exposure scale to bring it to target_mid.
-      3. After scaling, hard-clamp at 1.0 so nothing is blown out.
-         The detector sees uint8 — values above 1.0 all map to 255 and are
-         useless. Clamping loses highlight detail but that's fine, we only
-         care about the chart patches being visible.
+    In sRGB display space, 0.18 linear maps to ~0.46 — comfortably in
+    mid-range for the detector. The gamma curve naturally compresses
+    highlights (bright ground) while expanding shadows, which is exactly
+    what a camera does.
 
     The rgb_scale and exposure_scale are tracked so swatch values can be
     un-scaled after detection to recover the original linear values.
@@ -417,7 +422,8 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
     if valid.size < 64:
         rgb_scale = np.ones(3, dtype=np.float32)
         exposure_scale = 1.0
-        return img.copy(), rgb_scale, exposure_scale, {"rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
+        return _linear_to_srgb_display(img), rgb_scale, exposure_scale, {
+            "rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
 
     # WB: neutralise colour cast using trimmed mean (10th-90th percentile)
     lo = float(np.percentile(valid, 10.0))
@@ -433,17 +439,17 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
     rgb_scale = np.clip(rgb_scale, 0.4, 2.5).astype(np.float32)
     rgb_scale /= max(float(np.mean(rgb_scale)), 1e-6)
 
-    # Exposure: use the mean of the mid-range pixels (not median of all pixels).
-    # The mid-range excludes the sun disc and deep shadows — it's the part of
+    # Exposure: use the mean of the mid-range pixels (p10-p90).
+    # This excludes the sun disc and deep shadows — the part of
     # the tile where the chart would be. Scale that to target_mid.
     mid_lum = float(np.mean(lum[mask]))
     exposure_scale = float(np.clip(target_mid / max(mid_lum, 1e-6), 0.001, 100.0))
 
-    balanced = img * rgb_scale[None, None, :] * exposure_scale
-    # Hard clamp at 1.0 — anything above is blown out and useless for detection.
-    # This is the key: on bright ground tiles, the sun reflection gets clamped
-    # but the chart patches (which are 18% grey or darker) survive intact.
-    balanced = np.clip(balanced, 0.0, 1.0).astype(np.float32)
+    # Scale in linear, then convert to sRGB display space.
+    # The sRGB gamma curve compresses highlights naturally (no clamping needed)
+    # and the detector sees an image that looks like a normal camera photo.
+    balanced_linear = np.clip(img * rgb_scale[None, None, :] * exposure_scale, 0.0, None)
+    balanced_display = _linear_to_srgb_display(balanced_linear)
 
     info = {
         "rgb_scale": rgb_scale.tolist(),
@@ -453,7 +459,7 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
         "lum_p90": hi,
         "target_mid": target_mid,
     }
-    return balanced, rgb_scale, exposure_scale, info
+    return balanced_display, rgb_scale, exposure_scale, info
 
 
 def _get_detector_target_width() -> int:
@@ -773,12 +779,12 @@ def _detect_in_tile(tile_linear: np.ndarray,
     out_h, out_w = tile_linear.shape[:2]
     tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
     tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
-    tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
-    # Prebalanced image is already clamped to [0, 1] — no tonemapping needed.
-    # Reinhard x/(x+1) would compress an already-exposed image and squash the
-    # chart patches into a narrower range, hurting detection.
-    tile_detect_tm = tile_detect_linear
-    tile_detect_u8 = _linear_to_u8_for_detection(tile_detect_linear)
+    tile_detect_display, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
+    # Prebalanced output is already in sRGB display space (gamma applied).
+    # Feed it directly to the detector — no tonemapping or second gamma.
+    tile_detect_tm = tile_detect_display
+    # For the debug JPEG, just scale to uint8 — it's already in display space.
+    tile_detect_u8 = np.clip(tile_detect_display * 255 + 0.5, 0, 255).astype(np.uint8)
 
     if debug_dir:
         _save_intermediate_debug(
@@ -806,28 +812,27 @@ def _detect_in_tile(tile_linear: np.ndarray,
 
     # Try prebalanced first (handles both bright and dark tiles),
     # then raw, then a second bracket at 2 stops darker/brighter.
+    # Prebalanced images are in sRGB display space (gamma applied) — looks
+    # like a normal photo to the detector. Raw uses Reinhard tonemap.
+    # Each attempt: (name, detect_image, scale_vec)
     _bracket_attempts = [
-        ("prebalanced",  tile_detect_tm,  tile_detect_linear, (detect_rgb_scale * detect_exposure_scale).astype(np.float32)),
-        ("raw",          tile_raw_tm,     tile_linear,        np.ones(3, dtype=np.float32)),
+        ("prebalanced",  tile_detect_tm,  (detect_rgb_scale * detect_exposure_scale).astype(np.float32)),
+        ("raw",          tile_raw_tm,     np.ones(3, dtype=np.float32)),
     ]
-    # If the prebalance exposure was a big pull-down (bright tile), also try
-    # a more aggressive bracket. If it was a big pull-up (dark tile), try brighter.
-    # Prebalanced brackets are already clamped to [0,1] — pass directly, no tonemap.
+    # Extra brackets for extreme tiles.
     if detect_exposure_scale < 0.5:
-        # Tile was very bright — try even darker (target_mid=0.08)
-        _dark_lin, _dark_rgb, _dark_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.08)
+        _dark_disp, _dark_rgb, _dark_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.08)
         _bracket_attempts.append(
-            ("bracket_dark", _dark_lin, _dark_lin, (_dark_rgb * _dark_exp).astype(np.float32)))
+            ("bracket_dark", _dark_disp, (_dark_rgb * _dark_exp).astype(np.float32)))
     elif detect_exposure_scale > 4.0:
-        # Tile was very dark — try even brighter (target_mid=0.5)
-        _bright_lin, _bright_rgb, _bright_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.5)
+        _bright_disp, _bright_rgb, _bright_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.5)
         _bracket_attempts.append(
-            ("bracket_bright", _bright_lin, _bright_lin, (_bright_rgb * _bright_exp).astype(np.float32)))
+            ("bracket_bright", _bright_disp, (_bright_rgb * _bright_exp).astype(np.float32)))
 
-    for _attempt_name, _attempt_tm, _attempt_linear, _attempt_scale in _bracket_attempts:
+    for _attempt_name, _attempt_img, _attempt_scale in _bracket_attempts:
         try:
             seg_results = ccd.detect_colour_checkers_segmentation(
-                _attempt_tm,
+                _attempt_img,
                 show=False,
                 additional_data=True,
                 apply_cctf_decoding=False,
@@ -837,7 +842,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
                 chosen_det = seg_det
                 chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
                 method_used = f"segmentation({_attempt_name})"
-                detect_source_linear = _attempt_linear
+                detect_source_linear = tile_linear
                 detect_scale_vec = _attempt_scale
                 print(f"[cc-erp] Segmentation located chart on {_attempt_name} tile "
                       f"yaw={yaw:.0f} pitch={pitch:.0f} exp_scale={detect_exposure_scale:.3f}")
