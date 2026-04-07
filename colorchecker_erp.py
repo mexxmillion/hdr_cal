@@ -740,11 +740,23 @@ def _detect_in_tile(tile_linear: np.ndarray,
         return None
 
     out_h, out_w = tile_linear.shape[:2]
-    tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
+    # Raw tile debug: ACEScg → sRGB display
+    _raw_srgb_lin = acescg_to_srgb_linear(tile_linear) if HAVE_COLOUR else tile_linear
+    _raw_srgb_lin = np.clip(_raw_srgb_lin, 0.0, 1.0)
+    _raw_srgb = np.where(_raw_srgb_lin <= 0.0031308,
+                         _raw_srgb_lin * 12.92,
+                         1.055 * np.power(np.clip(_raw_srgb_lin, 1e-9, None), 1.0 / 2.4) - 0.055)
+    tile_rgb_u8 = np.clip(_raw_srgb * 255 + 0.5, 0, 255).astype(np.uint8)
     tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
     tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
     tile_detect_tm = (tile_detect_linear / (tile_detect_linear + 1.0)).astype(np.float32)
-    tile_detect_u8 = _linear_to_u8_for_detection(tile_detect_linear)
+    # Debug image: ACEScg → sRGB display (same as sweep debug)
+    _pb_srgb_lin = acescg_to_srgb_linear(tile_detect_linear) if HAVE_COLOUR else tile_detect_linear
+    _pb_srgb_lin = np.clip(_pb_srgb_lin, 0.0, 1.0)
+    _pb_srgb = np.where(_pb_srgb_lin <= 0.0031308,
+                        _pb_srgb_lin * 12.92,
+                        1.055 * np.power(np.clip(_pb_srgb_lin, 1e-9, None), 1.0 / 2.4) - 0.055)
+    tile_detect_u8 = np.clip(_pb_srgb * 255 + 0.5, 0, 255).astype(np.uint8)
 
     if debug_dir:
         _save_intermediate_debug(
