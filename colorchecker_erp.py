@@ -389,8 +389,20 @@ def _srgb_to_linear_arr(v: np.ndarray) -> np.ndarray:
 
 
 
-def _compute_detection_prebalance(img_linear: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, dict]:
-    """Build a temporary balanced view to help chart detection under strong casts."""
+def _compute_detection_prebalance(img_linear: np.ndarray,
+                                   target_mid: float = 0.18,
+                                   ) -> Tuple[np.ndarray, np.ndarray, float, dict]:
+    """
+    Per-tile exposure and WB normalization for chart detection.
+
+    Strategy: meter the tile like a camera — use the median luminance as the
+    "grey" reference and scale it to target_mid (default 0.18). This handles
+    both bright ground tiles and dark shadow tiles uniformly.
+
+    The rgb_scale neutralises colour casts, the exposure_scale brings the
+    median luminance to target_mid. Both are tracked so swatch values can
+    be un-scaled after detection.
+    """
     img = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
     lum = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
     valid = lum[np.isfinite(lum) & (lum > 1e-6)]
@@ -399,6 +411,7 @@ def _compute_detection_prebalance(img_linear: np.ndarray) -> Tuple[np.ndarray, n
         exposure_scale = 1.0
         return img.copy(), rgb_scale, exposure_scale, {"rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
 
+    # WB: neutralise colour cast using trimmed mean (10th-98th percentile)
     lo = float(np.percentile(valid, 10.0))
     hi = float(np.percentile(valid, 98.0))
     mask = np.isfinite(lum) & (lum >= lo) & (lum <= hi)
@@ -412,15 +425,20 @@ def _compute_detection_prebalance(img_linear: np.ndarray) -> Tuple[np.ndarray, n
     rgb_scale = np.clip(rgb_scale, 0.4, 2.5).astype(np.float32)
     rgb_scale /= max(float(np.mean(rgb_scale)), 1e-6)
 
-    p99 = float(np.percentile(valid, 99.0))
-    exposure_scale = float(np.clip(0.85 / max(p99, 1e-6), 0.25, 8.0))
+    # Exposure: bring median luminance to target_mid.
+    # Median is more robust than p99 — not dominated by sun disc or specular
+    # highlights, gives a camera-meter-like reading.
+    median_lum = float(np.median(valid))
+    exposure_scale = float(np.clip(target_mid / max(median_lum, 1e-6), 0.01, 50.0))
+
     balanced = np.clip(img * rgb_scale[None, None, :] * exposure_scale, 0.0, None).astype(np.float32)
     info = {
         "rgb_scale": rgb_scale.tolist(),
         "exposure_scale": exposure_scale,
+        "lum_median": median_lum,
         "lum_p10": lo,
         "lum_p98": hi,
-        "lum_p99": p99,
+        "target_mid": target_mid,
     }
     return balanced, rgb_scale, exposure_scale, info
 
@@ -755,7 +773,11 @@ def _detect_in_tile(tile_linear: np.ndarray,
                   f"exp={detect_exposure_scale:.2f}"),
         )
 
-    print(f"[cc-erp] Detection prebalance candidate: rgb={detect_rgb_scale[0]:.3f},{detect_rgb_scale[1]:.3f},{detect_rgb_scale[2]:.3f} exp={detect_exposure_scale:.3f}")
+    _med_lum = detect_balance_info.get("lum_median", 0)
+    print(f"[cc-erp] Tile {stage_label} metering: median_lum={_med_lum:.4f} "
+          f"exp_scale={detect_exposure_scale:.3f} "
+          f"wb=[{detect_rgb_scale[0]:.3f},{detect_rgb_scale[1]:.3f},{detect_rgb_scale[2]:.3f}] "
+          f"({'BRIGHT' if detect_exposure_scale < 0.5 else 'DARK' if detect_exposure_scale > 4.0 else 'ok'})")
 
     seg_det = None
     chosen_det = None
@@ -766,26 +788,31 @@ def _detect_in_tile(tile_linear: np.ndarray,
     detect_source_linear = tile_linear
     detect_scale_vec = np.ones(3, dtype=np.float32)
 
-    try:
-        seg_results = ccd.detect_colour_checkers_segmentation(
-            tile_raw_tm,
-            show=False,
-            additional_data=True,
-            apply_cctf_decoding=False,
-        )
-        if seg_results:
-            seg_det = seg_results[0]
-            chosen_det = seg_det
-            chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
-            method_used = "segmentation(raw)"
-            print(f"[cc-erp] Segmentation located chart on raw tile yaw={yaw:.0f} pitch={pitch:.0f}")
-    except Exception:
-        pass
+    # Try prebalanced first (handles both bright and dark tiles),
+    # then raw, then a second bracket at 2 stops darker/brighter.
+    _bracket_attempts = [
+        ("prebalanced",  tile_detect_tm,  tile_detect_linear, (detect_rgb_scale * detect_exposure_scale).astype(np.float32)),
+        ("raw",          tile_raw_tm,     tile_linear,        np.ones(3, dtype=np.float32)),
+    ]
+    # If the prebalance exposure was a big pull-down (bright tile), also try
+    # a more aggressive bracket. If it was a big pull-up (dark tile), try brighter.
+    if detect_exposure_scale < 0.5:
+        # Tile was very bright — try even darker (target_mid=0.08)
+        _dark_lin, _dark_rgb, _dark_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.08)
+        _dark_tm = (_dark_lin / (_dark_lin + 1.0)).astype(np.float32)
+        _bracket_attempts.append(
+            ("bracket_dark", _dark_tm, _dark_lin, (_dark_rgb * _dark_exp).astype(np.float32)))
+    elif detect_exposure_scale > 4.0:
+        # Tile was very dark — try even brighter (target_mid=0.5)
+        _bright_lin, _bright_rgb, _bright_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.5)
+        _bright_tm = (_bright_lin / (_bright_lin + 1.0)).astype(np.float32)
+        _bracket_attempts.append(
+            ("bracket_bright", _bright_tm, _bright_lin, (_bright_rgb * _bright_exp).astype(np.float32)))
 
-    if seg_det is None:
+    for _attempt_name, _attempt_tm, _attempt_linear, _attempt_scale in _bracket_attempts:
         try:
             seg_results = ccd.detect_colour_checkers_segmentation(
-                tile_detect_tm,
+                _attempt_tm,
                 show=False,
                 additional_data=True,
                 apply_cctf_decoding=False,
@@ -794,10 +821,12 @@ def _detect_in_tile(tile_linear: np.ndarray,
                 seg_det = seg_results[0]
                 chosen_det = seg_det
                 chosen_sw_tm = np.array(seg_det.swatch_colours, dtype=np.float32)
-                method_used = "segmentation(prebalanced)"
-                detect_source_linear = tile_detect_linear
-                detect_scale_vec = (detect_rgb_scale * detect_exposure_scale).astype(np.float32)
-                print(f"[cc-erp] Segmentation located chart on prebalanced tile yaw={yaw:.0f} pitch={pitch:.0f}")
+                method_used = f"segmentation({_attempt_name})"
+                detect_source_linear = _attempt_linear
+                detect_scale_vec = _attempt_scale
+                print(f"[cc-erp] Segmentation located chart on {_attempt_name} tile "
+                      f"yaw={yaw:.0f} pitch={pitch:.0f} exp_scale={detect_exposure_scale:.3f}")
+                break
         except Exception:
             pass
 
