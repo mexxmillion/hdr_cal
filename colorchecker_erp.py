@@ -1491,7 +1491,12 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            tile_u8 = _linear_to_u8_for_detection(tile_linear)
+            # Show the globally-metered sRGB view — same as what the detector sees.
+            tile_balanced = np.clip(
+                tile_linear * _global_rgb_scale[None, None, :] * _global_exp_scale,
+                0.0, None)
+            tile_disp = _linear_to_srgb_display(tile_balanced)
+            tile_u8 = np.clip(tile_disp * 255 + 0.5, 0, 255).astype(np.uint8)
             tile_bgr = cv2.cvtColor(tile_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
                         f"cube-overlap yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
