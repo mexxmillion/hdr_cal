@@ -98,8 +98,8 @@ def _to_display_srgb_linear(img_linear, source_colorspace="acescg"):
     """Convert a linear working image into linear sRGB for display."""
     img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
     cs = (source_colorspace or "acescg").lower().replace("-", "").replace("_", "")
-    if cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_ACESCG_TO_SRGB_LINEAR is not None:
-        return np.clip(apply_matrix_3x3(img_linear, M_ACESCG_TO_SRGB_LINEAR), 0.0, None)
+    if cs in ("acescg", "aces", "ap1") and acescg_to_srgb_linear is not None:
+        return np.clip(acescg_to_srgb_linear(img_linear), 0.0, None)
     return img_linear
 
 def luminance(rgb):
@@ -243,8 +243,8 @@ def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
             img = img[..., :3]
         src_cs = (input_colorspace or target_colorspace or "acescg").lower().replace("-", "").replace("_", "")
         dst_cs = (target_colorspace or src_cs).lower().replace("-", "").replace("_", "")
-        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
-            img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and srgb_linear_to_acescg is not None:
+            img = srgb_linear_to_acescg(img)
             img = np.clip(img, 0.0, None)
             log("Loaded EXR — interpreted as linear sRGB and converted to ACEScg")
         else:
@@ -256,8 +256,8 @@ def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
             img = img[..., :3]
         src_cs = (input_colorspace or target_colorspace or "acescg").lower().replace("-", "").replace("_", "")
         dst_cs = (target_colorspace or src_cs).lower().replace("-", "").replace("_", "")
-        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
-            img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+        if src_cs in ("srgb", "rec709", "linear") and dst_cs in ("acescg", "aces", "ap1") and srgb_linear_to_acescg is not None:
+            img = srgb_linear_to_acescg(img)
             img = np.clip(img, 0.0, None)
             log("Loaded .hdr — interpreted as linear sRGB and converted to ACEScg")
         else:
@@ -277,8 +277,8 @@ def load_image_any(path, target_colorspace="acescg", input_colorspace=None):
         img = img.astype(np.float32)
     img = srgb_to_linear(img)
     cs = target_colorspace.lower().replace("-", "").replace("_", "")
-    if cs in ("acescg", "aces", "ap1") and apply_matrix_3x3 is not None and M_SRGB_LINEAR_TO_ACESCG is not None:
-        img = apply_matrix_3x3(img, M_SRGB_LINEAR_TO_ACESCG)
+    if cs in ("acescg", "aces", "ap1") and srgb_linear_to_acescg is not None:
+        img = srgb_linear_to_acescg(img)
         img = np.clip(img, 0.0, None)
         log(f"Loaded LDR → linearised sRGB → ACEScg")
     else:
@@ -1255,17 +1255,15 @@ try:
         def get_cc24_reference(colorspace="acescg"):
             return CC24_LINEAR_SRGB
     try:
-        from colorchecker_erp import apply_matrix_3x3, M_SRGB_LINEAR_TO_ACESCG, M_ACESCG_TO_SRGB_LINEAR
+        from colorchecker_erp import srgb_linear_to_acescg, acescg_to_srgb_linear
     except ImportError:
-        apply_matrix_3x3 = None
-        M_SRGB_LINEAR_TO_ACESCG = None
-        M_ACESCG_TO_SRGB_LINEAR = None
+        srgb_linear_to_acescg = None
+        acescg_to_srgb_linear = None
 except Exception as _cc_import_err:
     HAVE_CC_ERP = False
     CC24_LINEAR_SRGB = None
-    apply_matrix_3x3 = None
-    M_SRGB_LINEAR_TO_ACESCG = None
-    M_ACESCG_TO_SRGB_LINEAR = None
+    srgb_linear_to_acescg = None
+    acescg_to_srgb_linear = None
     import traceback as _tb
     warn(f"colorchecker_erp import failed: {_cc_import_err}")
     warn("Full traceback:")

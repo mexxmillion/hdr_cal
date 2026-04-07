@@ -69,34 +69,30 @@ except ImportError:
     HAVE_COLOUR = False
 
 
-# ─── Colorspace matrices ─────────────────────────────────────────────────────
-# sRGB D65 → XYZ D65 (IEC 61966-2-1)
-_M_SRGB_TO_XYZ = np.array([
-    [0.4124564, 0.3575761, 0.1804375],
-    [0.2126729, 0.7151522, 0.0721750],
-    [0.0193339, 0.1191920, 0.9503041],
-], dtype=np.float64)
+# ─── Colorspace conversions (via colour-science) ────────────────────────────
 
-# XYZ D65 → ACEScg AP1 (S-2014-004)
-_M_XYZ_TO_ACESCG = np.array([
-    [ 1.6410234, -0.3248033, -0.2364247],
-    [-0.6636629,  1.6153316,  0.0167563],
-    [ 0.0117219, -0.0082844,  0.9883949],
-], dtype=np.float64)
-
-# Combined: linear sRGB → ACEScg
-M_SRGB_LINEAR_TO_ACESCG = (_M_XYZ_TO_ACESCG @ _M_SRGB_TO_XYZ).astype(np.float32)
-
-# Inverse: ACEScg → linear sRGB
-M_ACESCG_TO_SRGB_LINEAR = np.linalg.inv(
-    M_SRGB_LINEAR_TO_ACESCG.astype(np.float64)
-).astype(np.float32)
+def srgb_linear_to_acescg(img: np.ndarray) -> np.ndarray:
+    """Convert linear sRGB (D65) → ACEScg (AP1/D60) with proper chromatic adaptation."""
+    if not HAVE_COLOUR:
+        raise RuntimeError("colour-science is required for colorspace conversion")
+    return colour.RGB_to_RGB(
+        np.asarray(img, dtype=np.float32),
+        "sRGB", "ACEScg",
+        apply_cctf_decoding=False,
+        apply_cctf_encoding=False,
+    ).astype(np.float32)
 
 
-def apply_matrix_3x3(img: np.ndarray, M: np.ndarray) -> np.ndarray:
-    """Apply a 3×3 matrix to every pixel of a (H,W,3) or (N,3) array."""
-    shape = img.shape
-    return (img.reshape(-1, 3).astype(np.float32) @ M.T).reshape(shape).astype(np.float32)
+def acescg_to_srgb_linear(img: np.ndarray) -> np.ndarray:
+    """Convert ACEScg (AP1/D60) → linear sRGB (D65) with proper chromatic adaptation."""
+    if not HAVE_COLOUR:
+        raise RuntimeError("colour-science is required for colorspace conversion")
+    return colour.RGB_to_RGB(
+        np.asarray(img, dtype=np.float32),
+        "ACEScg", "sRGB",
+        apply_cctf_decoding=False,
+        apply_cctf_encoding=False,
+    ).astype(np.float32)
 
 
 # ─── CC24 reference values ────────────────────────────────────────────────────
@@ -347,8 +343,8 @@ class CheckerDetection:
 def _linear_to_u8_for_detection(img_linear: np.ndarray) -> np.ndarray:
     """Convert linear ACEScg HDR to uint8 sRGB for detection/debug display."""
     img_linear = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
-    if apply_matrix_3x3 is not None and M_ACESCG_TO_SRGB_LINEAR is not None:
-        img_disp = np.clip(apply_matrix_3x3(img_linear, M_ACESCG_TO_SRGB_LINEAR), 0.0, None)
+    if HAVE_COLOUR:
+        img_disp = np.clip(acescg_to_srgb_linear(img_linear), 0.0, None)
     else:
         img_disp = img_linear
     lum = 0.2126 * img_disp[..., 0] + 0.7152 * img_disp[..., 1] + 0.0722 * img_disp[..., 2]
