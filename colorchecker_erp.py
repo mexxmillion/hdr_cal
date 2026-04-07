@@ -395,13 +395,21 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
     """
     Per-tile exposure and WB normalization for chart detection.
 
-    Strategy: meter the tile like a camera — use the median luminance as the
-    "grey" reference and scale it to target_mid (default 0.18). This handles
-    both bright ground tiles and dark shadow tiles uniformly.
+    Goal: make every tile look like a normally-exposed camera photo so the
+    detector can find the chart. The chart patches should land in a
+    comfortable mid-range, not crushed into highlights or lost in shadows.
 
-    The rgb_scale neutralises colour casts, the exposure_scale brings the
-    median luminance to target_mid. Both are tracked so swatch values can
-    be un-scaled after detection.
+    Strategy:
+      1. Compute per-channel mean of the mid-range pixels → WB scale to
+         neutralise colour cast.
+      2. Find the median luminance → exposure scale to bring it to target_mid.
+      3. After scaling, hard-clamp at 1.0 so nothing is blown out.
+         The detector sees uint8 — values above 1.0 all map to 255 and are
+         useless. Clamping loses highlight detail but that's fine, we only
+         care about the chart patches being visible.
+
+    The rgb_scale and exposure_scale are tracked so swatch values can be
+    un-scaled after detection to recover the original linear values.
     """
     img = np.clip(np.asarray(img_linear, dtype=np.float32), 0.0, None)
     lum = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
@@ -411,9 +419,9 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
         exposure_scale = 1.0
         return img.copy(), rgb_scale, exposure_scale, {"rgb_scale": rgb_scale.tolist(), "exposure_scale": exposure_scale}
 
-    # WB: neutralise colour cast using trimmed mean (10th-98th percentile)
+    # WB: neutralise colour cast using trimmed mean (10th-90th percentile)
     lo = float(np.percentile(valid, 10.0))
-    hi = float(np.percentile(valid, 98.0))
+    hi = float(np.percentile(valid, 90.0))
     mask = np.isfinite(lum) & (lum >= lo) & (lum <= hi)
     if np.count_nonzero(mask) < 64:
         mask = np.isfinite(lum) & (lum > 1e-6)
@@ -425,19 +433,24 @@ def _compute_detection_prebalance(img_linear: np.ndarray,
     rgb_scale = np.clip(rgb_scale, 0.4, 2.5).astype(np.float32)
     rgb_scale /= max(float(np.mean(rgb_scale)), 1e-6)
 
-    # Exposure: bring median luminance to target_mid.
-    # Median is more robust than p99 — not dominated by sun disc or specular
-    # highlights, gives a camera-meter-like reading.
-    median_lum = float(np.median(valid))
-    exposure_scale = float(np.clip(target_mid / max(median_lum, 1e-6), 0.01, 50.0))
+    # Exposure: use the mean of the mid-range pixels (not median of all pixels).
+    # The mid-range excludes the sun disc and deep shadows — it's the part of
+    # the tile where the chart would be. Scale that to target_mid.
+    mid_lum = float(np.mean(lum[mask]))
+    exposure_scale = float(np.clip(target_mid / max(mid_lum, 1e-6), 0.001, 100.0))
 
-    balanced = np.clip(img * rgb_scale[None, None, :] * exposure_scale, 0.0, None).astype(np.float32)
+    balanced = img * rgb_scale[None, None, :] * exposure_scale
+    # Hard clamp at 1.0 — anything above is blown out and useless for detection.
+    # This is the key: on bright ground tiles, the sun reflection gets clamped
+    # but the chart patches (which are 18% grey or darker) survive intact.
+    balanced = np.clip(balanced, 0.0, 1.0).astype(np.float32)
+
     info = {
         "rgb_scale": rgb_scale.tolist(),
         "exposure_scale": exposure_scale,
-        "lum_median": median_lum,
+        "lum_mid_mean": mid_lum,
         "lum_p10": lo,
-        "lum_p98": hi,
+        "lum_p90": hi,
         "target_mid": target_mid,
     }
     return balanced, rgb_scale, exposure_scale, info
@@ -761,7 +774,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
     tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
     tile_raw_tm = (tile_linear / (tile_linear + 1.0)).astype(np.float32)
     tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
-    tile_detect_tm = (tile_detect_linear / (tile_detect_linear + 1.0)).astype(np.float32)
+    # Prebalanced image is already clamped to [0, 1] — no tonemapping needed.
+    # Reinhard x/(x+1) would compress an already-exposed image and squash the
+    # chart patches into a narrower range, hurting detection.
+    tile_detect_tm = tile_detect_linear
     tile_detect_u8 = _linear_to_u8_for_detection(tile_detect_linear)
 
     if debug_dir:
@@ -773,8 +789,8 @@ def _detect_in_tile(tile_linear: np.ndarray,
                   f"exp={detect_exposure_scale:.2f}"),
         )
 
-    _med_lum = detect_balance_info.get("lum_median", 0)
-    print(f"[cc-erp] Tile {stage_label} metering: median_lum={_med_lum:.4f} "
+    _mid_lum = detect_balance_info.get("lum_mid_mean", 0)
+    print(f"[cc-erp] Tile {stage_label} metering: mid_mean_lum={_mid_lum:.4f} "
           f"exp_scale={detect_exposure_scale:.3f} "
           f"wb=[{detect_rgb_scale[0]:.3f},{detect_rgb_scale[1]:.3f},{detect_rgb_scale[2]:.3f}] "
           f"({'BRIGHT' if detect_exposure_scale < 0.5 else 'DARK' if detect_exposure_scale > 4.0 else 'ok'})")
@@ -796,18 +812,17 @@ def _detect_in_tile(tile_linear: np.ndarray,
     ]
     # If the prebalance exposure was a big pull-down (bright tile), also try
     # a more aggressive bracket. If it was a big pull-up (dark tile), try brighter.
+    # Prebalanced brackets are already clamped to [0,1] — pass directly, no tonemap.
     if detect_exposure_scale < 0.5:
         # Tile was very bright — try even darker (target_mid=0.08)
         _dark_lin, _dark_rgb, _dark_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.08)
-        _dark_tm = (_dark_lin / (_dark_lin + 1.0)).astype(np.float32)
         _bracket_attempts.append(
-            ("bracket_dark", _dark_tm, _dark_lin, (_dark_rgb * _dark_exp).astype(np.float32)))
+            ("bracket_dark", _dark_lin, _dark_lin, (_dark_rgb * _dark_exp).astype(np.float32)))
     elif detect_exposure_scale > 4.0:
         # Tile was very dark — try even brighter (target_mid=0.5)
         _bright_lin, _bright_rgb, _bright_exp, _ = _compute_detection_prebalance(tile_linear, target_mid=0.5)
-        _bright_tm = (_bright_lin / (_bright_lin + 1.0)).astype(np.float32)
         _bracket_attempts.append(
-            ("bracket_bright", _bright_tm, _bright_lin, (_bright_rgb * _bright_exp).astype(np.float32)))
+            ("bracket_bright", _bright_lin, _bright_lin, (_bright_rgb * _bright_exp).astype(np.float32)))
 
     for _attempt_name, _attempt_tm, _attempt_linear, _attempt_scale in _bracket_attempts:
         try:
