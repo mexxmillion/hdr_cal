@@ -11,6 +11,7 @@ colour-science>=0.4.3  # pulled in by colour-checker-detection, listed for clari
 
 # ── YOLOv8 inference (optional but recommended for better swatch extraction) ──
 ultralytics>=8.0       # downloads model (~88 MB) automatically on first run
+sympy                  # required by torch (transitive dep of ultralytics)
 click>=8.0             # required by colour-checker-detection CLI internals
 
 # ── GUI (optional — only needed for hdri_cal_gui.py) ─────────────────────────
