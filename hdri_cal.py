@@ -1550,6 +1550,14 @@ def main():
                          "'contour' uses a contour-fit quad, and 'auto' compares both and keeps the better-agreeing read.")
     ap.add_argument("--cc-compare-backends", action="store_true", default=False,
                     help="Save backend comparison overlays for the ColorChecker read stage.")
+    ap.add_argument("--sweep-fov", type=float, default=90.0,
+                    help="Chart sweep tile FOV in degrees (default 90)")
+    ap.add_argument("--sweep-overlap", type=float, default=20.0,
+                    help="Overlap between sweep tiles in degrees (default 20)")
+    ap.add_argument("--sweep-min-pitch", type=float, default=-70.0,
+                    help="Lowest sweep pitch in degrees, -90=nadir (default -70)")
+    ap.add_argument("--sweep-max-pitch", type=float, default=30.0,
+                    help="Highest sweep pitch in degrees (default 30, skips top dome)")
 
     # ── Validate-only mode ────────────────────────────────────────────────
     ap.add_argument("--validate-only", action="store_true", default=False,
@@ -1791,6 +1799,10 @@ def _run_pipeline(args):
                 debug_dir=cc_debug,
                 read_backend=getattr(args, "cc_read_backend", "auto"),
                 compare_backends=getattr(args, "cc_compare_backends", False),
+                sweep_fov=getattr(args, "sweep_fov", 90.0),
+                sweep_overlap=getattr(args, "sweep_overlap", 20.0),
+                sweep_min_pitch=getattr(args, "sweep_min_pitch", -70.0),
+                sweep_max_pitch=getattr(args, "sweep_max_pitch", 30.0),
             )
         else:
             log(f"Loading ColorChecker plate: {checker_src}")

@@ -219,6 +219,12 @@ class PipelineConfig:
     sun_gain_ceiling:   float = 2000.0
     sun_gain_rolloff:   float = 500.0
 
+    # Chart sweep
+    sweep_fov:          float = 90.0
+    sweep_overlap:      float = 20.0
+    sweep_min_pitch:    float = -70.0
+    sweep_max_pitch:    float = 30.0
+
 
 
 def config_to_namespace(cfg: PipelineConfig):
@@ -717,6 +723,38 @@ class SettingsPanel(QScrollArea):
         f.addRow("Gain rolloff",    self.sun_gain_rolloff)
         self._adv_groups.append(grp)
 
+        grp = QGroupBox("Chart Sweep")
+        f = QFormLayout(grp)
+        self.sweep_fov = QDoubleSpinBox()
+        self.sweep_fov.setRange(45.0, 140.0)
+        self.sweep_fov.setValue(90.0)
+        self.sweep_fov.setDecimals(0)
+        self.sweep_fov.setSuffix("°")
+        self.sweep_fov.setToolTip("Tile field of view for chart sweep")
+        self.sweep_overlap = QDoubleSpinBox()
+        self.sweep_overlap.setRange(0.0, 60.0)
+        self.sweep_overlap.setValue(20.0)
+        self.sweep_overlap.setDecimals(0)
+        self.sweep_overlap.setSuffix("°")
+        self.sweep_overlap.setToolTip("Overlap between adjacent sweep tiles")
+        self.sweep_min_pitch = QDoubleSpinBox()
+        self.sweep_min_pitch.setRange(-90.0, 0.0)
+        self.sweep_min_pitch.setValue(-70.0)
+        self.sweep_min_pitch.setDecimals(0)
+        self.sweep_min_pitch.setSuffix("°")
+        self.sweep_min_pitch.setToolTip("Lowest pitch to sweep (-90 = nadir)")
+        self.sweep_max_pitch = QDoubleSpinBox()
+        self.sweep_max_pitch.setRange(-30.0, 90.0)
+        self.sweep_max_pitch.setValue(30.0)
+        self.sweep_max_pitch.setDecimals(0)
+        self.sweep_max_pitch.setSuffix("°")
+        self.sweep_max_pitch.setToolTip("Highest pitch to sweep (skip top dome)")
+        f.addRow("Sweep FOV",       self.sweep_fov)
+        f.addRow("Sweep overlap",   self.sweep_overlap)
+        f.addRow("Min pitch",       self.sweep_min_pitch)
+        f.addRow("Max pitch",       self.sweep_max_pitch)
+        self._adv_groups.append(grp)
+
         for grp in self._adv_groups:
             self._lay.addWidget(grp)
 
@@ -819,6 +857,10 @@ class SettingsPanel(QScrollArea):
         cfg.lobe_neutralise = self.lobe_neutralise.value()
         cfg.sun_gain_ceiling = self.sun_gain_ceiling.value()
         cfg.sun_gain_rolloff = self.sun_gain_rolloff.value()
+        cfg.sweep_fov = self.sweep_fov.value()
+        cfg.sweep_overlap = self.sweep_overlap.value()
+        cfg.sweep_min_pitch = self.sweep_min_pitch.value()
+        cfg.sweep_max_pitch = self.sweep_max_pitch.value()
 
         return cfg
 
@@ -1003,6 +1045,10 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.setValue(float(getattr(cfg, "lobe_neutralise", 1.0)))
             self._settings.sun_gain_ceiling.setValue(float(getattr(cfg, "sun_gain_ceiling", 2000.0)))
             self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
+            self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 90.0)))
+            self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 20.0)))
+            self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -70.0)))
+            self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 30.0)))
             self._settings._sync_calibration_mode()
         finally:
             self._syncing_settings = False

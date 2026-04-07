@@ -1385,7 +1385,7 @@ def _estimate_checker_pose(pts_px: list,
 
 def find_colorchecker_in_erp(
     erp_linear: np.ndarray,
-    fov_deg: float = 110.0,
+    fov_deg: float = 90.0,
     tile_w: int = 900,
     tile_h: int = 675,
     yaw_step_deg: float = 40.0,
@@ -1395,15 +1395,27 @@ def find_colorchecker_in_erp(
     debug_dir: Optional[str] = None,
     read_backend: str = "colour",
     compare_backends: bool = True,
+    sweep_fov: float = 90.0,
+    sweep_overlap: float = 20.0,
+    sweep_min_pitch: float = -70.0,
+    sweep_max_pitch: float = 30.0,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Find a ColorChecker Classic 24 inside an ERP panorama.
 
     Detection strategy:
-      1. Coarse cubemap sweep at 110° FOV for overlap between faces.
+      1. Systematic sweep starting from the ground and working up.
+         Uses sweep_fov (default 90°) with sweep_overlap (default 20°)
+         between tiles. Skips the top dome since charts are never there.
       2. Re-extract a centred 90° tile using the detected quadrilateral centre.
       3. Re-extract a tighter centred tile (about 50° FOV, adaptively derived
          from checker coverage) so swatch extraction sees a larger checker.
+
+    Sweep parameters:
+      sweep_fov       : tile field of view in degrees (default 90)
+      sweep_overlap   : overlap between tiles in degrees (default 20)
+      sweep_min_pitch : lowest pitch to sweep, -90 = nadir (default -70)
+      sweep_max_pitch : highest pitch to sweep (default 30, skips top dome)
     """
     if not HAVE_CCD:
         return None, {"error": "colour-checker-detection not installed. "
@@ -1422,18 +1434,42 @@ def find_colorchecker_in_erp(
           f"(CC24 reference patch 22: "
           f"R={cc24_ref[21,0]:.4f} G={cc24_ref[21,1]:.4f} B={cc24_ref[21,2]:.4f})")
 
-    coarse_faces = [
-        (0.0,   0.0),
-        (90.0,  0.0),
-        (180.0, 0.0),
-        (270.0, 0.0),
-        (0.0,  90.0),
-        (0.0, -90.0),
-    ]
-    coarse_fov = float(np.clip(fov_deg, 90.0, 140.0))
+    # Build sweep grid: bottom-up, full 360° azimuth with overlap.
+    coarse_fov = float(np.clip(sweep_fov, 45.0, 140.0))
+    _step = coarse_fov - sweep_overlap
+    if _step < 10.0:
+        _step = 10.0
+
+    # Pitch rows from ground up (chart is most likely near ground level)
+    _pitch_lo = float(np.clip(sweep_min_pitch, -90.0, 89.0))
+    _pitch_hi = float(np.clip(sweep_max_pitch, _pitch_lo + 1.0, 90.0))
+    _pitch_rows = []
+    _p = _pitch_lo
+    while _p <= _pitch_hi:
+        _pitch_rows.append(_p)
+        _p += _step
+    if _pitch_rows[-1] < _pitch_hi:
+        _pitch_rows.append(_pitch_hi)
+
+    # Yaw columns: full 360° with overlap
+    _yaw_cols = []
+    _y = 0.0
+    while _y < 360.0:
+        _yaw_cols.append(_y)
+        _y += _step
+    # Don't add 360 — it wraps to 0
+
+    coarse_faces = []
+    for pitch in _pitch_rows:
+        for yaw in _yaw_cols:
+            coarse_faces.append((yaw, pitch))
+
     coarse_size = 1024
 
-    print(f"[cc-erp] Pass cube-overlap: {len(coarse_faces)} tiles (FOV={coarse_fov:.0f}°)")
+    print(f"[cc-erp] Sweep: {len(coarse_faces)} tiles "
+          f"(FOV={coarse_fov:.0f}° step={_step:.0f}° "
+          f"pitch=[{_pitch_lo:.0f}°,{_pitch_hi:.0f}°] "
+          f"yaw_cols={len(_yaw_cols)} pitch_rows={len(_pitch_rows)})")
     for idx, (yaw, pitch) in enumerate(coarse_faces):
         total_tiles += 1
         tile_linear, map_uv = erp_to_rectilinear(
