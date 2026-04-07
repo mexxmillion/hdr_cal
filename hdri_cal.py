@@ -1333,16 +1333,18 @@ def main():
     # Two independent axes: --wb-source and --exposure-source.
     # Each can be set explicitly. 'auto' applies smart fallback logic.
     ap.add_argument("--wb-source", default="auto",
-                    choices=["auto", "chart", "none"],
+                    choices=["auto", "chart", "sphere", "none"],
                     help="White balance colour source. "
-                         "'auto' (default): chart if found+confident, else none. "
+                         "'auto' (default): chart if found+confident, else sphere. "
                          "'chart': use ColorChecker patch 22. "
+                         "'sphere': neutralise rendered grey sphere to achromatic. "
                          "'none': no WB correction, passthrough.")
     ap.add_argument("--exposure-source", default="auto",
-                    choices=["auto", "chart", "none"],
+                    choices=["auto", "chart", "sphere", "none"],
                     help="Exposure magnitude source. "
-                         "'auto' (default): chart if found+confident, else none. "
+                         "'auto' (default): chart if found+confident, else sphere. "
                          "'chart': use ColorChecker patch 22 luma as the absolute reference. "
+                         "'sphere': render grey sphere and normalise to 18%% grey. "
                          "'none': no exposure correction.")
     # ── Hot lobe ──────────────────────────────────────────────────────────
     ap.add_argument("--sun-threshold", type=float, default=0.1,
@@ -1807,12 +1809,15 @@ def _run_pipeline(args):
     #   sphere always available (just renders the env)
     #   kelvin/manual always available if args provided
 
-    FALLBACK_WB  = "none"      # when chart requested but unavailable
-    FALLBACK_EXP = "none"      # when chart requested but unavailable
+    FALLBACK_WB  = "sphere"    # when chart unavailable: neutralise sphere render
+    FALLBACK_EXP = "sphere"    # when chart unavailable: normalise sphere to grey
 
     def _resolve_wb(src_raw, chart_ok):
         if src_raw == "auto":
-            return "chart" if chart_ok else FALLBACK_WB
+            if chart_ok:
+                return "chart"
+            log(f"WB auto: no chart found — falling back to sphere integration")
+            return FALLBACK_WB
         if src_raw == "chart" and not chart_ok:
             warn(f"⚠ --wb-source chart requested but chart not found or low confidence "
                  f"(conf={float(cc_det_info.get('confidence') or 0.0):.3f} < {CHART_CONF_MIN}) "
@@ -1823,7 +1828,10 @@ def _run_pipeline(args):
 
     def _resolve_exp(src_raw, chart_ok):
         if src_raw == "auto":
-            return "chart" if chart_ok else FALLBACK_EXP
+            if chart_ok:
+                return "chart"
+            log(f"Exposure auto: no chart found — falling back to sphere integration")
+            return FALLBACK_EXP
         if src_raw == "chart" and not chart_ok:
             warn(f"⚠ --exposure-source chart requested but chart not found or low confidence "
                  f"(conf={float(cc_det_info.get('confidence') or 0.0):.3f} < {CHART_CONF_MIN}) "

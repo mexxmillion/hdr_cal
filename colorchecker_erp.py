@@ -55,12 +55,31 @@ except ImportError:
 
 # Check if the ML inference method is available (requires ultralytics)
 HAVE_CCD_INFERENCE = False
+_YOLO_MODEL_PATH = None
 if HAVE_CCD:
     try:
         _ = ccd.detect_colour_checkers_inference
         HAVE_CCD_INFERENCE = True
+        # Resolve where the model file lives (or would be downloaded to)
+        _model_repo = os.environ.get(
+            "COLOUR_SCIENCE__COLOUR_CHECKER_DETECTION__REPOSITORY",
+            os.path.join(os.path.expanduser("~"), ".colour-science", "colour-checker-detection"),
+        )
+        _candidate = os.path.join(_model_repo, "colour-checker-detection-l-seg.pt")
+        _YOLO_MODEL_PATH = _candidate if os.path.isfile(_candidate) else None
     except AttributeError:
         pass
+
+def _log_detection_backends():
+    """Log which chart detection backends are available. Call once at detection time."""
+    print(f"[cc-erp] Detection backends:")
+    print(f"[cc-erp]   colour-checker-detection : {'yes' if HAVE_CCD else 'NO — segmentation unavailable'}")
+    print(f"[cc-erp]   YOLO inference           : {'yes' if HAVE_CCD_INFERENCE else 'no (ultralytics not installed)'}")
+    if HAVE_CCD_INFERENCE:
+        if _YOLO_MODEL_PATH:
+            print(f"[cc-erp]   YOLO model               : {_YOLO_MODEL_PATH}")
+        else:
+            print(f"[cc-erp]   YOLO model               : NOT FOUND — will attempt download at runtime")
 
 try:
     import colour
@@ -1392,6 +1411,8 @@ def find_colorchecker_in_erp(
 
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
+
+    _log_detection_backends()
 
     best: Optional[CheckerDetection] = None
     total_tiles = 0
