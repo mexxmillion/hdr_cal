@@ -747,22 +747,23 @@ def _detect_in_tile(tile_linear: np.ndarray,
     tile_srgb_lin = acescg_to_srgb_linear(tile_linear) if HAVE_COLOUR else tile_linear
     tile_srgb_lin = np.clip(tile_srgb_lin, 0.0, None).astype(np.float32)
     tile_raw_tm = (tile_srgb_lin / (tile_srgb_lin + 1.0)).astype(np.float32)
-    tile_rgb_u8 = np.clip(tile_raw_tm * 255 + 0.5, 0, 255).astype(np.uint8)
-
-    # Prebalanced: WB + exposure adjust in ACEScg linear, convert to sRGB, then Reinhard
+    # Prebalanced: WB + exposure in ACEScg linear, → sRGB linear, → Reinhard
     tile_detect_linear, detect_rgb_scale, detect_exposure_scale, detect_balance_info = _compute_detection_prebalance(tile_linear)
     tile_detect_srgb = acescg_to_srgb_linear(tile_detect_linear) if HAVE_COLOUR else tile_detect_linear
     tile_detect_srgb = np.clip(tile_detect_srgb, 0.0, None).astype(np.float32)
     tile_detect_tm = (tile_detect_srgb / (tile_detect_srgb + 1.0)).astype(np.float32)
-    tile_detect_u8 = np.clip(tile_detect_tm * 255 + 0.5, 0, 255).astype(np.uint8)
+
+    # Debug images: proper sRGB display (ACEScg → sRGB → p99 exposure → gamma)
+    tile_rgb_u8 = _linear_to_u8_for_detection(tile_linear)
+    tile_detect_u8 = _linear_to_u8_for_detection(tile_detect_linear)
 
     if debug_dir:
-        # These show exactly what the detector sees (Reinhard tonemapped)
+        # Proper sRGB display for debug
         _save_intermediate_debug(
             debug_dir,
             f"tile_{stage_label}_raw.jpg",
             tile_rgb_u8,
-            note=f"{stage_label}: raw Reinhard",
+            note=f"{stage_label}: raw sRGB display",
         )
         _save_intermediate_debug(
             debug_dir,
@@ -878,11 +879,14 @@ def _detect_in_tile(tile_linear: np.ndarray,
                         return float(np.mean(np.abs(n * sc - r)))
 
                     ref_arr = cc24_ref if cc24_ref is not None else CC24_LINEAR_SRGB
+                    # Inverse Reinhard → sRGB linear → ACEScg for comparison
                     seg_sw_safe = np.clip(chosen_sw_tm, 0, 0.9999)
-                    seg_sw_lin = seg_sw_safe / (1.0 - seg_sw_safe)
+                    seg_sw_srgb = seg_sw_safe / (1.0 - seg_sw_safe)
+                    seg_sw_lin = srgb_linear_to_acescg(seg_sw_srgb) if HAVE_COLOUR else seg_sw_srgb
                     seg_err = _cerr(seg_sw_lin, ref_arr)
                     inf_sw_safe = np.clip(inf_sw_tm, 0, 0.9999)
-                    inf_sw_lin = inf_sw_safe / (1.0 - inf_sw_safe)
+                    inf_sw_srgb = inf_sw_safe / (1.0 - inf_sw_safe)
+                    inf_sw_lin = srgb_linear_to_acescg(inf_sw_srgb) if HAVE_COLOUR else inf_sw_srgb
                     inf_err = _cerr(inf_sw_lin, ref_arr)
                     print(f"[cc-erp] YOLO on crop: seg_err={seg_err:.4f}  yolo_err={inf_err:.4f}  crop={crop_w}x{crop_h} -> {zoom_w}x{zoom_h}px")
 
@@ -998,9 +1002,11 @@ def _detect_in_tile(tile_linear: np.ndarray,
         backproject_pixel_to_erp(cx, cy, map_uv)
         for cx, cy in colour_centres_tile
     ], dtype=np.float32)
+    # Inverse Reinhard → sRGB linear, undo prebalance scale, → ACEScg linear
     colour_sw_safe = np.clip(colour_sw_tm, 0.0, 0.9999)
-    colour_swatches_linear = colour_sw_safe / (1.0 - colour_sw_safe)
-    colour_swatches_linear = colour_swatches_linear / np.clip(detect_scale_vec[None, :], 1e-6, None)
+    colour_swatches_srgb = colour_sw_safe / (1.0 - colour_sw_safe)
+    colour_swatches_srgb = colour_swatches_srgb / np.clip(detect_scale_vec[None, :], 1e-6, None)
+    colour_swatches_linear = srgb_linear_to_acescg(colour_swatches_srgb) if HAVE_COLOUR else colour_swatches_srgb
     colour_swatches_linear, colour_reorder = _reorder_swatches_to_cc24(colour_swatches_linear, cc24_ref)
     colour_centres_uv = colour_centres_uv[colour_reorder]
     colour_centres_tile = colour_centres_tile[colour_reorder]
@@ -1496,11 +1502,8 @@ def find_colorchecker_in_erp(
             erp_linear, yaw, pitch, coarse_fov, coarse_size, coarse_size)
 
         if debug_dir:
-            # ACEScg → sRGB linear → Reinhard — same as what detector sees
-            _srgb = acescg_to_srgb_linear(tile_linear) if HAVE_COLOUR else tile_linear
-            _srgb = np.clip(_srgb, 0.0, None)
-            _tm = (_srgb / (_srgb + 1.0)).astype(np.float32)
-            _u8 = np.clip(_tm * 255 + 0.5, 0, 255).astype(np.uint8)
+            # Proper sRGB display (ACEScg → sRGB → p99 exposure → gamma)
+            _u8 = _linear_to_u8_for_detection(tile_linear)
             tile_bgr = cv2.cvtColor(_u8, cv2.COLOR_RGB2BGR)
             cv2.putText(tile_bgr,
                         f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={coarse_fov:.0f}",
