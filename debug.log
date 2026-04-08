@@ -1,4 +1,3 @@
-SCL_DEVOPS_REZ_SEARCH_PATHS: \\inferno2\projects\common\home\quw\dev\temp_packages;
 Traceback (most recent call last):
   File "\\inferno2\projects\common\home\quw\dev\temp_packages\HDRIColorCharts\Dependencies\sympy\__init__.py", line 23, in <module>
     import mpmath
@@ -83,4 +82,4 @@ Traceback (most recent call last):
   File "\\s2\rez\packages\prod\packages\numpy\1.26.4.post1\platform-windows\arch-AMD64\Python311\site-packages\numpy\lib\npyio.py", line 427, in load
     fid = stack.enter_context(open(os_fspath(file), "rb"))
                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-FileNotFoundError: [Errno 2] No such file or directory: 'S:\\Temp\\tmp5npuocmq\\output-results.npz'
+FileNotFoundError: [Errno 2] No such file or directory: 'S:\\Temp\\tmpqlnpoukv\\output-results.npz'
