@@ -318,17 +318,64 @@ def _sample_swatches_at_centres(tile_linear: np.ndarray,
 
 
 def _compute_confidence(swatches_linear: np.ndarray,
-                        cc24_ref: np.ndarray) -> float:
-    """Score via neutral-ramp chroma agreement (illuminant-invariant)."""
+                        cc24_ref: np.ndarray,
+                        quad_tile: Optional[np.ndarray] = None) -> Tuple[float, dict]:
+    """Score a detection via geometry + neutral-ramp sanity.
+
+    A partial-chart YOLO hit produces a plausible-looking quad but maps the
+    rectified neutrals onto wrong tile regions — so the neutrals come back
+    non-monotonic or chromatic. Multiple gates catch that:
+
+      1. Quad aspect ratio vs CC24's 1.5:1 (hard gate).
+      2. Neutral luminance monotonicity (hard gate).
+      3. Neutral chroma error after grey-card WB (score).
+
+    Returns (confidence in [0,1], diag dict). confidence=0 means a hard gate
+    failed and the detection should be discarded.
+    """
     if swatches_linear.shape != (24, 3):
-        return 0.0
+        return 0.0, {"reason": "wrong shape"}
+
+    diag = {}
+
+    # Gate 1: quad aspect ratio must be close to CC24's 1.5:1.
+    if quad_tile is not None and quad_tile.shape == (4, 2):
+        tl, tr, br, bl = _order_quad_tl_tr_br_bl(quad_tile)
+        w_top = float(np.linalg.norm(tr - tl))
+        w_bot = float(np.linalg.norm(br - bl))
+        h_lft = float(np.linalg.norm(bl - tl))
+        h_rgt = float(np.linalg.norm(br - tr))
+        w_avg = 0.5 * (w_top + w_bot)
+        h_avg = 0.5 * (h_lft + h_rgt)
+        aspect = w_avg / max(h_avg, 1e-6)
+        # CC24 is 6×4 patches → ~1.5 aspect. Allow [1.15, 1.95] before rejecting.
+        diag["aspect"] = aspect
+        if aspect < 1.15 or aspect > 1.95:
+            return 0.0, {**diag, "reason": f"aspect {aspect:.2f} outside [1.15, 1.95]"}
+
+    # Gate 2: neutral ramp should be monotonically darker from patch 19 (white)
+    # to patch 24 (black). Allow one small inversion (noise), not more.
     meas = swatches_linear[18:24]
     ref = cc24_ref[18:24]
     lm = 0.2126 * meas[:, 0] + 0.7152 * meas[:, 1] + 0.0722 * meas[:, 2]
+    diffs = np.diff(lm)  # should be all negative
+    inversions = int(np.sum(diffs > 0))
+    diag["neutral_lum"] = lm.tolist()
+    diag["neutral_inversions"] = inversions
+    if inversions >= 2:
+        return 0.0, {**diag, "reason": f"neutral ramp has {inversions} inversions"}
+
+    # Score: neutral chroma agreement after per-row grey-card scale.
     lr = 0.2126 * ref[:, 0] + 0.7152 * ref[:, 1] + 0.0722 * ref[:, 2]
     scale = np.clip(lr / (lm + 1e-8), 0.0, 20.0)[:, None]
     err = float(np.mean(np.abs(meas * scale - ref)))
-    return float(np.clip(1.0 - err * 5.0, 0.0, 1.0))
+    score = float(np.clip(1.0 - err * 5.0, 0.0, 1.0))
+    # One inversion: light penalty (still usable but less trusted).
+    if inversions == 1:
+        score *= 0.8
+    diag["chroma_err"] = err
+    diag["score"] = score
+    return score, diag
 
 
 # ─── Pose estimation ─────────────────────────────────────────────────────────
@@ -419,6 +466,22 @@ def _detect_in_tile(tile_linear: np.ndarray,
         quad_tile = quad_raw / max(det_scale, 1e-6)
     quad_tile = _order_quad_tl_tr_br_bl(quad_tile)
 
+    # Early aspect gate: CC24 is 1.5:1. A partial-chart hit often has a far
+    # squarer or wildly elongated quad. Skip expensive sampling if so.
+    _tl, _tr, _br, _bl = quad_tile
+    _w = 0.5 * (float(np.linalg.norm(_tr - _tl)) + float(np.linalg.norm(_br - _bl)))
+    _h = 0.5 * (float(np.linalg.norm(_bl - _tl)) + float(np.linalg.norm(_br - _tr)))
+    _aspect = _w / max(_h, 1e-6)
+    if _aspect < 1.15 or _aspect > 1.95:
+        print(f"[cc-erp] {tile_label}: reject quad aspect {_aspect:.2f} (want ~1.5)")
+        return None
+    # Also require the quad to cover a reasonable fraction of the tile.
+    _quad_area = abs(cv2.contourArea(quad_tile.astype(np.float32)))
+    _tile_area = float(out_w) * float(out_h)
+    if _quad_area < 0.01 * _tile_area:
+        print(f"[cc-erp] {tile_label}: reject tiny quad ({_quad_area/_tile_area*100:.1f}% of tile)")
+        return None
+
     # Use the detector's per-swatch geometry (swatch_masks in rectified-chart
     # space) mapped back to tile pixels via the rectified→tile homography.
     # The library already returns masks in CC24 row-major order.
@@ -452,7 +515,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
     centres_uv = np.array([backproject_pixel_to_erp(cx, cy, map_uv)
                            for cx, cy in centres_tile], dtype=np.float32)
 
-    confidence = _compute_confidence(swatches_wcs, cc24_ref)
+    confidence, conf_diag = _compute_confidence(swatches_wcs, cc24_ref, quad_tile)
+    if confidence <= 0.0:
+        print(f"[cc-erp] {tile_label}: rejected — {conf_diag.get('reason', 'score=0')}")
+        return None
 
     normal_world = _estimate_checker_pose(quad_tile, out_w, out_h,
                                           yaw, pitch, tile_fov_deg)
