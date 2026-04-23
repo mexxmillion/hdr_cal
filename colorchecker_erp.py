@@ -275,64 +275,6 @@ def _order_quad_tl_tr_br_bl(poly: np.ndarray) -> np.ndarray:
                      q[np.argmax(s)], q[np.argmax(d)]], dtype=np.float32)
 
 
-def _sample_swatches_from_quad(tile_linear: np.ndarray,
-                               quad: np.ndarray,
-                               sample_frac: float = 0.18) -> Tuple[np.ndarray, np.ndarray]:
-    """Sample 24 CC24 swatches from the quadrilateral in tile space using grid geometry.
-
-    Returns (swatches (24,3) float, centres (24,2) float) in row-major order.
-    """
-    tl, tr, br, bl = _order_quad_tl_tr_br_bl(quad)
-    h, w = tile_linear.shape[:2]
-    rows, cols = 4, 6
-
-    # Build per-cell sample grid and sample via cv2.remap for speed.
-    # For each of 24 patches, sample a (5x5) block around the centre and average.
-    K = 5
-    offs = np.linspace(-sample_frac, sample_frac, K, dtype=np.float32)
-
-    # Precompute patch centres and basis vectors
-    centres = np.zeros((24, 2), dtype=np.float32)
-    pts_x = np.zeros((24 * K * K,), dtype=np.float32)
-    pts_y = np.zeros((24 * K * K,), dtype=np.float32)
-
-    idx = 0
-    for r in range(rows):
-        for c in range(cols):
-            s = (c + 0.5) / cols
-            t = (r + 0.5) / rows
-            top = tl + s * (tr - tl)
-            bot = bl + s * (br - bl)
-            pt = top + t * (bot - top)
-
-            left = tl + t * (bl - tl)
-            right = tr + t * (br - tr)
-            cell_w_vec = (right - left) / cols
-            top_col = tl + s * (tr - tl)
-            bot_col = bl + s * (br - bl)
-            cell_h_vec = (bot_col - top_col) / rows
-
-            patch_idx = r * cols + c
-            centres[patch_idx] = pt
-
-            for oy in offs:
-                for ox in offs:
-                    p = pt + cell_w_vec * ox + cell_h_vec * oy
-                    pts_x[idx] = p[0]
-                    pts_y[idx] = p[1]
-                    idx += 1
-
-    # Bilinear sample via cv2.remap
-    map_x = pts_x.reshape(1, -1)
-    map_y = pts_y.reshape(1, -1)
-    samples = cv2.remap(tile_linear, map_x, map_y,
-                        interpolation=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REPLICATE)
-    samples = samples.reshape(24, K * K, 3)
-    swatches = samples.mean(axis=1).astype(np.float32)
-    return swatches, centres
-
-
 def _sample_swatches_at_centres(tile_linear: np.ndarray,
                                 centres: np.ndarray,
                                 quad: np.ndarray,
@@ -387,36 +329,6 @@ def _compute_confidence(swatches_linear: np.ndarray,
     scale = np.clip(lr / (lm + 1e-8), 0.0, 20.0)[:, None]
     err = float(np.mean(np.abs(meas * scale - ref)))
     return float(np.clip(1.0 - err * 5.0, 0.0, 1.0))
-
-
-def _reorder_swatches_to_cc24(swatches: np.ndarray,
-                              cc24_ref: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """Reorder 24 swatches to CC24 row-major using chroma (luma-normalised) match."""
-    rows, cols = 4, 6
-    assert swatches.shape == (24, 3)
-    if cc24_ref is None:
-        cc24_ref = CC24_LINEAR_SRGB
-
-    ref_luma = (0.2126*cc24_ref[:, 0] + 0.7152*cc24_ref[:, 1] + 0.0722*cc24_ref[:, 2])[:, None]
-    ref_norm = cc24_ref / np.clip(ref_luma, 1e-4, None)
-    sw_luma = (0.2126*swatches[:, 0] + 0.7152*swatches[:, 1] + 0.0722*swatches[:, 2])[:, None]
-    sw_norm = swatches / np.clip(sw_luma, 1e-4, None)
-
-    grid = np.arange(24).reshape(rows, cols)
-    candidates = []
-    for flip in (False, True):
-        g = grid if not flip else grid[:, ::-1]
-        for rot in range(4):
-            candidates.append(np.rot90(g, rot).flatten().tolist())
-
-    best_idx, best_err = candidates[0], float("inf")
-    for idx in candidates:
-        err = float(np.mean(np.abs(sw_norm[idx] - ref_norm)))
-        if err < best_err:
-            best_err, best_idx = err, idx
-
-    reorder = np.array(best_idx, dtype=np.int32)
-    return swatches[reorder], reorder
 
 
 # ─── Pose estimation ─────────────────────────────────────────────────────────
@@ -507,42 +419,35 @@ def _detect_in_tile(tile_linear: np.ndarray,
         quad_tile = quad_raw / max(det_scale, 1e-6)
     quad_tile = _order_quad_tl_tr_br_bl(quad_tile)
 
-    # Prefer the detector's actual per-swatch geometry (swatch_masks in
-    # rectified-chart space) mapped back to tile pixels via the known
-    # rectified→tile homography. This is what the old code did and it's
-    # more accurate than a grid interpolation over the quad.
-    centres_tile = None
-    cc_rectified = None
+    # Use the detector's per-swatch geometry (swatch_masks in rectified-chart
+    # space) mapped back to tile pixels via the rectified→tile homography.
+    # The library already returns masks in CC24 row-major order.
     try:
         cc_rectified = np.array(det.colour_checker, dtype=np.float32)
-    except Exception:
-        pass
-    try:
         masks = np.array(det.swatch_masks, dtype=np.float32)  # (24, 4) [y0,y1,x0,x1]
-    except Exception:
-        masks = None
+    except Exception as e:
+        print(f"[cc-erp] {tile_label}: missing additional_data ({e})")
+        return None
 
-    if cc_rectified is not None and masks is not None and masks.shape == (24, 4):
-        H_cc, W_cc = cc_rectified.shape[:2]
-        cx_rect = (masks[:, 2] + masks[:, 3]) * 0.5
-        cy_rect = (masks[:, 0] + masks[:, 1]) * 0.5
-        rect_corners = np.array([[0, 0], [W_cc, 0], [W_cc, H_cc], [0, H_cc]], dtype=np.float32)
-        H_rect_to_tile, _ = cv2.findHomography(rect_corners, quad_tile)
-        if H_rect_to_tile is not None:
-            pts = np.column_stack([cx_rect, cy_rect, np.ones(24, dtype=np.float32)])
-            mapped = (H_rect_to_tile @ pts.T).T
-            w_coord = np.clip(mapped[:, 2:3], 1e-8, None)
-            centres_tile = (mapped[:, :2] / w_coord).astype(np.float32)
+    if masks.shape != (24, 4) or cc_rectified.ndim != 3:
+        return None
 
-    if centres_tile is None:
-        # Fallback: grid from quad
-        _, centres_tile = _sample_swatches_from_quad(tile_linear, quad_tile)
+    H_cc, W_cc = cc_rectified.shape[:2]
+    cx_rect = (masks[:, 2] + masks[:, 3]) * 0.5
+    cy_rect = (masks[:, 0] + masks[:, 1]) * 0.5
+    rect_corners = np.array([[0, 0], [W_cc, 0], [W_cc, H_cc], [0, H_cc]], dtype=np.float32)
+    H_rect_to_tile, _ = cv2.findHomography(rect_corners, quad_tile)
+    if H_rect_to_tile is None:
+        return None
 
-    # Sample HDR swatches: 5×5 block average around each centre, sized from the
-    # local cell footprint so patches are averaged, not edges.
+    pts = np.column_stack([cx_rect, cy_rect, np.ones(24, dtype=np.float32)])
+    mapped = (H_rect_to_tile @ pts.T).T
+    centres_tile = (mapped[:, :2] / np.clip(mapped[:, 2:3], 1e-8, None)).astype(np.float32)
+
+    # Sample HDR scene-linear values at the detector-provided centres.
+    # (The lib's det.swatch_colours is in the tonemapped u8 input space, not
+    # useful for HDR calibration — that's why we re-sample the linear tile.)
     swatches_wcs = _sample_swatches_at_centres(tile_linear, centres_tile, quad_tile)
-    swatches_wcs, reorder = _reorder_swatches_to_cc24(swatches_wcs, cc24_ref)
-    centres_tile = centres_tile[reorder]
 
     centres_uv = np.array([backproject_pixel_to_erp(cx, cy, map_uv)
                            for cx, cy in centres_tile], dtype=np.float32)
