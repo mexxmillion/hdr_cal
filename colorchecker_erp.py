@@ -509,8 +509,8 @@ def find_colorchecker_in_erp(
     sweep_min_pitch: float = -30.0,
     sweep_max_pitch: float = 90.0,
     tile_size: int = 1024,
-    min_confidence: float = 0.05,
-    early_exit_confidence: float = 0.35,
+    min_confidence: float = 0.55,
+    early_exit_confidence: float = 0.75,
     # kept for API compatibility (no-ops in YOLO-only mode):
     read_backend: str = "yolo",
     compare_backends: bool = False,

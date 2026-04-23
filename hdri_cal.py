@@ -1558,6 +1558,12 @@ def main():
                     help="Lowest sweep pitch, -90=zenith (default -30, skips top dome)")
     ap.add_argument("--sweep-max-pitch", type=float, default=90.0,
                     help="Highest sweep pitch, +90=nadir/ground (default 90)")
+    ap.add_argument("--cc-min-confidence", type=float, default=0.55,
+                    help="Minimum confidence for a tile detection to be kept "
+                         "(default 0.55). Raise to reject partial-chart detections.")
+    ap.add_argument("--cc-early-exit-confidence", type=float, default=0.75,
+                    help="Sweep stops as soon as a tile scores at or above this "
+                         "(default 0.75). Raise to keep searching for better tiles.")
 
     # ── Validate-only mode ────────────────────────────────────────────────
     ap.add_argument("--validate-only", action="store_true", default=False,
@@ -1803,6 +1809,8 @@ def _run_pipeline(args):
                 sweep_overlap=getattr(args, "sweep_overlap", 10.0),
                 sweep_min_pitch=getattr(args, "sweep_min_pitch", -30.0),
                 sweep_max_pitch=getattr(args, "sweep_max_pitch", 90.0),
+                min_confidence=getattr(args, "cc_min_confidence", 0.55),
+                early_exit_confidence=getattr(args, "cc_early_exit_confidence", 0.75),
             )
         else:
             log(f"Loading ColorChecker plate: {checker_src}")

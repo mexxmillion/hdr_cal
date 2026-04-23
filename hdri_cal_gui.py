@@ -224,6 +224,8 @@ class PipelineConfig:
     sweep_overlap:      float = 10.0
     sweep_min_pitch:    float = -30.0
     sweep_max_pitch:    float = 90.0
+    cc_min_confidence:  float = 0.55
+    cc_early_exit_confidence: float = 0.75
 
 
 
@@ -270,6 +272,8 @@ def config_to_namespace(cfg: PipelineConfig):
         "colorchecker_in_hdri": False,
         "cc_read_backend":      "colour",
         "cc_compare_backends":  False,
+        "cc_min_confidence":    0.55,
+        "cc_early_exit_confidence": 0.75,
         "validate_only":        False,
     }
     for attr, default in _defaults.items():
@@ -749,10 +753,29 @@ class SettingsPanel(QScrollArea):
         self.sweep_max_pitch.setDecimals(0)
         self.sweep_max_pitch.setSuffix("°")
         self.sweep_max_pitch.setToolTip("Highest pitch (+90=nadir/ground, default 90)")
+        self.cc_min_confidence = QDoubleSpinBox()
+        self.cc_min_confidence.setRange(0.0, 1.0)
+        self.cc_min_confidence.setSingleStep(0.05)
+        self.cc_min_confidence.setDecimals(2)
+        self.cc_min_confidence.setValue(0.55)
+        self.cc_min_confidence.setToolTip(
+            "Minimum detection confidence (neutral-ramp chroma agreement, 0-1). "
+            "Raise to reject partial-chart detections that produce wrong "
+            "rectified pose and bad swatches. 0.55 default, 0.75+ strict.")
+        self.cc_early_exit_confidence = QDoubleSpinBox()
+        self.cc_early_exit_confidence.setRange(0.0, 1.0)
+        self.cc_early_exit_confidence.setSingleStep(0.05)
+        self.cc_early_exit_confidence.setDecimals(2)
+        self.cc_early_exit_confidence.setValue(0.75)
+        self.cc_early_exit_confidence.setToolTip(
+            "Sweep stops when a tile scores at or above this (0-1). "
+            "Raise to keep searching every tile for the best detection.")
         f.addRow("Sweep FOV",       self.sweep_fov)
         f.addRow("Sweep overlap",   self.sweep_overlap)
         f.addRow("Min pitch",       self.sweep_min_pitch)
         f.addRow("Max pitch",       self.sweep_max_pitch)
+        f.addRow("Min confidence",  self.cc_min_confidence)
+        f.addRow("Early-exit conf", self.cc_early_exit_confidence)
         self._adv_groups.append(grp)
 
         for grp in self._adv_groups:
@@ -859,6 +882,8 @@ class SettingsPanel(QScrollArea):
         cfg.sun_gain_rolloff = self.sun_gain_rolloff.value()
         cfg.sweep_fov = self.sweep_fov.value()
         cfg.sweep_overlap = self.sweep_overlap.value()
+        cfg.cc_min_confidence = self.cc_min_confidence.value()
+        cfg.cc_early_exit_confidence = self.cc_early_exit_confidence.value()
         cfg.sweep_min_pitch = self.sweep_min_pitch.value()
         cfg.sweep_max_pitch = self.sweep_max_pitch.value()
 
@@ -1026,6 +1051,8 @@ class MainWindow(QMainWindow):
             self._settings.sweep_overlap.editingFinished,
             self._settings.sweep_min_pitch.editingFinished,
             self._settings.sweep_max_pitch.editingFinished,
+            self._settings.cc_min_confidence.editingFinished,
+            self._settings.cc_early_exit_confidence.editingFinished,
         ]:
             signal.connect(self._on_settings_changed)
 
@@ -1053,6 +1080,8 @@ class MainWindow(QMainWindow):
             self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 10.0)))
             self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -30.0)))
             self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 90.0)))
+            self._settings.cc_min_confidence.setValue(float(getattr(cfg, "cc_min_confidence", 0.55)))
+            self._settings.cc_early_exit_confidence.setValue(float(getattr(cfg, "cc_early_exit_confidence", 0.75)))
             self._settings._sync_calibration_mode()
         finally:
             self._syncing_settings = False
