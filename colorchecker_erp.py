@@ -524,6 +524,7 @@ def find_colorchecker_in_erp(
     sweep_max_pitch: float = 90.0,
     tile_size: int = 1024,
     min_confidence: float = 0.05,
+    early_exit_confidence: float = 0.35,
     # kept for API compatibility (no-ops in YOLO-only mode):
     read_backend: str = "yolo",
     compare_backends: bool = False,
@@ -595,6 +596,12 @@ def find_colorchecker_in_erp(
             best = det
             print(f"[cc-erp]  hit  tile={idx} yaw={yaw:.0f}° pitch={pitch:.0f}° "
                   f"conf={det.confidence:.3f}")
+        # Early exit: a confident detection beats finishing the sweep.
+        # The recenter passes will refine geometry anyway.
+        if best.confidence >= early_exit_confidence:
+            print(f"[cc-erp] Early exit at tile {idx}/{len(tiles)} "
+                  f"(conf={best.confidence:.3f} >= {early_exit_confidence:.2f})")
+            break
 
     if best is None:
         print(f"[cc-erp] No chart found after {searched} tiles")
