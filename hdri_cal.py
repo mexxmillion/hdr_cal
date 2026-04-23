@@ -1807,18 +1807,17 @@ def _run_pipeline(args):
         else:
             log(f"Loading ColorChecker plate: {checker_src}")
             cc_img_raw, _ = load_image_any(checker_src, target_colorspace=working_cs)
-            from colorchecker_erp import _linear_to_u8_for_detection
+            from colorchecker_erp import _linear_to_u8_for_display
             import colour_checker_detection as _ccd_direct
-            tile_u8_bgr = cv2.cvtColor(
-                _linear_to_u8_for_detection(cc_img_raw), cv2.COLOR_RGB2BGR)
+            tile_u8 = _linear_to_u8_for_display(cc_img_raw)  # RGB u8
+            tile_f = tile_u8.astype(np.float32) / 255.0
             try:
-                results = _ccd_direct.detect_colour_checkers_segmentation(
-                    tile_u8_bgr, show=False, additional_data=False)
+                results = _ccd_direct.detect_colour_checkers_inference(
+                    tile_f, additional_data=False, apply_cctf_decoding=True)
                 if results:
-                    sw = results[0]   # (24,3) float BGR
-                    if sw is not None and sw.shape == (24, 3):
-                        sw_rgb = sw[:, ::-1].astype(np.float32)
-                        cc_measured = srgb_to_linear(np.clip(sw_rgb, 0, 1))
+                    sw = np.asarray(results[0], dtype=np.float32)  # (24,3) RGB linear
+                    if sw.shape == (24, 3):
+                        cc_measured = np.clip(sw, 0.0, None)
                         cc_det_info = {"source": checker_src, "found": True}
             except Exception as e:
                 warn(f"Flat plate CC detection failed: {e}")
