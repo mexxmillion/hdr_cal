@@ -1,64 +1,35 @@
-[hdri-cal] Loading: //inferno2/projects/common/home/quw/hdri_shoot/selects/gwpark_sunny_acescg_clipped4.exr
-[hdri-cal] Loaded EXR — interpreted as acescg
+[hdri-cal] Loading: //inferno2/projects/common/home/quw/hdri_shoot/selects/gwpark_sunny_acescg_clipped3.exr
+[hdri-cal] Loading: //inferno2/projects/common/home/quw/hdri_shoot/selects/gwpark_sunny_acescg_clipped3.exr
 [hdri-cal] Loaded EXR — interpreted as acescg
 [hdri-cal] Processing at full resolution: 2050×1026
-[hdri-cal] HDRI orientation OK: upper/lower energy ratio = 4.03
+[hdri-cal] Loaded EXR — interpreted as acescg
+[hdri-cal] HDRI orientation OK: upper/lower energy ratio = 4.15
 [hdri-cal] Chart search: auto-searching HDRI (default behaviour — use --wb-source sphere --exposure-source sphere to skip)
 [hdri-cal] Searching for ColorChecker in HDRI latlong (gnomonic tile sweep) ...
 [cc-erp] colour-checker-detection: yes
 [cc-erp] YOLO inference API     : yes
 [cc-erp] YOLO model: \\inferno2\projects\common\home\quw\dev\temp_packages\models\colour-checker-detection-l-seg.pt (88.3 MB)
-[cc-erp] Sweep: 18 tiles  fov=70° step=60° pitch=[-30,90]  yaws=6 pitches=3
+[cc-erp] Thresholds: min_confidence=0.50  early_exit=0.50
+[cc-erp] Sweep: 18 tiles  fov=75° step=65° pitch=[-30,90]  yaws=6 pitches=3
 [cc-erp] tile 1/18  sweep_y000_p+90.jpg  yaw=   0.0° pitch=  90.0° …
-0: 1280x1280 (no detections), 2048.6ms
-Speed: 47.5ms preprocess, 2048.6ms inference, 26.8ms postprocess per image at shape (1, 3, 1280, 1280)
+0: 1280x1280 1 ColorCheckerClassic24, 2051.1ms
+Speed: 49.6ms preprocess, 2051.1ms inference, 37.3ms postprocess per image at shape (1, 3, 1280, 1280)
+[cc-erp] sweep_000: rejected — neutral ramp has 2 inversions
  no detection
-[cc-erp] tile 2/18  sweep_y060_p+90.jpg  yaw=  60.0° pitch=  90.0° …
-0: 1280x1280 (no detections), 2127.6ms
-Speed: 44.2ms preprocess, 2127.6ms inference, 10.7ms postprocess per image at shape (1, 3, 1280, 1280)
+[cc-erp] tile 2/18  sweep_y065_p+90.jpg  yaw=  65.0° pitch=  90.0° …
+0: 1280x1280 (no detections), 2171.6ms
+Speed: 46.2ms preprocess, 2171.6ms inference, 11.0ms postprocess per image at shape (1, 3, 1280, 1280)
  no detection
-[cc-erp] tile 3/18  sweep_y120_p+90.jpg  yaw= 120.0° pitch=  90.0° …
-0: 1280x1280 (no detections), 2055.3ms
-Speed: 46.2ms preprocess, 2055.3ms inference, 10.6ms postprocess per image at shape (1, 3, 1280, 1280)
+[cc-erp] tile 3/18  sweep_y130_p+90.jpg  yaw= 130.0° pitch=  90.0° …
+0: 1280x1280 (no detections), 2030.1ms
+Speed: 50.4ms preprocess, 2030.1ms inference, 11.9ms postprocess per image at shape (1, 3, 1280, 1280)
  no detection
-[cc-erp] tile 4/18  sweep_y180_p+90.jpg  yaw= 180.0° pitch=  90.0° …
-0: 1280x1280 1 ColorCheckerClassic24, 2027.1ms
-Speed: 48.5ms preprocess, 2027.1ms inference, 26.6ms postprocess per image at shape (1, 3, 1280, 1280)
+[cc-erp] tile 4/18  sweep_y195_p+90.jpg  yaw= 195.0° pitch=  90.0° …
+0: 1280x1280 1 ColorCheckerClassic24, 2251.1ms
+Speed: 50.0ms preprocess, 2251.1ms inference, 29.1ms postprocess per image at shape (1, 3, 1280, 1280)
  no detection
-[cc-erp] tile 5/18  sweep_y240_p+90.jpg  yaw= 240.0° pitch=  90.0° …
-0: 1280x1280 (no detections), 2002.0ms
-Speed: 48.3ms preprocess, 2002.0ms inference, 10.8ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 6/18  sweep_y300_p+90.jpg  yaw= 300.0° pitch=  90.0° …
-0: 1280x1280 (no detections), 2071.5ms
-Speed: 49.6ms preprocess, 2071.5ms inference, 10.2ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 7/18  sweep_y000_p+30.jpg  yaw=   0.0° pitch=  30.0° …
-0: 1280x1280 (no detections), 2037.1ms
-Speed: 44.3ms preprocess, 2037.1ms inference, 11.0ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 8/18  sweep_y060_p+30.jpg  yaw=  60.0° pitch=  30.0° …
-0: 1280x1280 1 ColorCheckerClassic24, 2092.3ms
-Speed: 49.4ms preprocess, 2092.3ms inference, 25.7ms postprocess per image at shape (1, 3, 1280, 1280)
- conf=0.586  HIT
-[cc-erp] tile 9/18  sweep_y120_p+30.jpg  yaw= 120.0° pitch=  30.0° …
-0: 1280x1280 (no detections), 2087.9ms
-Speed: 48.3ms preprocess, 2087.9ms inference, 9.9ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 10/18  sweep_y180_p+30.jpg  yaw= 180.0° pitch=  30.0° …
-0: 1280x1280 (no detections), 1922.1ms
-Speed: 47.9ms preprocess, 1922.1ms inference, 10.8ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 11/18  sweep_y240_p+30.jpg  yaw= 240.0° pitch=  30.0° …
-0: 1280x1280 (no detections), 2028.4ms
-Speed: 44.2ms preprocess, 2028.4ms inference, 10.8ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 12/18  sweep_y300_p+30.jpg  yaw= 300.0° pitch=  30.0° …
-0: 1280x1280 (no detections), 2016.7ms
-Speed: 45.9ms preprocess, 2016.7ms inference, 10.9ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 13/18  sweep_y000_p-30.jpg  yaw=   0.0° pitch= -30.0° …
-0: 1280x1280 (no detections), 2305.5ms
-Speed: 58.2ms preprocess, 2305.5ms inference, 11.4ms postprocess per image at shape (1, 3, 1280, 1280)
- no detection
-[cc-erp] tile 14/18  sweep_y060_p-30.jpg  yaw=  60.0° pitch= -30.0° …
+[cc-erp] tile 5/18  sweep_y260_p+90.jpg  yaw= 260.0° pitch=  90.0° …
+0: 1280x1280 1 ColorCheckerClassic24, 2037.7ms
+Speed: 45.3ms preprocess, 2037.7ms inference, 28.9ms postprocess per image at shape (1, 3, 1280, 1280)
+ conf=0.193 < min 0.50 (skip)
+[cc-erp] tile 6/18  sweep_y325_p+90.jpg  yaw= 325.0° pitch=  90.0° …
