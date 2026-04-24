@@ -77,22 +77,25 @@ def _log_backends():
 
 # ─── Colorspace conversions ──────────────────────────────────────────────────
 
+# Precomputed 3×3 matrices from colour.RGB_to_RGB (sRGB↔ACEScg, D65 reference
+# with Bradford CAT to D60 for ACEScg). Direct matmul is ~100× faster than
+# colour.RGB_to_RGB which re-looks-up colorspaces and runs validation each call.
+_M_SRGB_TO_ACESCG = np.array([
+    [ 0.6131324221, 0.3395947780, 0.0472728000],
+    [ 0.0701243812, 0.9163940113, 0.0134816074],
+    [ 0.0205876659, 0.1095745646, 0.8698377695],
+], dtype=np.float32)
+_M_ACESCG_TO_SRGB = np.linalg.inv(_M_SRGB_TO_ACESCG).astype(np.float32)
+
+
 def srgb_linear_to_acescg(img: np.ndarray) -> np.ndarray:
-    if not HAVE_COLOUR:
-        raise RuntimeError("colour-science required for colorspace conversion")
-    return colour.RGB_to_RGB(
-        np.asarray(img, dtype=np.float32), "sRGB", "ACEScg",
-        apply_cctf_decoding=False, apply_cctf_encoding=False,
-    ).astype(np.float32)
+    a = np.asarray(img, dtype=np.float32)
+    return (a.reshape(-1, 3) @ _M_SRGB_TO_ACESCG.T).reshape(a.shape).astype(np.float32)
 
 
 def acescg_to_srgb_linear(img: np.ndarray) -> np.ndarray:
-    if not HAVE_COLOUR:
-        raise RuntimeError("colour-science required for colorspace conversion")
-    return colour.RGB_to_RGB(
-        np.asarray(img, dtype=np.float32), "ACEScg", "sRGB",
-        apply_cctf_decoding=False, apply_cctf_encoding=False,
-    ).astype(np.float32)
+    a = np.asarray(img, dtype=np.float32)
+    return (a.reshape(-1, 3) @ _M_ACESCG_TO_SRGB.T).reshape(a.shape).astype(np.float32)
 
 
 # ─── CC24 reference values (linear sRGB / Rec.709 primaries, D65) ────────────
@@ -364,26 +367,32 @@ def _compute_confidence(swatches_linear: np.ndarray,
         pair_b = 0.5 * (s12 + s30)
         diag["aspect"] = max(pair_a, pair_b) / max(min(pair_a, pair_b), 1e-6)
 
-    # Gate 2: neutral ramp should be monotonically darker from patch 19 (white)
-    # to patch 24 (black). Allow one small inversion (noise), not more.
+    # Gate 2: the 6 neutral patches should correlate strongly with the
+    # reference neutral ramp (white -> black). Use Pearson correlation on
+    # log-luma — robust to HDR clipping and sample noise while still catching
+    # mappings that landed on wrong tiles (random colors don't correlate).
     meas = swatches_linear[18:24]
     ref = cc24_ref[18:24]
     lm = 0.2126 * meas[:, 0] + 0.7152 * meas[:, 1] + 0.0722 * meas[:, 2]
-    diffs = np.diff(lm)  # should be all negative
-    inversions = int(np.sum(diffs > 0))
-    diag["neutral_lum"] = lm.tolist()
-    diag["neutral_inversions"] = inversions
-    if inversions >= 2:
-        return 0.0, {**diag, "reason": f"neutral ramp has {inversions} inversions"}
+    lr = 0.2126 * ref[:, 0] + 0.7152 * ref[:, 1] + 0.0722 * ref[:, 2]
+    lm_log = np.log(np.clip(lm, 1e-6, None))
+    lr_log = np.log(np.clip(lr, 1e-6, None))
+    lm_c = lm_log - lm_log.mean()
+    lr_c = lr_log - lr_log.mean()
+    denom = float(np.sqrt((lm_c * lm_c).sum() * (lr_c * lr_c).sum()))
+    corr = float((lm_c * lr_c).sum() / denom) if denom > 1e-8 else 0.0
+    diag["neutral_lum"] = [float(x) for x in lm]
+    diag["neutral_corr"] = corr
+    if corr < 0.80:
+        return 0.0, {**diag,
+                     "reason": f"neutral ramp correlation {corr:.2f} < 0.80"}
 
     # Score: neutral chroma agreement after per-row grey-card scale.
-    lr = 0.2126 * ref[:, 0] + 0.7152 * ref[:, 1] + 0.0722 * ref[:, 2]
     scale = np.clip(lr / (lm + 1e-8), 0.0, 20.0)[:, None]
     err = float(np.mean(np.abs(meas * scale - ref)))
     score = float(np.clip(1.0 - err * 5.0, 0.0, 1.0))
-    # One inversion: light penalty (still usable but less trusted).
-    if inversions == 1:
-        score *= 0.8
+    # Correlation between 0.80 and 0.95 gets a proportional penalty.
+    score *= float(np.clip((corr - 0.80) / 0.15, 0.0, 1.0)) * 0.3 + 0.7
     diag["chroma_err"] = err
     diag["score"] = score
     return score, diag
@@ -515,6 +524,8 @@ def _detect_in_tile(tile_linear: np.ndarray,
         return None
 
     if masks.shape != (24, 4) or cc_rectified.ndim != 3:
+        print(f"[cc-erp] {tile_label}: bad additional_data shapes "
+              f"masks={masks.shape} rect_ndim={cc_rectified.ndim}")
         return None
 
     H_cc, W_cc = cc_rectified.shape[:2]
@@ -523,6 +534,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
     rect_corners = np.array([[0, 0], [W_cc, 0], [W_cc, H_cc], [0, H_cc]], dtype=np.float32)
     H_rect_to_tile, _ = cv2.findHomography(rect_corners, quad_tile)
     if H_rect_to_tile is None:
+        print(f"[cc-erp] {tile_label}: rectified->tile homography failed")
         return None
 
     pts = np.column_stack([cx_rect, cy_rect, np.ones(24, dtype=np.float32)])
@@ -657,32 +669,42 @@ def find_colorchecker_in_erp(
     best: Optional[CheckerDetection] = None
     searched = 0
 
+    import time as _time
+    save_sweep_tiles = os.environ.get("CC_SAVE_SWEEP_TILES", "0") == "1"
+
     for idx, (yaw, pitch) in enumerate(tiles):
         searched += 1
+        t0 = _time.perf_counter()
         tile, map_uv = erp_to_rectilinear(erp_linear, yaw, pitch, fov, tile_size, tile_size)
+        t_proj = _time.perf_counter() - t0
+
         label = f"sweep_{idx:03d}"
         sweep_fname = f"sweep_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"
         print(f"[cc-erp] tile {idx+1}/{len(tiles)}  {sweep_fname}  "
               f"yaw={yaw:6.1f}° pitch={pitch:6.1f}° …",
               end="", flush=True)
 
-        if debug_dir:
+        if debug_dir and save_sweep_tiles:
             u8 = _linear_to_u8_for_display(tile)
             bgr = cv2.cvtColor(u8, cv2.COLOR_RGB2BGR)
             cv2.putText(bgr, f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={fov:.0f}",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
             cv2.imwrite(os.path.join(debug_dir, sweep_fname), bgr)
 
+        t1 = _time.perf_counter()
         det = _detect_in_tile(tile, map_uv, yaw, pitch, fov, cc24_ref,
                               debug_dir=debug_dir, tile_label=label,
                               save_debug=bool(debug_dir))
+        t_det = _time.perf_counter() - t1
+        t_total = _time.perf_counter() - t0
         if det is None:
-            print(" no detection")
+            print(f" no detection  [{t_total:.1f}s proj={t_proj*1000:.0f}ms det={t_det:.1f}s]")
             continue
         if det.confidence < min_confidence:
-            print(f" conf={det.confidence:.3f} < min {min_confidence:.2f} (skip)")
+            print(f" conf={det.confidence:.3f} < min {min_confidence:.2f} (skip)"
+                  f"  [{t_total:.1f}s]")
             continue
-        print(f" conf={det.confidence:.3f}  HIT")
+        print(f" conf={det.confidence:.3f}  HIT  [{t_total:.1f}s]")
         if best is None or det.confidence > best.confidence:
             best = det
         # Early exit: a confident detection beats finishing the sweep.
