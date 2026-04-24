@@ -460,9 +460,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
         # Assume detector reformatted space — rescale by max-dim ratio.
         det_scale = qmax / max(float(out_w), float(out_h), 1.0)
         quad_tile = quad_raw / max(det_scale, 1e-6)
-    # Don't reorder quad_tile — the detector returns corners in the same
-    # order as its swatch_masks / rectified image, and reordering can break
-    # the rectified→tile homography for rotated charts.
+    # Order the quad as TL,TR,BR,BL so it pairs with the library's rectified
+    # image corners (0,0),(W,0),(W,H),(0,H) — the pre-refactor code relied on
+    # this and skipping it breaks the homography for many rotations.
+    quad_tile = _order_quad_tl_tr_br_bl(quad_tile)
 
     # Early aspect gate (orientation-invariant): CC24 is 1.5:1, but a rotated
     # detection could legitimately present as 0.67:1. Compare pairs of
@@ -524,10 +525,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
         print(f"[cc-erp] {tile_label}: rejected — {conf_diag.get('reason', 'score=0')}")
         return None
 
-    # Pose estimation needs TL,TR,BR,BL ordering — safe to derive a reordered
-    # copy here; homography above already used the detector's native order.
-    normal_world = _estimate_checker_pose(_order_quad_tl_tr_br_bl(quad_tile),
-                                          out_w, out_h,
+    normal_world = _estimate_checker_pose(quad_tile, out_w, out_h,
                                           yaw, pitch, tile_fov_deg)
     theta_n = float(np.degrees(np.arccos(np.clip(normal_world[1], -1, 1))))
     phi_n = float(np.degrees(np.arctan2(normal_world[0], normal_world[2])))
@@ -637,9 +635,10 @@ def find_colorchecker_in_erp(
         searched += 1
         tile, map_uv = erp_to_rectilinear(erp_linear, yaw, pitch, fov, tile_size, tile_size)
         label = f"sweep_{idx:03d}"
+        print(f"[cc-erp] tile {idx+1}/{len(tiles)}  yaw={yaw:6.1f}° pitch={pitch:6.1f}° …",
+              end="", flush=True)
 
         if debug_dir:
-            # Save raw sweep tile for visual inspection / for cc_debug re-testing.
             u8 = _linear_to_u8_for_display(tile)
             bgr = cv2.cvtColor(u8, cv2.COLOR_RGB2BGR)
             cv2.putText(bgr, f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={fov:.0f}",
@@ -649,12 +648,15 @@ def find_colorchecker_in_erp(
         det = _detect_in_tile(tile, map_uv, yaw, pitch, fov, cc24_ref,
                               debug_dir=debug_dir, tile_label=label,
                               save_debug=bool(debug_dir))
-        if det is None or det.confidence < min_confidence:
+        if det is None:
+            print(" no detection")
             continue
+        if det.confidence < min_confidence:
+            print(f" conf={det.confidence:.3f} < min {min_confidence:.2f} (skip)")
+            continue
+        print(f" conf={det.confidence:.3f}  HIT")
         if best is None or det.confidence > best.confidence:
             best = det
-            print(f"[cc-erp]  hit  tile={idx} yaw={yaw:.0f}° pitch={pitch:.0f}° "
-                  f"conf={det.confidence:.3f}")
         # Early exit: a confident detection beats finishing the sweep.
         # The recenter passes will refine geometry anyway.
         if best.confidence >= early_exit_confidence:
