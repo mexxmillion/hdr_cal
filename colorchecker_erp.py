@@ -397,12 +397,17 @@ def _detect_in_tile(tile_linear: np.ndarray,
     if not HAVE_YOLO:
         return None
 
+    import time as _time
+    _t = {}
+    _t0 = _time.perf_counter()
+
     out_h, out_w = tile_linear.shape[:2]
 
     # Display-map the HDR tile exactly like a JPG would look — that's YOLO's
     # training distribution. Feed float32 [0,1] with apply_cctf_decoding=True.
     tile_u8 = _linear_to_u8_for_display(tile_linear)
     tile_f = tile_u8.astype(np.float32) / 255.0
+    _t["display_map"] = _time.perf_counter() - _t0; _tm = _time.perf_counter()
 
     try:
         results = ccd.detect_colour_checkers_inference(
@@ -410,8 +415,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
     except Exception as e:
         print(f"[cc-erp] YOLO error on {tile_label}: {e}")
         return None
+    _t["yolo"] = _time.perf_counter() - _tm; _tm = _time.perf_counter()
 
     if not results:
+        print(f"[cc-erp] {tile_label}: YOLO raw hit but library returned 0 detections")
         return None
 
     det = results[0]
@@ -481,9 +488,11 @@ def _detect_in_tile(tile_linear: np.ndarray,
         print(f"[cc-erp] {tile_label}: tile->rect homography failed")
         return None
 
+    _t["setup"] = _time.perf_counter() - _tm; _tm = _time.perf_counter()
     rect_hdr = cv2.warpPerspective(tile_linear, H_tile_to_rect, (W_cc, H_cc),
                                    flags=cv2.INTER_LINEAR,
                                    borderMode=cv2.BORDER_REPLICATE)
+    _t["warp"] = _time.perf_counter() - _tm; _tm = _time.perf_counter()
 
     swatches_wcs = np.zeros((24, 3), dtype=np.float32)
     centres_rect = np.zeros((24, 2), dtype=np.float32)
@@ -506,10 +515,25 @@ def _detect_in_tile(tile_linear: np.ndarray,
     centres_uv = np.array([backproject_pixel_to_erp(cx, cy, map_uv)
                            for cx, cy in centres_tile], dtype=np.float32)
 
+    _t["sample"] = _time.perf_counter() - _tm; _tm = _time.perf_counter()
+
     confidence, conf_diag = _compute_confidence(swatches_wcs, cc24_ref, quad_tile)
+    _t["confidence"] = _time.perf_counter() - _tm
     if confidence <= 0.0:
-        print(f"[cc-erp] {tile_label}: rejected — {conf_diag.get('reason', 'score=0')}")
+        print(f"[cc-erp] {tile_label}: rejected conf=0 — "
+              f"{conf_diag.get('reason', 'score=0')}  "
+              f"(aspect={conf_diag.get('aspect', 0):.2f} "
+              f"corr={conf_diag.get('neutral_corr', 0):.2f} "
+              f"chroma_err={conf_diag.get('chroma_err', float('nan')):.3f})")
         return None
+    print(f"[cc-erp] {tile_label}: conf={confidence:.3f} "
+          f"aspect={conf_diag.get('aspect', 0):.2f} "
+          f"corr={conf_diag.get('neutral_corr', 0):.2f} "
+          f"chroma_err={conf_diag.get('chroma_err', float('nan')):.3f} "
+          f"[disp={_t['display_map']*1000:.0f}ms "
+          f"yolo={_t['yolo']:.2f}s "
+          f"warp={_t['warp']*1000:.0f}ms "
+          f"sample={_t['sample']*1000:.0f}ms]")
 
     # Pose needs TL,TR,BR,BL — safe to reorder here since the quad's link to
     # swatch_masks/rect_corners has already been consumed by the homography.
