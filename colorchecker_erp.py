@@ -338,20 +338,16 @@ def _compute_confidence(swatches_linear: np.ndarray,
 
     diag = {}
 
-    # Gate 1: quad aspect ratio must be close to CC24's 1.5:1.
+    # Aspect gate is now done pre-sampling in _detect_in_tile (orientation
+    # invariant). Record it for diagnostics only.
     if quad_tile is not None and quad_tile.shape == (4, 2):
-        tl, tr, br, bl = _order_quad_tl_tr_br_bl(quad_tile)
-        w_top = float(np.linalg.norm(tr - tl))
-        w_bot = float(np.linalg.norm(br - bl))
-        h_lft = float(np.linalg.norm(bl - tl))
-        h_rgt = float(np.linalg.norm(br - tr))
-        w_avg = 0.5 * (w_top + w_bot)
-        h_avg = 0.5 * (h_lft + h_rgt)
-        aspect = w_avg / max(h_avg, 1e-6)
-        # CC24 is 6×4 patches → ~1.5 aspect. Allow [1.15, 1.95] before rejecting.
-        diag["aspect"] = aspect
-        if aspect < 1.15 or aspect > 1.95:
-            return 0.0, {**diag, "reason": f"aspect {aspect:.2f} outside [1.15, 1.95]"}
+        s01 = float(np.linalg.norm(quad_tile[1] - quad_tile[0]))
+        s12 = float(np.linalg.norm(quad_tile[2] - quad_tile[1]))
+        s23 = float(np.linalg.norm(quad_tile[3] - quad_tile[2]))
+        s30 = float(np.linalg.norm(quad_tile[0] - quad_tile[3]))
+        pair_a = 0.5 * (s01 + s23)
+        pair_b = 0.5 * (s12 + s30)
+        diag["aspect"] = max(pair_a, pair_b) / max(min(pair_a, pair_b), 1e-6)
 
     # Gate 2: neutral ramp should be monotonically darker from patch 19 (white)
     # to patch 24 (black). Allow one small inversion (noise), not more.
@@ -464,14 +460,22 @@ def _detect_in_tile(tile_linear: np.ndarray,
         # Assume detector reformatted space — rescale by max-dim ratio.
         det_scale = qmax / max(float(out_w), float(out_h), 1.0)
         quad_tile = quad_raw / max(det_scale, 1e-6)
-    quad_tile = _order_quad_tl_tr_br_bl(quad_tile)
+    # Don't reorder quad_tile — the detector returns corners in the same
+    # order as its swatch_masks / rectified image, and reordering can break
+    # the rectified→tile homography for rotated charts.
 
-    # Early aspect gate: CC24 is 1.5:1. A partial-chart hit often has a far
-    # squarer or wildly elongated quad. Skip expensive sampling if so.
-    _tl, _tr, _br, _bl = quad_tile
-    _w = 0.5 * (float(np.linalg.norm(_tr - _tl)) + float(np.linalg.norm(_br - _bl)))
-    _h = 0.5 * (float(np.linalg.norm(_bl - _tl)) + float(np.linalg.norm(_br - _tr)))
-    _aspect = _w / max(_h, 1e-6)
+    # Early aspect gate (orientation-invariant): CC24 is 1.5:1, but a rotated
+    # detection could legitimately present as 0.67:1. Compare pairs of
+    # opposite sides and take the longer/shorter ratio.
+    _s01 = float(np.linalg.norm(quad_tile[1] - quad_tile[0]))
+    _s12 = float(np.linalg.norm(quad_tile[2] - quad_tile[1]))
+    _s23 = float(np.linalg.norm(quad_tile[3] - quad_tile[2]))
+    _s30 = float(np.linalg.norm(quad_tile[0] - quad_tile[3]))
+    _pair_a = 0.5 * (_s01 + _s23)
+    _pair_b = 0.5 * (_s12 + _s30)
+    _long = max(_pair_a, _pair_b)
+    _short = max(min(_pair_a, _pair_b), 1e-6)
+    _aspect = _long / _short
     if _aspect < 1.15 or _aspect > 1.95:
         print(f"[cc-erp] {tile_label}: reject quad aspect {_aspect:.2f} (want ~1.5)")
         return None
@@ -520,7 +524,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
         print(f"[cc-erp] {tile_label}: rejected — {conf_diag.get('reason', 'score=0')}")
         return None
 
-    normal_world = _estimate_checker_pose(quad_tile, out_w, out_h,
+    # Pose estimation needs TL,TR,BR,BL ordering — safe to derive a reordered
+    # copy here; homography above already used the detector's native order.
+    normal_world = _estimate_checker_pose(_order_quad_tl_tr_br_bl(quad_tile),
+                                          out_w, out_h,
                                           yaw, pitch, tile_fov_deg)
     theta_n = float(np.degrees(np.arccos(np.clip(normal_world[1], -1, 1))))
     phi_n = float(np.degrees(np.arctan2(normal_world[0], normal_world[2])))
