@@ -1561,9 +1561,10 @@ def main():
     ap.add_argument("--cc-min-confidence", type=float, default=0.55,
                     help="Minimum confidence for a tile detection to be kept "
                          "(default 0.55). Raise to reject partial-chart detections.")
-    ap.add_argument("--cc-early-exit-confidence", type=float, default=0.75,
+    ap.add_argument("--cc-early-exit-confidence", type=float, default=0.55,
                     help="Sweep stops as soon as a tile scores at or above this "
-                         "(default 0.75). Raise to keep searching for better tiles.")
+                         "(default 0.55, matches --cc-min-confidence so first hit "
+                         "ends the sweep). Raise above min to keep searching.")
 
     # ── Validate-only mode ────────────────────────────────────────────────
     ap.add_argument("--validate-only", action="store_true", default=False,

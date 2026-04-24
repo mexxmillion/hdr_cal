@@ -581,7 +581,7 @@ def find_colorchecker_in_erp(
     sweep_max_pitch: float = 90.0,
     tile_size: int = 1024,
     min_confidence: float = 0.55,
-    early_exit_confidence: float = 0.75,
+    early_exit_confidence: float = 0.55,
     # kept for API compatibility (no-ops in YOLO-only mode):
     read_backend: str = "yolo",
     compare_backends: bool = False,
@@ -603,6 +603,12 @@ def find_colorchecker_in_erp(
 
     _log_backends()
     cc24_ref = get_cc24_reference(colorspace)
+
+    # Early-exit must not be stricter than min_confidence — otherwise the
+    # sweep keeps running past valid hits that the user already accepted.
+    early_exit_confidence = max(float(early_exit_confidence), float(min_confidence))
+    print(f"[cc-erp] Thresholds: min_confidence={min_confidence:.2f}  "
+          f"early_exit={early_exit_confidence:.2f}")
 
     # Build sweep grid: nadir-first, 360° yaw, configurable pitch band.
     fov = float(np.clip(sweep_fov, 30.0, 140.0))

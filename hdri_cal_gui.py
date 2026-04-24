@@ -225,7 +225,7 @@ class PipelineConfig:
     sweep_min_pitch:    float = -30.0
     sweep_max_pitch:    float = 90.0
     cc_min_confidence:  float = 0.55
-    cc_early_exit_confidence: float = 0.75
+    cc_early_exit_confidence: float = 0.55
 
 
 
@@ -273,7 +273,7 @@ def config_to_namespace(cfg: PipelineConfig):
         "cc_read_backend":      "colour",
         "cc_compare_backends":  False,
         "cc_min_confidence":    0.55,
-        "cc_early_exit_confidence": 0.75,
+        "cc_early_exit_confidence": 0.55,
         "validate_only":        False,
     }
     for attr, default in _defaults.items():
@@ -766,10 +766,12 @@ class SettingsPanel(QScrollArea):
         self.cc_early_exit_confidence.setRange(0.0, 1.0)
         self.cc_early_exit_confidence.setSingleStep(0.05)
         self.cc_early_exit_confidence.setDecimals(2)
-        self.cc_early_exit_confidence.setValue(0.75)
+        self.cc_early_exit_confidence.setValue(0.55)
         self.cc_early_exit_confidence.setToolTip(
             "Sweep stops when a tile scores at or above this (0-1). "
-            "Raise to keep searching every tile for the best detection.")
+            "Default matches Min confidence so the first accepted hit ends "
+            "the sweep. Raise it above Min to keep searching for a better "
+            "tile before stopping. Clamped to >= Min at runtime.")
         f.addRow("Sweep FOV",       self.sweep_fov)
         f.addRow("Sweep overlap",   self.sweep_overlap)
         f.addRow("Min pitch",       self.sweep_min_pitch)
