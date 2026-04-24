@@ -278,63 +278,6 @@ def _order_quad_tl_tr_br_bl(poly: np.ndarray) -> np.ndarray:
                      q[np.argmax(s)], q[np.argmax(d)]], dtype=np.float32)
 
 
-def _sample_swatches_at_centres(tile_linear: np.ndarray,
-                                centres: np.ndarray,
-                                sample_frac: float = 0.30,
-                                K: int = 5) -> np.ndarray:
-    """Sample 24 swatches as K×K block averages around each centre.
-
-    Block size and orientation are derived from neighbour-centre distances
-    in row-major CC24 order (swatch i and i+1 are adjacent columns; swatch i
-    and i+6 are adjacent rows). This is independent of quadrilateral
-    ordering and robust to any chart rotation.
-    """
-    c = np.asarray(centres, dtype=np.float32).reshape(24, 2)
-
-    # Row-direction vector = average of (next col) - (this col) for each pair
-    # within a row. Col-direction similarly.
-    rows_idx = np.array([[r*6 + cc for cc in range(6)] for r in range(4)])
-    # Horizontal neighbour deltas (within rows)
-    dh = []
-    for r in range(4):
-        for cc in range(5):
-            dh.append(c[rows_idx[r, cc+1]] - c[rows_idx[r, cc]])
-    dh = np.mean(dh, axis=0)
-    # Vertical neighbour deltas (within columns)
-    dv = []
-    for cc in range(6):
-        for r in range(3):
-            dv.append(c[rows_idx[r+1, cc]] - c[rows_idx[r, cc]])
-    dv = np.mean(dv, axis=0)
-
-    cell_w = float(np.linalg.norm(dh))
-    cell_h = float(np.linalg.norm(dv))
-    ux = dh / max(cell_w, 1e-8)
-    uy = dv / max(cell_h, 1e-8)
-    half_w = cell_w * sample_frac
-    half_h = cell_h * sample_frac
-    offs = np.linspace(-1.0, 1.0, K, dtype=np.float32)
-
-    pts_x = np.empty(24 * K * K, dtype=np.float32)
-    pts_y = np.empty(24 * K * K, dtype=np.float32)
-    idx = 0
-    for cx, cy in c:
-        for oy in offs:
-            for ox in offs:
-                dx = ux[0] * (ox * half_w) + uy[0] * (oy * half_h)
-                dy = ux[1] * (ox * half_w) + uy[1] * (oy * half_h)
-                pts_x[idx] = cx + dx
-                pts_y[idx] = cy + dy
-                idx += 1
-
-    samples = cv2.remap(tile_linear,
-                        pts_x.reshape(1, -1), pts_y.reshape(1, -1),
-                        interpolation=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REPLICATE)
-    samples = samples.reshape(24, K * K, 3)
-    return samples.mean(axis=1).astype(np.float32)
-
-
 def _compute_confidence(swatches_linear: np.ndarray,
                         cc24_ref: np.ndarray,
                         quad_tile: Optional[np.ndarray] = None) -> Tuple[float, dict]:
@@ -528,23 +471,37 @@ def _detect_in_tile(tile_linear: np.ndarray,
               f"masks={masks.shape} rect_ndim={cc_rectified.ndim}")
         return None
 
+    # Mirror what the library does — rectify the chart with its own quad,
+    # then read swatches at its own bbox masks — except do it on the HDR
+    # linear tile so the values stay scene-referred instead of tonemapped.
     H_cc, W_cc = cc_rectified.shape[:2]
-    cx_rect = (masks[:, 2] + masks[:, 3]) * 0.5
-    cy_rect = (masks[:, 0] + masks[:, 1]) * 0.5
     rect_corners = np.array([[0, 0], [W_cc, 0], [W_cc, H_cc], [0, H_cc]], dtype=np.float32)
-    H_rect_to_tile, _ = cv2.findHomography(rect_corners, quad_tile)
-    if H_rect_to_tile is None:
-        print(f"[cc-erp] {tile_label}: rectified->tile homography failed")
+    H_tile_to_rect, _ = cv2.findHomography(quad_tile, rect_corners)
+    if H_tile_to_rect is None:
+        print(f"[cc-erp] {tile_label}: tile->rect homography failed")
         return None
 
-    pts = np.column_stack([cx_rect, cy_rect, np.ones(24, dtype=np.float32)])
+    rect_hdr = cv2.warpPerspective(tile_linear, H_tile_to_rect, (W_cc, H_cc),
+                                   flags=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_REPLICATE)
+
+    swatches_wcs = np.zeros((24, 3), dtype=np.float32)
+    centres_rect = np.zeros((24, 2), dtype=np.float32)
+    for i in range(24):
+        y0, y1, x0, x1 = masks[i].astype(np.int32)
+        y0 = max(0, y0); x0 = max(0, x0)
+        y1 = min(H_cc, y1); x1 = min(W_cc, x1)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        patch = rect_hdr[y0:y1, x0:x1]
+        swatches_wcs[i] = patch.reshape(-1, 3).mean(axis=0)
+        centres_rect[i] = [(x0 + x1) * 0.5, (y0 + y1) * 0.5]
+
+    # Map the bbox centres back to the tile only for debug visualisation.
+    H_rect_to_tile = np.linalg.inv(H_tile_to_rect)
+    pts = np.column_stack([centres_rect[:, 0], centres_rect[:, 1], np.ones(24, np.float32)])
     mapped = (H_rect_to_tile @ pts.T).T
     centres_tile = (mapped[:, :2] / np.clip(mapped[:, 2:3], 1e-8, None)).astype(np.float32)
-
-    # Sample HDR scene-linear values at the detector-provided centres.
-    # (The lib's det.swatch_colours is in the tonemapped u8 input space, not
-    # useful for HDR calibration — that's why we re-sample the linear tile.)
-    swatches_wcs = _sample_swatches_at_centres(tile_linear, centres_tile)
 
     centres_uv = np.array([backproject_pixel_to_erp(cx, cy, map_uv)
                            for cx, cy in centres_tile], dtype=np.float32)
