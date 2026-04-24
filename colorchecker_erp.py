@@ -277,30 +277,45 @@ def _order_quad_tl_tr_br_bl(poly: np.ndarray) -> np.ndarray:
 
 def _sample_swatches_at_centres(tile_linear: np.ndarray,
                                 centres: np.ndarray,
-                                quad: np.ndarray,
                                 sample_frac: float = 0.30,
                                 K: int = 5) -> np.ndarray:
     """Sample 24 swatches as K×K block averages around each centre.
-    Block size scales with the local cell footprint derived from the quad.
-    Returns (24, 3) float in tile colorspace.
+
+    Block size and orientation are derived from neighbour-centre distances
+    in row-major CC24 order (swatch i and i+1 are adjacent columns; swatch i
+    and i+6 are adjacent rows). This is independent of quadrilateral
+    ordering and robust to any chart rotation.
     """
-    tl, tr, br, bl = _order_quad_tl_tr_br_bl(quad)
-    cell_w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) * 0.5 / 6.0
-    cell_h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) * 0.5 / 4.0
+    c = np.asarray(centres, dtype=np.float32).reshape(24, 2)
+
+    # Row-direction vector = average of (next col) - (this col) for each pair
+    # within a row. Col-direction similarly.
+    rows_idx = np.array([[r*6 + cc for cc in range(6)] for r in range(4)])
+    # Horizontal neighbour deltas (within rows)
+    dh = []
+    for r in range(4):
+        for cc in range(5):
+            dh.append(c[rows_idx[r, cc+1]] - c[rows_idx[r, cc]])
+    dh = np.mean(dh, axis=0)
+    # Vertical neighbour deltas (within columns)
+    dv = []
+    for cc in range(6):
+        for r in range(3):
+            dv.append(c[rows_idx[r+1, cc]] - c[rows_idx[r, cc]])
+    dv = np.mean(dv, axis=0)
+
+    cell_w = float(np.linalg.norm(dh))
+    cell_h = float(np.linalg.norm(dv))
+    ux = dh / max(cell_w, 1e-8)
+    uy = dv / max(cell_h, 1e-8)
     half_w = cell_w * sample_frac
     half_h = cell_h * sample_frac
     offs = np.linspace(-1.0, 1.0, K, dtype=np.float32)
 
-    # Build sample grid per centre along quad-aligned axes
-    ux = (tr - tl)
-    ux /= max(float(np.linalg.norm(ux)), 1e-8)
-    uy = (bl - tl)
-    uy /= max(float(np.linalg.norm(uy)), 1e-8)
-
     pts_x = np.empty(24 * K * K, dtype=np.float32)
     pts_y = np.empty(24 * K * K, dtype=np.float32)
     idx = 0
-    for cx, cy in centres:
+    for cx, cy in c:
         for oy in offs:
             for ox in offs:
                 dx = ux[0] * (ox * half_w) + uy[0] * (oy * half_h)
@@ -460,10 +475,12 @@ def _detect_in_tile(tile_linear: np.ndarray,
         # Assume detector reformatted space — rescale by max-dim ratio.
         det_scale = qmax / max(float(out_w), float(out_h), 1.0)
         quad_tile = quad_raw / max(det_scale, 1e-6)
-    # Order the quad as TL,TR,BR,BL so it pairs with the library's rectified
-    # image corners (0,0),(W,0),(W,H),(0,H) — the pre-refactor code relied on
-    # this and skipping it breaks the homography for many rotations.
-    quad_tile = _order_quad_tl_tr_br_bl(quad_tile)
+    # DO NOT reorder quad_tile. The library returns quadrilateral in a
+    # canonical order paired 1:1 with its rectified image corners, and
+    # with swatch_masks. Reordering by image-space TL/TR/BR/BL rotates the
+    # mapping whenever the chart isn't axis-aligned, which sends swatch
+    # centres to the wrong patches. Pose estimation needs TL,TR,BR,BL, so
+    # we reorder only a local copy for that call.
 
     # Early aspect gate (orientation-invariant): CC24 is 1.5:1, but a rotated
     # detection could legitimately present as 0.67:1. Compare pairs of
@@ -515,7 +532,7 @@ def _detect_in_tile(tile_linear: np.ndarray,
     # Sample HDR scene-linear values at the detector-provided centres.
     # (The lib's det.swatch_colours is in the tonemapped u8 input space, not
     # useful for HDR calibration — that's why we re-sample the linear tile.)
-    swatches_wcs = _sample_swatches_at_centres(tile_linear, centres_tile, quad_tile)
+    swatches_wcs = _sample_swatches_at_centres(tile_linear, centres_tile)
 
     centres_uv = np.array([backproject_pixel_to_erp(cx, cy, map_uv)
                            for cx, cy in centres_tile], dtype=np.float32)
@@ -525,7 +542,10 @@ def _detect_in_tile(tile_linear: np.ndarray,
         print(f"[cc-erp] {tile_label}: rejected — {conf_diag.get('reason', 'score=0')}")
         return None
 
-    normal_world = _estimate_checker_pose(quad_tile, out_w, out_h,
+    # Pose needs TL,TR,BR,BL — safe to reorder here since the quad's link to
+    # swatch_masks/rect_corners has already been consumed by the homography.
+    normal_world = _estimate_checker_pose(_order_quad_tl_tr_br_bl(quad_tile),
+                                          out_w, out_h,
                                           yaw, pitch, tile_fov_deg)
     theta_n = float(np.degrees(np.arccos(np.clip(normal_world[1], -1, 1))))
     phi_n = float(np.degrees(np.arctan2(normal_world[0], normal_world[2])))
