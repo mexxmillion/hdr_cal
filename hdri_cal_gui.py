@@ -220,12 +220,12 @@ class PipelineConfig:
     sun_gain_rolloff:   float = 500.0
 
     # Chart sweep
-    sweep_fov:          float = 50.0
+    sweep_fov:          float = 70.0
     sweep_overlap:      float = 10.0
     sweep_min_pitch:    float = -30.0
     sweep_max_pitch:    float = 90.0
-    cc_min_confidence:  float = 0.55
-    cc_early_exit_confidence: float = 0.55
+    cc_min_confidence:  float = 0.50
+    cc_early_exit_confidence: float = 0.50
 
 
 
@@ -272,8 +272,8 @@ def config_to_namespace(cfg: PipelineConfig):
         "colorchecker_in_hdri": False,
         "cc_read_backend":      "colour",
         "cc_compare_backends":  False,
-        "cc_min_confidence":    0.55,
-        "cc_early_exit_confidence": 0.55,
+        "cc_min_confidence":    0.50,
+        "cc_early_exit_confidence": 0.50,
         "validate_only":        False,
     }
     for attr, default in _defaults.items():
@@ -731,7 +731,7 @@ class SettingsPanel(QScrollArea):
         f = QFormLayout(grp)
         self.sweep_fov = QDoubleSpinBox()
         self.sweep_fov.setRange(30.0, 140.0)
-        self.sweep_fov.setValue(50.0)
+        self.sweep_fov.setValue(70.0)
         self.sweep_fov.setDecimals(0)
         self.sweep_fov.setSuffix("°")
         self.sweep_fov.setToolTip("Tile field of view for chart sweep")
@@ -757,16 +757,16 @@ class SettingsPanel(QScrollArea):
         self.cc_min_confidence.setRange(0.0, 1.0)
         self.cc_min_confidence.setSingleStep(0.05)
         self.cc_min_confidence.setDecimals(2)
-        self.cc_min_confidence.setValue(0.55)
+        self.cc_min_confidence.setValue(0.50)
         self.cc_min_confidence.setToolTip(
             "Minimum detection confidence (neutral-ramp chroma agreement, 0-1). "
             "Raise to reject partial-chart detections that produce wrong "
-            "rectified pose and bad swatches. 0.55 default, 0.75+ strict.")
+            "rectified pose and bad swatches. 0.50 default, 0.75+ strict.")
         self.cc_early_exit_confidence = QDoubleSpinBox()
         self.cc_early_exit_confidence.setRange(0.0, 1.0)
         self.cc_early_exit_confidence.setSingleStep(0.05)
         self.cc_early_exit_confidence.setDecimals(2)
-        self.cc_early_exit_confidence.setValue(0.55)
+        self.cc_early_exit_confidence.setValue(0.50)
         self.cc_early_exit_confidence.setToolTip(
             "Sweep stops when a tile scores at or above this (0-1). "
             "Default matches Min confidence so the first accepted hit ends "
@@ -1078,12 +1078,12 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.setValue(float(getattr(cfg, "lobe_neutralise", 1.0)))
             self._settings.sun_gain_ceiling.setValue(float(getattr(cfg, "sun_gain_ceiling", 2000.0)))
             self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
-            self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 50.0)))
+            self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 70.0)))
             self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 10.0)))
             self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -30.0)))
             self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 90.0)))
-            self._settings.cc_min_confidence.setValue(float(getattr(cfg, "cc_min_confidence", 0.55)))
-            self._settings.cc_early_exit_confidence.setValue(float(getattr(cfg, "cc_early_exit_confidence", 0.75)))
+            self._settings.cc_min_confidence.setValue(float(getattr(cfg, "cc_min_confidence", 0.50)))
+            self._settings.cc_early_exit_confidence.setValue(float(getattr(cfg, "cc_early_exit_confidence", 0.50)))
             self._settings._sync_calibration_mode()
         finally:
             self._syncing_settings = False

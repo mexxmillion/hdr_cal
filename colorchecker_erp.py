@@ -564,13 +564,13 @@ def find_colorchecker_in_erp(
     erp_linear: np.ndarray,
     colorspace: str = "acescg",
     debug_dir: Optional[str] = None,
-    sweep_fov: float = 50.0,
+    sweep_fov: float = 70.0,
     sweep_overlap: float = 10.0,
     sweep_min_pitch: float = -30.0,
     sweep_max_pitch: float = 90.0,
     tile_size: int = 1024,
-    min_confidence: float = 0.55,
-    early_exit_confidence: float = 0.55,
+    min_confidence: float = 0.50,
+    early_exit_confidence: float = 0.50,
     # kept for API compatibility (no-ops in YOLO-only mode):
     read_backend: str = "yolo",
     compare_backends: bool = False,
@@ -627,7 +627,6 @@ def find_colorchecker_in_erp(
     searched = 0
 
     import time as _time
-    save_sweep_tiles = os.environ.get("CC_SAVE_SWEEP_TILES", "0") == "1"
 
     for idx, (yaw, pitch) in enumerate(tiles):
         searched += 1
@@ -641,7 +640,7 @@ def find_colorchecker_in_erp(
               f"yaw={yaw:6.1f}° pitch={pitch:6.1f}° …",
               end="", flush=True)
 
-        if debug_dir and save_sweep_tiles:
+        if debug_dir:
             u8 = _linear_to_u8_for_display(tile)
             bgr = cv2.cvtColor(u8, cv2.COLOR_RGB2BGR)
             cv2.putText(bgr, f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={fov:.0f}",

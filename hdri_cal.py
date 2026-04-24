@@ -1550,20 +1550,20 @@ def main():
                          "'contour' uses a contour-fit quad, and 'auto' compares both and keeps the better-agreeing read.")
     ap.add_argument("--cc-compare-backends", action="store_true", default=False,
                     help="Save backend comparison overlays for the ColorChecker read stage.")
-    ap.add_argument("--sweep-fov", type=float, default=50.0,
-                    help="Chart sweep tile FOV in degrees (default 50)")
+    ap.add_argument("--sweep-fov", type=float, default=70.0,
+                    help="Chart sweep tile FOV in degrees (default 70)")
     ap.add_argument("--sweep-overlap", type=float, default=10.0,
                     help="Overlap between sweep tiles in degrees (default 10)")
     ap.add_argument("--sweep-min-pitch", type=float, default=-30.0,
                     help="Lowest sweep pitch, -90=zenith (default -30, skips top dome)")
     ap.add_argument("--sweep-max-pitch", type=float, default=90.0,
                     help="Highest sweep pitch, +90=nadir/ground (default 90)")
-    ap.add_argument("--cc-min-confidence", type=float, default=0.55,
+    ap.add_argument("--cc-min-confidence", type=float, default=0.50,
                     help="Minimum confidence for a tile detection to be kept "
-                         "(default 0.55). Raise to reject partial-chart detections.")
-    ap.add_argument("--cc-early-exit-confidence", type=float, default=0.55,
+                         "(default 0.50). Raise to reject partial-chart detections.")
+    ap.add_argument("--cc-early-exit-confidence", type=float, default=0.50,
                     help="Sweep stops as soon as a tile scores at or above this "
-                         "(default 0.55, matches --cc-min-confidence so first hit "
+                         "(default 0.50, matches --cc-min-confidence so first hit "
                          "ends the sweep). Raise above min to keep searching.")
 
     # ── Validate-only mode ────────────────────────────────────────────────
