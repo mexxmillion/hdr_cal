@@ -635,7 +635,9 @@ def find_colorchecker_in_erp(
         searched += 1
         tile, map_uv = erp_to_rectilinear(erp_linear, yaw, pitch, fov, tile_size, tile_size)
         label = f"sweep_{idx:03d}"
-        print(f"[cc-erp] tile {idx+1}/{len(tiles)}  yaw={yaw:6.1f}° pitch={pitch:6.1f}° …",
+        sweep_fname = f"sweep_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"
+        print(f"[cc-erp] tile {idx+1}/{len(tiles)}  {sweep_fname}  "
+              f"yaw={yaw:6.1f}° pitch={pitch:6.1f}° …",
               end="", flush=True)
 
         if debug_dir:
@@ -643,7 +645,7 @@ def find_colorchecker_in_erp(
             bgr = cv2.cvtColor(u8, cv2.COLOR_RGB2BGR)
             cv2.putText(bgr, f"sweep yaw={yaw:.0f} pitch={pitch:.0f} fov={fov:.0f}",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-            cv2.imwrite(os.path.join(debug_dir, f"sweep_y{int(yaw):03d}_p{int(pitch):+03d}.jpg"), bgr)
+            cv2.imwrite(os.path.join(debug_dir, sweep_fname), bgr)
 
         det = _detect_in_tile(tile, map_uv, yaw, pitch, fov, cc24_ref,
                               debug_dir=debug_dir, tile_label=label,
