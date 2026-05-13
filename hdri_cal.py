@@ -1679,16 +1679,6 @@ def _run_validate_only(args, img, meta):
             f"Possible clamping: {clip_frac:.3%} of pixels at/near max luma "
             f"({lum_max:.2f}).  Headroom ratio: {headroom:.2f}× "
             f"({'likely clipped' if headroom < 1.05 else 'some headroom'})")
-    if chroma_imbal > 0.12:
-        warnings.append(
-            f"Upper-hemi chroma imbalance {chroma_imbal:.3f} > 0.12 "
-            f"— coloured illuminant (golden hour / overcast coloured sky). "
-            f"")
-    if chroma_imbal > 0.05:
-        warnings.append(
-            f"Upper-hemi chroma imbalance {chroma_imbal:.3f} > 0.05 "
-            f"— mild colour cast in upper hemisphere")
-
     for w_ in warnings:
         warn(w_)
 
@@ -1907,11 +1897,8 @@ def _run_pipeline(args):
             log(f"  reference linear RGB : R={ref[0]:.5f}  G={ref[1]:.5f}  B={ref[2]:.5f}  (~0.18)")
             log(f"  measured luma        : {meas_luma:.5f}  (ref={ref_luma:.5f}, "
                 f"ratio={exposure_ratio:.3f}×)")
-            log(f"  chroma deviation     : R-G={chroma_rg:+.4f}  B-G={chroma_bg:+.4f}  "
-                f"(|err|={patch22_chroma_err:.4f}, should be <0.02 after correct WB)")
-            log(f"  patch confidence     : {patch22_confidence:.3f}"
-                + (" ⚠ LOW — patch may be misidentified or chart is clipped/in shadow"
-                   if patch22_confidence < 0.7 else " ✓"))
+            log(f"  raw chroma           : R-G={chroma_rg:+.4f}  B-G={chroma_bg:+.4f}  "
+                f"(pre-WB, expected to be non-zero on a coloured-lit scene)")
 
             # ── Pose logging ──────────────────────────────────────────────
             theta = cc_det_info.get("checker_normal_theta_deg")
@@ -2004,30 +1991,33 @@ def _run_pipeline(args):
     FALLBACK_EXP = "meter"     # when chart unavailable: pixel-average exposure
 
     def _resolve_wb(src_raw, chart_ok):
+        # Explicit chart request: trust the chart unconditionally. Confidence
+        # is meaningless before WB (a warm-lit chart can't look neutral) —
+        # if the user placed corners or asked for chart explicitly, use it.
+        if src_raw == "chart":
+            if wb_from_chart:
+                return "chart"
+            log("WB chart requested but no chart found — falling back to "
+                f"'{FALLBACK_WB}'")
+            return FALLBACK_WB
         if src_raw == "auto":
-            if chart_ok:
+            if wb_from_chart:
                 return "chart"
             log(f"WB auto: no chart found — falling back to pixel-average metering")
-            return FALLBACK_WB
-        if src_raw == "chart" and not chart_ok:
-            warn(f"⚠ --wb-source chart requested but chart not found or low confidence "
-                 f"(conf={float(cc_det_info.get('confidence') or 0.0):.3f} < {CHART_CONF_MIN}) "
-                 f"— add --colorchecker-in-hdri to search for chart, "
-                 f"or falling back to '{FALLBACK_WB}'")
             return FALLBACK_WB
         return src_raw
 
     def _resolve_exp(src_raw, chart_ok):
+        if src_raw == "chart":
+            if wb_from_chart:
+                return "chart"
+            log("Exposure chart requested but no chart found — falling back to "
+                f"'{FALLBACK_EXP}'")
+            return FALLBACK_EXP
         if src_raw == "auto":
-            if chart_ok:
+            if wb_from_chart:
                 return "chart"
             log(f"Exposure auto: no chart found — falling back to pixel-average metering")
-            return FALLBACK_EXP
-        if src_raw == "chart" and not chart_ok:
-            warn(f"⚠ --exposure-source chart requested but chart not found or low confidence "
-                 f"(conf={float(cc_det_info.get('confidence') or 0.0):.3f} < {CHART_CONF_MIN}) "
-                 f"— add --colorchecker-in-hdri to search for chart, "
-                 f"or falling back to '{FALLBACK_EXP}'")
             return FALLBACK_EXP
         return src_raw
 
@@ -2146,192 +2136,10 @@ def _run_pipeline(args):
         "wb_info":          wb_dome_info,
     }
 
-    # ── WB cross-check: always render sphere after WB and report neutrality ──
-    # Run a low-res sphere render on the WB-applied image.
-    # This is the single most useful sanity check:
-    #   - If WB is correct, sphere mean R≈G≈B (achromatic)
-    #   - R-G and B-G deviation tells you the residual colour cast in stops
-    # When chart WB was used, also compute sphere WB independently and compare.
-    # Large disagreement → chart patch may be misidentified or in shadow.
-    log("── WB sanity check (irradiance) ──")
-    # Use direct upper-hemisphere irradiance instead of sphere renders — faster, same info.
-    _dirs_wb, _dOmega_wb = latlong_dirs(wb_img.shape[0], wb_img.shape[1])
-    _cos_up_wb = np.clip(_dirs_wb[..., 1], 0.0, None)
-    _E_wb_rgb = np.array([
-        float(np.sum(wb_img[..., c] * _cos_up_wb * _dOmega_wb)) for c in range(3)])
-    _E_wb_luma = float(0.2126*_E_wb_rgb[0] + 0.7152*_E_wb_rgb[1] + 0.0722*_E_wb_rgb[2])
-    # Chroma deviation: how far from neutral is the upper-hemi irradiance?
-    _rg_dev = float((_E_wb_rgb[0] - _E_wb_rgb[1]) / (_E_wb_luma + 1e-8))
-    _bg_dev = float((_E_wb_rgb[2] - _E_wb_rgb[1]) / (_E_wb_luma + 1e-8))
-    log(f"  E_upper RGB : R={_E_wb_rgb[0]:.4f}  G={_E_wb_rgb[1]:.4f}  B={_E_wb_rgb[2]:.4f}")
-    log(f"  chroma (R-G)/luma={_rg_dev:+.4f}  (B-G)/luma={_bg_dev:+.4f}  (ideal=0.0)")
-    _chroma_total = abs(_rg_dev) + abs(_bg_dev)
-
-    if wb_from_chart:
-        # Cross-check: derive WB scale implied by raw upper-hemi irradiance
-        _E_raw_rgb = np.array([
-            float(np.sum(img[..., c] * _cos_up_wb * _dOmega_wb)) for c in range(3)])
-        _E_raw_luma = float(0.2126*_E_raw_rgb[0] + 0.7152*_E_raw_rgb[1] + 0.0722*_E_raw_rgb[2])
-        _sphere_implied_scale = _E_raw_luma / np.clip(_E_raw_rgb, 1e-8, None)
-        _sphere_implied_luma  = float(0.2126*_sphere_implied_scale[0]
-                                      + 0.7152*_sphere_implied_scale[1]
-                                      + 0.0722*_sphere_implied_scale[2])
-        _sphere_implied_neutral = (_sphere_implied_scale / max(_sphere_implied_luma, 1e-8)
-                                   ).astype(np.float32)
-        # Compare chart scale vs sphere scale
-        _scale_diff = wb_scale - _sphere_implied_neutral
-        _diff_mag   = float(np.max(np.abs(_scale_diff)))
-        log(f"  chart  WB scale : R={wb_scale[0]:.4f}  G={wb_scale[1]:.4f}  B={wb_scale[2]:.4f}")
-        log(f"  sphere WB scale : R={_sphere_implied_neutral[0]:.4f}  "
-            f"G={_sphere_implied_neutral[1]:.4f}  B={_sphere_implied_neutral[2]:.4f}")
-        log(f"  max channel diff: {_diff_mag:.4f}")
-        if _diff_mag > 0.15:
-            warn(f"⚠⚠ LARGE disagreement between chart WB and sphere WB "
-                 f"(max_diff={_diff_mag:.3f} > 0.15). Chart patch may be "
-                 f"misidentified, in shadow, or clipped. "
-                 f"Consider --sphere-wb as fallback.")
-        elif _diff_mag > 0.08:
-            warn(f"⚠ Moderate disagreement between chart WB and sphere WB "
-                 f"(max_diff={_diff_mag:.3f} > 0.08). Verify chart patch in debug image.")
-        else:
-            log(f"  chart/sphere agreement: OK (diff={_diff_mag:.4f} < 0.08) ✓")
-        meta["white_balance"]["sphere_cross_check"] = {
-            "sphere_implied_scale":   _sphere_implied_neutral.tolist(),
-            "chart_scale":            wb_scale.tolist(),
-            "max_channel_diff":       _diff_mag,
-            "status": "LARGE_DISAGREEMENT" if _diff_mag > 0.15
-                      else "MODERATE_DISAGREEMENT" if _diff_mag > 0.08
-                      else "OK",
-        }
-
-    # ── Adaptive WB blend (chart + sphere) ───────────────────────────────
-    # When chart is found, we now blend chart WB scale and sphere WB scale
-    # based on their disagreement:
-    #
-    #   blend_t = smoothstep(LOW, HIGH, disagreement)
-    #   LOW  = 0.05 → below this, chart and sphere agree: trust chart fully
-    #   HIGH = 0.25 → above this, chart is unreliable: trust sphere fully
-    #
-    # Physical justification:
-    #   chart scale = correct IFF chart is in same light as scene (high sun, no shadow)
-    #   sphere scale = correct IFF scene has identifiable neutral illuminant
-    #   disagreement = proxy for "chart was in different light than scene"
-    #
-    # CRITICAL: blend only affects WB colour (hue/chromaticity).
-    #           Exposure magnitude stays from patch 22 luma — that's illuminant-independent.
-    #
-    # The blend is applied as a secondary correction on top of the already-WB'd image:
-    #   correction_c = blended_scale_c / chart_scale_c
-    #   wb_img_final = wb_img * correction_c
-
-    wb_blend_t    = 0.0
-    wb_blend_info = {"applied": False, "blend_t": 0.0, "method": "chart_only"}
-
-    # Blend is only valid when auto-mode is uncertain about the chart.
-    # If the user explicitly said --wb-source chart, OR auto resolved to chart
-    # at high confidence (>= 0.5), trust the chart unconditionally.
-    # Rationale: on a red/coloured sky the sphere WB is contaminated by the
-    # very cast the chart is trying to remove — blending toward sphere makes
-    # the WB worse, not better. The blend exists only to catch misidentified
-    # or shadowed charts, not legitimately coloured scenes.
-    _chart_explicit  = (_wb_src_raw == "chart")
-    _chart_confident_hi = wb_from_chart and (_conf_val >= 0.5)
-    _blend_allowed   = (not _chart_explicit) and (not _chart_confident_hi)
-
-    if not _blend_allowed and wb_from_chart and "_sphere_implied_neutral" in locals():
-        _reason = "user set --wb-source chart" if _chart_explicit else f"chart confidence {_conf_val:.3f} >= 0.5"
-        log(f"WB blend: skipped — {_reason}. Chart is ground truth.")
-        wb_blend_info = {"applied": False, "blend_t": 0.0,
-                         "method": "chart_only_explicit", "reason": _reason}
-
-    if _blend_allowed and wb_from_chart and "_sphere_implied_neutral" in locals():
-        LOW, HIGH = 0.05, 0.25
-        wb_blend_t = float(smoothstep01(((_diff_mag - LOW) / (HIGH - LOW))))
-
-        if wb_blend_t < 0.01:
-            log(f"WB blend: chart/sphere agree (diff={_diff_mag:.4f}) — chart only (t={wb_blend_t:.3f})")
-            wb_blend_info = {"applied": False, "blend_t": wb_blend_t,
-                             "method": "chart_only", "diff": _diff_mag}
-        else:
-            # G-normalise both scales before blending so they're comparable
-            chart_g_norm  = wb_scale / max(float(wb_scale[1]), 1e-8)
-            sphere_g_norm = _sphere_implied_neutral / max(float(_sphere_implied_neutral[1]), 1e-8)
-
-            blended_g_norm = (chart_g_norm  * (1.0 - wb_blend_t)
-                            + sphere_g_norm *        wb_blend_t).astype(np.float32)
-
-            # Secondary correction: what multiplier turns chart-WB'd image into blended-WB'd
-            # wb_img is already chart_scale applied: wb_img = img * chart_scale
-            # We want:  img * blended  =  wb_img * (blended / chart_scale)
-            correction = blended_g_norm / np.clip(chart_g_norm, 1e-8, None)
-            wb_img     = (wb_img * correction[None, None, :]).astype(np.float32)
-
-            # Update wb_scale to reflect what was actually applied
-            wb_scale = (chart_g_norm * correction).astype(np.float32)
-
-            method = ("sphere_dominant" if wb_blend_t > 0.75 else
-                      "blended_sphere_heavy" if wb_blend_t > 0.5 else
-                      "blended_chart_heavy" if wb_blend_t > 0.25 else
-                      "blended_slight")
-
-            log(f"WB blend: disagreement={_diff_mag:.4f}  t={wb_blend_t:.3f}  → {method}")
-            log(f"  chart  G-norm : R={chart_g_norm[0]:.4f}  G={chart_g_norm[1]:.4f}  B={chart_g_norm[2]:.4f}")
-            log(f"  sphere G-norm : R={sphere_g_norm[0]:.4f}  G={sphere_g_norm[1]:.4f}  B={sphere_g_norm[2]:.4f}")
-            log(f"  blended       : R={blended_g_norm[0]:.4f}  G={blended_g_norm[1]:.4f}  B={blended_g_norm[2]:.4f}")
-            log(f"  correction    : R={correction[0]:.4f}  G={correction[1]:.4f}  B={correction[2]:.4f}")
-
-            wb_blend_info = {
-                "applied":          True,
-                "blend_t":          wb_blend_t,
-                "method":           method,
-                "diff":             _diff_mag,
-                "chart_g_norm":     chart_g_norm.tolist(),
-                "sphere_g_norm":    sphere_g_norm.tolist(),
-                "blended_g_norm":   blended_g_norm.tolist(),
-                "correction":       correction.tolist(),
-            }
-
-            # Re-render sphere check with blended WB to confirm improvement
-            _env_blended_check = _env_for_sphere(wb_img, max_w=256)
-            _sp_blended, _sp_blended_mask = render_gray_ball_vectorized(
-                _env_blended_check, albedo=args.albedo, res=48, chunk=512)
-            _sp_bl_rgb  = np.mean(_sp_blended[_sp_blended_mask], axis=0)
-            _rg_bl = float(_sp_bl_rgb[0] - _sp_bl_rgb[1])
-            _bg_bl = float(_sp_bl_rgb[2] - _sp_bl_rgb[1])
-            log(f"  post-blend sphere: R={_sp_bl_rgb[0]:.4f} G={_sp_bl_rgb[1]:.4f} B={_sp_bl_rgb[2]:.4f}  "
-                f"R-G={_rg_bl:+.4f} B-G={_bg_bl:+.4f}  "
-                f"(was R-G={_rg_dev:+.4f} B-G={_bg_dev:+.4f})")
-            wb_blend_info["post_blend_sphere_rgb"]    = _sp_bl_rgb.tolist()
-            wb_blend_info["post_blend_chroma_rg"]     = _rg_bl
-            wb_blend_info["post_blend_chroma_bg"]     = _bg_bl
-            wb_blend_info["pre_blend_chroma_rg"]      = _rg_dev
-            wb_blend_info["pre_blend_chroma_bg"]      = _bg_dev
-
-            # Update for downstream chroma checks
-            _sp_rgb       = _sp_bl_rgb
-            _rg_dev       = _rg_bl
-            _bg_dev       = _bg_bl
-            _chroma_total = abs(_rg_bl) + abs(_bg_bl)
-
-            save_png_preview(os.path.join(args.debug_dir, "01_wb_blended_preview.png"), wb_img)
-
-    meta["white_balance"]["wb_blend"] = wb_blend_info
-
-    if _chroma_total > 0.10:
-        warn(f"⚠⚠ Sphere render shows strong colour cast after WB "
-             f"(R-G={_rg_dev:+.4f} B-G={_bg_dev:+.4f}). "
-             f"WB may be wrong — check 01_wb_sphere_check.png")
-    elif _chroma_total > 0.04:
-        warn(f"⚠ Sphere render shows minor colour cast after WB "
-             f"(R-G={_rg_dev:+.4f} B-G={_bg_dev:+.4f}).")
-
-    # Save sphere debug image for this WB check
+    # WB cross-check / chroma deviation / sphere-implied scale comparison
+    # all removed — chart is ground truth. No diagnostic that could be
+    # misread as the pipeline modifying colours.
     save_png_preview(os.path.join(args.debug_dir, "01_wb_preview.png"), wb_img)
-    meta["white_balance"]["sphere_check"] = {
-        "mean_rgb":   _E_wb_rgb.tolist(),
-        "chroma_rg":  _rg_dev,
-        "chroma_bg":  _bg_dev,
-    }
 
     # cc_measured holds the raw linear swatches from the chart (if found).
     # wb_from_chart_scale holds the derived WB multiplier (already applied via rgb_scale).
@@ -2495,9 +2303,6 @@ def _run_pipeline(args):
         log(f"  exposure_scale = {exposure_scale:.5f}  (predicted / measured)")
         log(f"  classic_scale  = {classic_scale:.5f}  (albedo / measured, for reference — "
             f"{'same' if abs(classic_scale - exposure_scale) < 0.01 else 'DIFFERS — pose correction active'})")
-        if wb_blend_info.get("applied"):
-            log(f"  note: WB blend t={wb_blend_t:.3f} — colour corrected by sphere blend, "
-                f"exposure anchored to chart luma")
     elif exp_src == "sphere":
         # ── Exposure from sphere / irradiance target ──────────────────────
         # Two sub-modes via --sphere-target:
@@ -2827,52 +2632,9 @@ def _run_pipeline(args):
     gains_pc = solution["gains_per_channel"]
     save_png_preview(os.path.join(args.debug_dir, "07_corrected_preview.png"), corrected)
 
-    _final_balance_target = getattr(args, "final_balance_target", "none")
-    final_balance_info = {
-        "applied": False,
-        "target": _final_balance_target,
-        "target_mode": _solve_target_key,
-        "target_summary": _solve_target_summary,
-    }
-    if _final_balance_target != "none":
-        _lum_w = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-        _fb_E_rgb = _irradiance_rgb_toward(corrected, _solve_target_dir)
-        _fb_card_before = args.albedo * _fb_E_rgb / math.pi
-        _fb_luma_before = float(np.dot(_fb_card_before, _lum_w))
-
-        _neutral_level = max(_fb_luma_before, 1e-6)
-        _fb_wb_scale = (_neutral_level / np.clip(_fb_card_before, 1e-6, None)).astype(np.float32)
-
-        _fb_card_after_wb = _fb_card_before * _fb_wb_scale
-        _fb_luma_after_wb = float(np.dot(_fb_card_after_wb, _lum_w))
-
-        _fb_exposure_scale = float(args.albedo / max(_fb_luma_after_wb, 1e-6))
-
-        _fb_total_scale = (_fb_wb_scale * _fb_exposure_scale).astype(np.float32)
-        corrected = corrected * _fb_total_scale[None, None, :]
-        _fb_card_after = _fb_card_before * _fb_total_scale
-        _fb_luma_after = float(np.dot(_fb_card_after, _lum_w))
-
-        log(f"Final post-balance — target {_solve_target_key}: "
-            f"card before R={_fb_card_before[0]:.4f} G={_fb_card_before[1]:.4f} B={_fb_card_before[2]:.4f}  "
-            f"(luma={_fb_luma_before:.4f})")
-        log(f"  wb scale      : R={_fb_wb_scale[0]:.4f}  G={_fb_wb_scale[1]:.4f}  B={_fb_wb_scale[2]:.4f}")
-        log(f"  exposure scale: {_fb_exposure_scale:.4f}")
-        log(f"  total scale   : R={_fb_total_scale[0]:.4f}  G={_fb_total_scale[1]:.4f}  B={_fb_total_scale[2]:.4f}")
-        log(f"  card after    : R={_fb_card_after[0]:.4f}  G={_fb_card_after[1]:.4f}  B={_fb_card_after[2]:.4f}  "
-            f"(luma={_fb_luma_after:.4f}, target={args.albedo:.4f})")
-
-        save_png_preview(os.path.join(args.debug_dir, "07b_final_balanced_preview.png"), corrected)
-        final_balance_info.update({
-            "applied": True,
-            "card_before_rgb": _fb_card_before.tolist(),
-            "card_before_luma": _fb_luma_before,
-            "wb_scale": _fb_wb_scale.tolist(),
-            "exposure_scale": _fb_exposure_scale,
-            "total_scale": _fb_total_scale.tolist(),
-            "card_after_rgb": _fb_card_after.tolist(),
-            "card_after_luma": _fb_luma_after,
-        })
+    # Final balance step removed — chart-WB+exposure is the single source
+    # of truth. No second-pass rebalancing.
+    final_balance_info = {"applied": False, "method": "removed"}
 
     # ── Validation render: final HDR → grey sphere ─────────────────────────
     # Ground-truth diagnostic — sphere mean RGB should match meter_target per
@@ -3000,6 +2762,11 @@ def _run_pipeline(args):
                    "reason": "no chart detected" if checker_src else "not requested"}
 
     meta["colorchecker"] = cc_info
+
+    # No "chart-neutral guarantee" step. WB sets R=G=B at patch 22,
+    # exposure_scale = albedo / patch22_luma — by construction patch 22
+    # reads albedo on all channels. Sun solve only touches lobe pixels.
+    # Nothing perturbs the chart between here and save_exr.
 
     # ── 10. Save final EXR ────────────────────────────────────────────────
     save_exr(args.out, corrected)

@@ -330,7 +330,6 @@ class PipelineWorker(QRunnable):
             for fname in [
                 "01_wb_preview.png", "02_exposed_preview.png",
                 "03_hot_mask.png",   "07_corrected_preview.png",
-                "07b_final_balanced_preview.png",
                 "08_final_hdri_preview.png",
                 "08_verify_sphere_final.png",
                 "colorchecker/cc_detected_tile.jpg",
@@ -957,7 +956,6 @@ class PreviewPanel(QWidget):
             ("Rectified",  "cc_rectified_final.jpg"),
             ("Swatches",   "cc_swatch_comparison.jpg"),
             ("Solved",     "07_corrected_preview.png"),
-            ("Balanced",   "07b_final_balanced_preview.png"),
             ("Final",      "08_final_hdri_preview.png"),
             ("Sphere",     "08_verify_sphere_final.png"),
         ]:
@@ -1399,11 +1397,12 @@ class SettingsPanel(QScrollArea):
             "sun_facing_vertical  - target a vertical card rotated toward the sun azimuth\n"
             "none                 - disable sun solve")
 
+        # final_balance_target removed — the pipeline no longer does a second
+        # pass of WB after the sun solve.  Kept as a stub for backwards-compat
+        # with old PipelineConfig dumps; always "none".
         self.final_balance_target = QComboBox()
-        self.final_balance_target.addItems(["none", "auto"])
-        self.final_balance_target.setToolTip(
-            "none - no final trim after sun solve\n"
-            "auto - measure the imaginary target card and apply one final RGB balance to make it neutral at albedo")
+        self.final_balance_target.addItems(["none"])
+        self.final_balance_target.setVisible(False)
 
         self.albedo = QDoubleSpinBox()
         self.albedo.setRange(0.01, 1.0)
@@ -1423,7 +1422,6 @@ class SettingsPanel(QScrollArea):
         f.addRow("Exposure source",  self.exp_source)
         f.addRow("Integration mode", self.integration_mode)
         f.addRow("Sun solve",        self.solver_mode)
-        f.addRow("Final balance",   self.final_balance_target)
         f.addRow("Albedo",          self.albedo)
         f.addRow("Validation",       self.validate_energy)
         self._adv_groups.append(grp)
@@ -1637,11 +1635,28 @@ class SettingsPanel(QScrollArea):
         cs = self.input_colorspace.currentText()
         cfg.colorspace = None if cs == "auto" else cs
 
-        # Advanced calibration choices
+        # Advanced calibration choices.
+        # Auto mode is intentionally rigid:
+        #   • chart placed → trust the chart (no WB blend, no final balance)
+        #   • no chart     → grey-world WB (pixel-average meter), sun-solve
+        #                     targeting a grey card facing up at the sky.
         cfg.integration_mode = self.integration_mode.currentText()
         if cfg.calibration_mode == "auto":
-            cfg.wb_source = "auto"
-            cfg.exposure_source = "auto"
+            chart_placed = (self.cc_manual_corners is not None
+                            or self.cc_search_rect is not None)
+            if chart_placed:
+                # Explicit "chart" source skips the sphere-WB blend logic
+                # and the pose-aware exposure branches downstream — exactly
+                # the simple "find chart → make patch22 grey" path.
+                cfg.wb_source = "chart"
+                cfg.exposure_source = "chart"
+            else:
+                # No chart: grey-world WB + sphere/meter exposure. The
+                # pipeline's "auto" already falls back to pixel-average
+                # when no chart is found, and sphere_solve=auto resolves
+                # to energy_conservation (card-facing-up target).
+                cfg.wb_source = "auto"
+                cfg.exposure_source = "auto"
             cfg.sphere_solve = "auto"
             cfg.final_balance_target = "none"
         else:
@@ -1863,13 +1878,24 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Ready  ·  Drop EXR / HDR / PNG / WebP into the window to begin")
 
     def _connect_settings_signals(self):
+        # Settings that actually change what the Source preview *looks* like
+        # — colorspace interpretation + the photographic exposure/WB knobs.
+        # Toggling these triggers a re-decode of the HDRI and a new
+        # display-mapped PNG + .f16.npy companion.
         for signal in [
-            self._settings.calibration_mode.currentTextChanged,
             self._settings.input_colorspace.currentTextChanged,
-            self._settings.center_hdri.toggled,
             self._settings.base_intensity.valueChanged,
             self._settings.base_temperature.valueChanged,
             self._settings.base_tint.valueChanged,
+        ]:
+            signal.connect(self._on_preview_setting_changed)
+
+        # Everything else only changes pipeline behaviour. We persist the
+        # config but do NOT rebuild the source preview — no disk reload,
+        # no tone-map, no UI lag.
+        for signal in [
+            self._settings.calibration_mode.currentTextChanged,
+            self._settings.center_hdri.toggled,
             self._settings.wb_source.currentTextChanged,
             self._settings.exp_source.currentTextChanged,
             self._settings.integration_mode.currentTextChanged,
@@ -1883,7 +1909,7 @@ class MainWindow(QMainWindow):
             self._settings.cc_min_confidence.editingFinished,
             self._settings.validate_energy.toggled,
         ]:
-            signal.connect(self._on_settings_changed)
+            signal.connect(self._on_config_only_changed)
         self._settings.pick_chart_btn.clicked.connect(self._on_pick_chart_corners)
         self._settings.detect_chart_btn.clicked.connect(self._on_detect_chart_in_rect)
 
@@ -2092,13 +2118,25 @@ class MainWindow(QMainWindow):
         fi.config = self._settings.build_config(fi.path)
         return fi
 
-    def _on_settings_changed(self, *_args):
+    def _on_preview_setting_changed(self, *_args):
+        """Settings that change how the Source preview looks (colorspace /
+        exposure / WB knobs). Stores config + queues a preview rebuild."""
         if self._syncing_settings:
             return
         fi = self._store_current_settings_into_selected()
         if fi is None:
             return
         self._request_source_preview_refresh()
+
+    def _on_config_only_changed(self, *_args):
+        """Settings that only affect pipeline behaviour at Process time.
+        Persist the config but don't reload the HDRI or rebuild previews."""
+        if self._syncing_settings:
+            return
+        self._store_current_settings_into_selected()
+
+    # Back-compat alias — older callsites used this name.
+    _on_settings_changed = _on_preview_setting_changed
 
     # ── Single-file load ──────────────────────────────────────────────────
     def _on_files_dropped(self, paths):
