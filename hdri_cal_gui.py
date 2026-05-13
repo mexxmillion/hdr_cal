@@ -1849,17 +1849,54 @@ class MainWindow(QMainWindow):
             self._status.showMessage("Cannot load while a job is running")
             return
         p = paths[0]
+
+        # If a file is already loaded, ask whether to reset settings or
+        # carry them over.  Chart hints are always wiped regardless.
+        reset_settings = True
+        if self._file_items:
+            current = self._file_items[0].name
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Question)
+            msg.setWindowTitle("Replace loaded file?")
+            msg.setText(
+                f"'{current}' is currently loaded.\n\n"
+                f"Replace it with '{Path(p).name}'?\n\n"
+                f"Chart placement (rect + corners) will be wiped either way "
+                f"— pick whether to keep or reset the other settings.")
+            reset_btn = msg.addButton("Replace + reset settings",
+                                       QMessageBox.AcceptRole)
+            keep_btn = msg.addButton("Replace + keep settings",
+                                      QMessageBox.AcceptRole)
+            cancel_btn = msg.addButton(QMessageBox.Cancel)
+            msg.setDefaultButton(reset_btn)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked is cancel_btn:
+                return
+            reset_settings = (clicked is reset_btn)
+
         # Replace current file (single-file workflow).
         self._file_items.clear()
         self._current_item = None
         self._preview.clear(); self._report.clear()
+        # Chart hints are always wiped — new image, new chart geometry.
+        self._settings._clear_cc_rect()
+        self._settings._clear_cc_corners()
+        self._preview.set_search_rect(None)
+        # Optionally reset everything else to defaults.
+        if reset_settings:
+            self._apply_config_to_settings(PipelineConfig())
+
         fi = FileItem(p)
         fi.config = self._settings.build_config(p)
         self._file_items.append(fi)
         self._ensure_source_preview(fi)
         self._update_q()
         self._on_file_selected(0)
-        self._status.showMessage(f"Loaded: {fi.name}")
+        kept = "" if reset_settings else "  ·  settings kept"
+        self._status.showMessage(
+            f"Loaded: {fi.name}{kept}  ·  No chart placed — "
+            f"draw a rect on Source to begin")
 
     def _on_browse_open(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2019,37 +2056,49 @@ class MainWindow(QMainWindow):
         self._run_single(validate_only=False)
 
     def _prompt_chart_setup_if_needed(self) -> bool:
-        """If the user hasn't set up chart detection, ask what they want.
-        Returns True if the run should proceed, False if it was cancelled."""
-        if (self._settings.cc_manual_corners is not None
-                or self._settings.cc_search_rect is not None):
+        """If the user hasn't placed chart corners, ask what they want.
+        Returns True if the run should proceed, False if it was cancelled
+        (or if the picker was opened — the user has to press Process again
+        after placing corners)."""
+        if self._settings.cc_manual_corners is not None:
             return True
 
+        has_rect = self._settings.cc_search_rect is not None
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Question)
-        msg.setWindowTitle("ColorChecker not set up")
-        msg.setText("No chart corners are set.\n\n"
-                    "Place the chart now, or skip chart-based calibration?")
-        manual_btn = msg.addButton("Place corners", QMessageBox.AcceptRole)
-        skip_btn = msg.addButton("Skip chart", QMessageBox.DestructiveRole)
+        msg.setWindowTitle("ColorChecker not placed")
+        if has_rect:
+            text = ("A search rectangle is drawn but no chart corners are "
+                    "placed yet.\n\nPlace the corners now, or ignore the "
+                    "chart and use base settings only?")
+        else:
+            text = ("No search rectangle has been drawn.\n\nDraw one and "
+                    "place the chart corners, or ignore the chart and "
+                    "use base settings only?")
+        msg.setText(text)
+        draw_btn = msg.addButton(
+            "Place corners" if has_rect else "Draw rectangle",
+            QMessageBox.AcceptRole)
+        ignore_btn = msg.addButton("Ignore chart",
+                                    QMessageBox.DestructiveRole)
         cancel_btn = msg.addButton(QMessageBox.Cancel)
-        msg.setDefaultButton(manual_btn)
+        msg.setDefaultButton(draw_btn)
         msg.exec()
         clicked = msg.clickedButton()
 
         if clicked is cancel_btn:
             return False
-        if clicked is skip_btn:
-            self._log.append("Chart detection skipped — using base settings only.")
+        if clicked is ignore_btn:
+            self._log.append("Chart ignored — using base settings only.")
             return True
-        # Manual placement needs a search rect first.
-        if self._settings.cc_search_rect is None:
+        # User picked "Place corners" / "Draw rectangle".
+        if has_rect:
+            self._on_pick_chart_corners()
+        else:
             QMessageBox.information(
                 self, "Draw a search rectangle",
                 "Drag a rectangle on the Source preview to mark where the "
                 "ColorChecker is, then click 'Place Chart Corners'.")
-            return False
-        self._on_pick_chart_corners()
         return False
 
     def _on_validate(self):
