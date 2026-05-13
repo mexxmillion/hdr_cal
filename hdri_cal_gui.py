@@ -22,10 +22,13 @@ from PySide6.QtWidgets import (
     QComboBox, QCheckBox, QDoubleSpinBox, QSpinBox, QLineEdit, QSlider,
     QGroupBox, QTextEdit, QFileDialog, QProgressBar,
     QScrollArea, QSizePolicy, QTabWidget, QFrame, QToolBar,
-    QStatusBar, QMessageBox, QAbstractItemView,
+    QStatusBar, QMessageBox, QAbstractItemView, QDialog,
 )
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot
-from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QColor
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot, QPoint, QPointF
+from PySide6.QtGui import (
+    QPixmap, QDragEnterEvent, QDropEvent, QColor,
+    QPainter, QPen, QImage, QMouseEvent,
+)
 
 import numpy as np
 import cv2
@@ -219,13 +222,20 @@ class PipelineConfig:
     sun_gain_ceiling:   float = 2000.0
     sun_gain_rolloff:   float = 500.0
 
-    # Chart sweep
-    sweep_fov:          float = 70.0
-    sweep_overlap:      float = 10.0
-    sweep_min_pitch:    float = -30.0
-    sweep_max_pitch:    float = 90.0
+    # Optional post-process validation suite (rendered sphere vs analytical,
+    # 6-direction irradiance map, E=π check, grey-card predictions).
+    # Off by default — adds ~1–2 s and is a debug aid, not a calibration step.
+    validate_energy:    bool = False
+
+    # Chart detection
     cc_min_confidence:  float = 0.50
-    cc_early_exit_confidence: float = 0.50
+
+    # User-drawn search rectangle on the latlong preview (u0, v0, u1, v1), or None.
+    # When set, auto-detect runs inside this rect only — no sphere sweep.
+    cc_search_rect:     Optional[tuple] = None
+
+    # Manual chart corners (list of 4 (u,v) tuples in 0-1 space, or None for auto)
+    cc_manual_corners:  Optional[list] = None
 
 
 
@@ -273,8 +283,10 @@ def config_to_namespace(cfg: PipelineConfig):
         "cc_read_backend":      "colour",
         "cc_compare_backends":  False,
         "cc_min_confidence":    0.50,
-        "cc_early_exit_confidence": 0.50,
+        "cc_search_rect":       None,
+        "cc_manual_corners":    None,
         "validate_only":        False,
+        "validate_energy":      False,
     }
     for attr, default in _defaults.items():
         if not hasattr(ns, attr):
@@ -378,6 +390,442 @@ class DropZone(QFrame):
         if paths: self.files_dropped.emit(paths)
 
 
+# ── Rubber-band search rect for the Source preview ────────────────────────────
+
+class RectDrawLabel(QLabel):
+    """QLabel that lets the user drag-out a rectangle. Emits rect_uv on release
+    as a normalised (u0, v0, u1, v1) tuple in image coords [0,1]."""
+    rect_drawn = Signal(tuple)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._base_pm: Optional[QPixmap] = None
+        self._dragging = False
+        self._start: Optional[QPointF] = None  # image coords
+        self._end: Optional[QPointF] = None    # image coords
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.CrossCursor)
+
+    def set_base_pixmap(self, pm: QPixmap):
+        self._base_pm = pm
+        self._dragging = False
+        self._start = None
+        self._end = None
+        self._redraw()
+
+    def clear_rect(self):
+        self._start = None
+        self._end = None
+        self._dragging = False
+        self._redraw()
+
+    def set_rect_uv(self, rect_uv: Optional[tuple]):
+        if rect_uv is None or self._base_pm is None or self._base_pm.isNull():
+            self.clear_rect()
+            return
+        w, h = self._base_pm.width(), self._base_pm.height()
+        u0, v0, u1, v1 = rect_uv
+        self._start = QPointF(u0 * w, v0 * h)
+        self._end = QPointF(u1 * w, v1 * h)
+        self._dragging = False
+        self._redraw()
+
+    def _widget_to_image(self, widget_pos: QPointF) -> Optional[QPointF]:
+        if self._base_pm is None or self._base_pm.isNull():
+            return None
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return None
+        lbl_w, lbl_h = self.width(), self.height()
+        pm_w, pm_h = pm.width(), pm.height()
+        ox = (lbl_w - pm_w) / 2.0
+        oy = (lbl_h - pm_h) / 2.0
+        ix = (widget_pos.x() - ox) * self._base_pm.width() / pm_w
+        iy = (widget_pos.y() - oy) * self._base_pm.height() / pm_h
+        ix = max(0, min(ix, self._base_pm.width() - 1))
+        iy = max(0, min(iy, self._base_pm.height() - 1))
+        return QPointF(ix, iy)
+
+    def mousePressEvent(self, ev: QMouseEvent):
+        if ev.button() != Qt.LeftButton:
+            return
+        pos = self._widget_to_image(ev.position())
+        if pos is None:
+            return
+        self._dragging = True
+        self._start = pos
+        self._end = pos
+        self._redraw()
+
+    def mouseMoveEvent(self, ev: QMouseEvent):
+        if not self._dragging:
+            return
+        pos = self._widget_to_image(ev.position())
+        if pos is None:
+            return
+        self._end = pos
+        self._redraw()
+
+    def mouseReleaseEvent(self, ev: QMouseEvent):
+        if not self._dragging or self._start is None or self._end is None:
+            return
+        self._dragging = False
+        self._redraw()
+        if self._base_pm is None:
+            return
+        w, h = self._base_pm.width(), self._base_pm.height()
+        u0 = min(self._start.x(), self._end.x()) / w
+        v0 = min(self._start.y(), self._end.y()) / h
+        u1 = max(self._start.x(), self._end.x()) / w
+        v1 = max(self._start.y(), self._end.y()) / h
+        if (u1 - u0) * w < 4 or (v1 - v0) * h < 4:
+            self._start = None
+            self._end = None
+            self._redraw()
+            return
+        self.rect_drawn.emit((u0, v0, u1, v1))
+
+    def _redraw(self):
+        if self._base_pm is None or self._base_pm.isNull():
+            self.setPixmap(QPixmap())
+            return
+        pm = self._base_pm.copy()
+        if self._start is not None and self._end is not None:
+            p = QPainter(pm)
+            pen = QPen(QColor(255, 200, 64), 2, Qt.DashLine)
+            p.setPen(pen)
+            x0 = int(min(self._start.x(), self._end.x()))
+            y0 = int(min(self._start.y(), self._end.y()))
+            x1 = int(max(self._start.x(), self._end.x()))
+            y1 = int(max(self._start.y(), self._end.y()))
+            p.drawRect(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+            p.end()
+        # Scale to widget if needed
+        scaled = pm.scaled(
+            max(self.width(), 1), max(self.height(), 1),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._redraw()
+
+
+# ── ColorChecker corner picker dialog ─────────────────────────────────────────
+
+class _PickerCanvas(QLabel):
+    """Image label that lets the user click up to 4 corners. Once 4 corners
+    are placed, draws a CC24 reference-swatch overlay registered to the quad."""
+    corner_changed = Signal()
+
+    # CC24 layout shared with colorchecker_erp.
+    _CC_COLS = 6
+    _CC_ROWS = 4
+
+    # Hit-test radius for grabbing an existing corner (image-pixel space).
+    _GRAB_RADIUS = 14.0
+
+    def __init__(self, pixmap: QPixmap, ref_swatches_u8: Optional[np.ndarray] = None,
+                 parent=None):
+        super().__init__(parent)
+        self._base_pm = pixmap
+        self._corners: list[QPointF] = []
+        # ref_swatches_u8: (24, 3) uint8 RGB values for overlay drawing.
+        self._ref = ref_swatches_u8
+        self._drag_idx: Optional[int] = None  # which corner is being dragged
+        self.setPixmap(pixmap)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+
+    def corners_xy(self) -> list[tuple[float, float]]:
+        """Return corners in image pixel coordinates."""
+        return [(float(p.x()), float(p.y())) for p in self._corners]
+
+    def reset_corners(self):
+        self._corners.clear()
+        self._drag_idx = None
+        self._redraw()
+        self.corner_changed.emit()
+
+    def _nearest_corner(self, pos: QPointF) -> Optional[int]:
+        """Return the index of the closest corner within grab radius, or None."""
+        best_i = None
+        best_d2 = self._GRAB_RADIUS ** 2
+        for i, c in enumerate(self._corners):
+            dx = c.x() - pos.x()
+            dy = c.y() - pos.y()
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        return best_i
+
+    def mousePressEvent(self, ev: QMouseEvent):
+        if ev.button() != Qt.LeftButton:
+            return
+        pos = self._widget_to_image(ev.position())
+        if pos is None:
+            return
+        # If clicking on an existing corner, start dragging it.
+        idx = self._nearest_corner(pos)
+        if idx is not None:
+            self._drag_idx = idx
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        # Otherwise add a new corner (up to 4).
+        if len(self._corners) < 4:
+            self._corners.append(pos)
+            self._drag_idx = len(self._corners) - 1
+            self.setCursor(Qt.ClosedHandCursor)
+            self._redraw()
+            self.corner_changed.emit()
+
+    def mouseMoveEvent(self, ev: QMouseEvent):
+        pos = self._widget_to_image(ev.position())
+        if pos is None:
+            return
+        if self._drag_idx is not None:
+            self._corners[self._drag_idx] = pos
+            self._redraw()
+            self.corner_changed.emit()
+            return
+        # Hover: change cursor when over a corner.
+        if self._nearest_corner(pos) is not None:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CrossCursor)
+
+    def mouseReleaseEvent(self, ev: QMouseEvent):
+        if ev.button() != Qt.LeftButton:
+            return
+        if self._drag_idx is not None:
+            self._drag_idx = None
+            self.setCursor(Qt.CrossCursor)
+
+    def _widget_to_image(self, widget_pos: QPointF) -> Optional[QPointF]:
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return None
+        lbl_w, lbl_h = self.width(), self.height()
+        pm_w, pm_h = pm.width(), pm.height()
+        ox = (lbl_w - pm_w) / 2.0
+        oy = (lbl_h - pm_h) / 2.0
+        ix = (widget_pos.x() - ox) * self._base_pm.width() / pm_w
+        iy = (widget_pos.y() - oy) * self._base_pm.height() / pm_h
+        ix = max(0, min(ix, self._base_pm.width() - 1))
+        iy = max(0, min(iy, self._base_pm.height() - 1))
+        return QPointF(ix, iy)
+
+    def _draw_swatch_overlay(self, painter: QPainter):
+        """Once 4 corners are placed, draw 24 swatch outlines coloured from
+        the CC24 reference, mapped through the user's quad."""
+        if len(self._corners) != 4 or self._ref is None:
+            return
+        src = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                       dtype=np.float32)
+        dst = np.array([[p.x(), p.y()] for p in self._corners], dtype=np.float32)
+        try:
+            M = cv2.getPerspectiveTransform(src, dst)
+        except Exception:
+            return
+        cols, rows = self._CC_COLS, self._CC_ROWS
+        for r in range(rows):
+            for c in range(cols):
+                idx = r * cols + c
+                # cell centre and half-extent in normalised quad space
+                cx = (c + 0.5) / cols
+                cy = (r + 0.5) / rows
+                # Inner sample region ~ 33% of cell
+                hx = 0.33 / cols * 0.5
+                hy = 0.33 / rows * 0.5
+                corners_n = np.array([
+                    [cx - hx, cy - hy],
+                    [cx + hx, cy - hy],
+                    [cx + hx, cy + hy],
+                    [cx - hx, cy + hy],
+                ], dtype=np.float32).reshape(-1, 1, 2)
+                warped = cv2.perspectiveTransform(corners_n, M).reshape(-1, 2)
+                rcol = self._ref[idx]
+                fill = QColor(int(rcol[0]), int(rcol[1]), int(rcol[2]), 200)
+                painter.setBrush(fill)
+                painter.setPen(QPen(QColor(0, 0, 0, 220), 1))
+                poly = [QPoint(int(round(x)), int(round(y))) for x, y in warped]
+                painter.drawPolygon(poly)
+
+    def _redraw(self):
+        pm = self._base_pm.copy()
+        painter = QPainter(pm)
+        # Swatch overlay first (under the quad outline)
+        self._draw_swatch_overlay(painter)
+        pen = QPen(QColor(0, 255, 0), 2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        for i, pt in enumerate(self._corners):
+            x, y = int(pt.x()), int(pt.y())
+            painter.drawEllipse(QPoint(x, y), 6, 6)
+            painter.drawText(x + 10, y - 4, f"{i+1}")
+        if len(self._corners) >= 2:
+            for i in range(len(self._corners)):
+                j = (i + 1) % len(self._corners)
+                if j < len(self._corners):
+                    painter.drawLine(
+                        int(self._corners[i].x()), int(self._corners[i].y()),
+                        int(self._corners[j].x()), int(self._corners[j].y()))
+            if len(self._corners) == 4:
+                painter.drawLine(
+                    int(self._corners[3].x()), int(self._corners[3].y()),
+                    int(self._corners[0].x()), int(self._corners[0].y()))
+        painter.end()
+        self.setPixmap(pm)
+
+
+def _cc24_reference_u8() -> np.ndarray:
+    """24×3 uint8 sRGB values for the CC24, for overlay drawing only."""
+    try:
+        from colorchecker_erp import CC24_LINEAR_SRGB
+        ref_lin = CC24_LINEAR_SRGB
+    except Exception:
+        # Fallback: tiny inline grey ramp so the overlay still works.
+        ref_lin = np.tile(np.linspace(0.1, 0.9, 24, dtype=np.float32)[:, None],
+                          (1, 3))
+    # Apply sRGB encoding for display.
+    a = np.clip(ref_lin, 0.0, 1.0).astype(np.float32)
+    enc = np.where(a <= 0.0031308,
+                   12.92 * a,
+                   1.055 * np.power(a, 1.0 / 2.4) - 0.055)
+    return np.clip(enc * 255.0, 0, 255).astype(np.uint8)
+
+
+class ChartCornerPicker(QDialog):
+    """Modal dialog: shows a rectilinear crop of the user-drawn search rect
+    on the latlong, lets the user click 4 chart corners, and returns the
+    corners back in ERP UV space.
+
+    Pass either:
+      - (erp_linear, rect_uv) to compute a rectilinear crop, OR
+      - image_path to a pre-rendered image (legacy path; returns corners in
+        that image's own UV space).
+    """
+
+    def __init__(self,
+                 erp_linear: Optional[np.ndarray] = None,
+                 rect_uv: Optional[tuple] = None,
+                 image_path: Optional[str] = None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Place ColorChecker Corners (TL → TR → BR → BL)")
+        self.setMinimumSize(900, 500)
+        self.resize(1200, 750)
+        self.corners_uv: Optional[list[tuple[float, float]]] = None
+        self._map_uv: Optional[np.ndarray] = None  # for ERP backprojection
+        self._crop_w = 0
+        self._crop_h = 0
+
+        lay = QVBoxLayout(self)
+
+        pm: Optional[QPixmap] = None
+        if erp_linear is not None and rect_uv is not None:
+            pm = self._build_crop_pixmap(erp_linear, rect_uv)
+            if pm is None:
+                lay.addWidget(QLabel("Failed to build rectilinear crop."))
+                return
+        elif image_path is not None:
+            pm = QPixmap(image_path)
+            if pm.isNull():
+                lay.addWidget(QLabel("Failed to load preview image."))
+                return
+        else:
+            lay.addWidget(QLabel("ChartCornerPicker: no input image provided."))
+            return
+
+        self._crop_w = pm.width()
+        self._crop_h = pm.height()
+
+        ref_u8 = _cc24_reference_u8()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._canvas = _PickerCanvas(pm, ref_swatches_u8=ref_u8)
+        self._canvas.corner_changed.connect(self._on_corners_changed)
+        scroll.setWidget(self._canvas)
+        lay.addWidget(scroll)
+
+        info = QLabel(
+            "Click to place 4 corners in order: TL → TR → BR → BL.  "
+            "Then drag any corner to fine-tune. Swatch overlay updates live.")
+        info.setAlignment(Qt.AlignCenter)
+        lay.addWidget(info)
+
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("Reset")
+        reset_btn.clicked.connect(self._canvas.reset_corners)
+        self._ok_btn = QPushButton("Accept")
+        self._ok_btn.setEnabled(False)
+        self._ok_btn.clicked.connect(self._on_accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self._ok_btn)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+    def _build_crop_pixmap(self, erp_linear: np.ndarray,
+                           rect_uv: tuple) -> Optional[QPixmap]:
+        try:
+            from colorchecker_erp import (
+                _rect_uv_to_tile_params, erp_to_rectilinear,
+                _linear_to_u8_for_display,
+            )
+        except Exception as e:
+            print(f"[picker] failed to import colorchecker_erp helpers: {e}")
+            return None
+        yaw, pitch, fov = _rect_uv_to_tile_params(rect_uv)
+        # Crop size matches the rect's aspect — longer side gets 1024 px.
+        u0, v0, u1, v1 = rect_uv
+        span_u = abs(u1 - u0) * 360.0
+        span_v = abs(v1 - v0) * 180.0
+        if span_u >= span_v:
+            out_w = 1024
+            out_h = max(64, int(round(1024 * (span_v / max(span_u, 1e-6)))))
+        else:
+            out_h = 1024
+            out_w = max(64, int(round(1024 * (span_u / max(span_v, 1e-6)))))
+        tile_linear, map_uv = erp_to_rectilinear(erp_linear, yaw, pitch, fov,
+                                                  out_w, out_h)
+        self._map_uv = map_uv
+        u8 = _linear_to_u8_for_display(tile_linear)
+        h, w = u8.shape[:2]
+        qimg = QImage(u8.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        return QPixmap.fromImage(qimg)
+
+    def _on_corners_changed(self):
+        n = len(self._canvas._corners)
+        self._ok_btn.setEnabled(n == 4)
+
+    def _on_accept(self):
+        xys = self._canvas.corners_xy()
+        if len(xys) != 4:
+            return
+        if self._map_uv is not None:
+            mu = self._map_uv
+            mh, mw = mu.shape[:2]
+            uvs: list[tuple[float, float]] = []
+            for cx, cy in xys:
+                ix = int(np.clip(round(cx), 0, mw - 1))
+                iy = int(np.clip(round(cy), 0, mh - 1))
+                u, v = float(mu[iy, ix, 0]), float(mu[iy, ix, 1])
+                uvs.append((u, v))
+            self.corners_uv = uvs
+        else:
+            # Legacy: corners were placed on the full latlong preview.
+            uvs = [(x / max(self._crop_w, 1), y / max(self._crop_h, 1))
+                   for x, y in xys]
+            self.corners_uv = uvs
+        self.accept()
+
+
 # ── File item ──────────────────────────────────────────────────────────────────
 class FileItem:
     def __init__(self, path):
@@ -397,13 +845,26 @@ class FileItem:
 
 # ── Preview panel ──────────────────────────────────────────────────────────────
 class PreviewPanel(QWidget):
+    # Emitted when the user drags out a search rect on the Source tab.
+    search_rect_drawn = Signal(tuple)  # (u0, v0, u1, v1)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
         self._tabs = QTabWidget(); lay.addWidget(self._tabs)
         self._labels: dict[str, QLabel] = {}
+
+        # Source tab uses a RectDrawLabel so the user can drag out a search rect.
+        self._source_label = RectDrawLabel()
+        self._source_label.setStyleSheet("background: #10101a;")
+        self._source_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._source_label.rect_drawn.connect(self.search_rect_drawn.emit)
+        sc_src = QScrollArea(); sc_src.setWidget(self._source_label)
+        sc_src.setWidgetResizable(True)
+        self._tabs.addTab(sc_src, "Source")
+        self._labels["source_preview.png"] = self._source_label
+
         for name, key in [
-            ("Source",     "source_preview.png"),
             ("WB",         "01_wb_preview.png"),
             ("Exposed",    "02_exposed_preview.png"),
             ("Lobe",       "03_hot_mask.png"),
@@ -421,10 +882,19 @@ class PreviewPanel(QWidget):
             self._tabs.addTab(sc, name); self._labels[key] = lbl
         self.clear()
 
+    def set_search_rect(self, rect_uv: Optional[tuple]):
+        self._source_label.set_rect_uv(rect_uv)
+
     def clear(self):
-        for lbl in self._labels.values():
-            lbl.setText("─"); lbl.setStyleSheet("background:#10101a; color:#282840; font-size:28px;")
-            lbl.setPixmap(QPixmap())
+        for key, lbl in self._labels.items():
+            if isinstance(lbl, RectDrawLabel):
+                lbl.set_base_pixmap(QPixmap())
+                lbl.setText("─")
+                lbl.setStyleSheet("background:#10101a; color:#282840; font-size:28px;")
+            else:
+                lbl.setText("─")
+                lbl.setStyleSheet("background:#10101a; color:#282840; font-size:28px;")
+                lbl.setPixmap(QPixmap())
 
     def update_preview(self, path):
         fname = os.path.basename(path)
@@ -432,10 +902,15 @@ class PreviewPanel(QWidget):
             if fname == os.path.basename(key) or path.endswith(key):
                 px = QPixmap(path)
                 if not px.isNull():
-                    lbl.setPixmap(px.scaled(
-                        lbl.width() or 600, lbl.height() or 400,
-                        Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    lbl.setStyleSheet("background:#10101a;"); lbl.setText("")
+                    if isinstance(lbl, RectDrawLabel):
+                        lbl.set_base_pixmap(px)
+                        lbl.setStyleSheet("background:#10101a;")
+                        lbl.setText("")
+                    else:
+                        lbl.setPixmap(px.scaled(
+                            lbl.width() or 600, lbl.height() or 400,
+                            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                        lbl.setStyleSheet("background:#10101a;"); lbl.setText("")
                 break
 
 
@@ -689,12 +1164,21 @@ class SettingsPanel(QScrollArea):
         self.albedo.setDecimals(4)
         self.albedo.setToolTip("Reflectance of the target grey card / swatch")
 
+        self.validate_energy = QCheckBox("Run energy & calibration validation")
+        self.validate_energy.setChecked(False)
+        self.validate_energy.setToolTip(
+            "Optional post-process: renders a grey sphere, integrates the 6-axis "
+            "irradiance map, prints E=π / grey-card predictions, and writes "
+            "meta['energy_validation'] in the report.\n"
+            "Adds ~1–2 s; off by default — debug aid, not a calibration step.")
+
         f.addRow("WB source",        self.wb_source)
         f.addRow("Exposure source",  self.exp_source)
         f.addRow("Integration mode", self.integration_mode)
         f.addRow("Sun solve",        self.solver_mode)
         f.addRow("Final balance",   self.final_balance_target)
         f.addRow("Albedo",          self.albedo)
+        f.addRow("Validation",       self.validate_energy)
         self._adv_groups.append(grp)
 
         grp = QGroupBox("Sun / Hot Lobe")
@@ -727,66 +1211,94 @@ class SettingsPanel(QScrollArea):
         f.addRow("Gain rolloff",    self.sun_gain_rolloff)
         self._adv_groups.append(grp)
 
-        grp = QGroupBox("Chart Sweep")
+        grp = QGroupBox("Chart Detection")
         f = QFormLayout(grp)
-        self.sweep_fov = QDoubleSpinBox()
-        self.sweep_fov.setRange(30.0, 140.0)
-        self.sweep_fov.setValue(70.0)
-        self.sweep_fov.setDecimals(0)
-        self.sweep_fov.setSuffix("°")
-        self.sweep_fov.setToolTip("Tile field of view for chart sweep")
-        self.sweep_overlap = QDoubleSpinBox()
-        self.sweep_overlap.setRange(0.0, 60.0)
-        self.sweep_overlap.setValue(10.0)
-        self.sweep_overlap.setDecimals(0)
-        self.sweep_overlap.setSuffix("°")
-        self.sweep_overlap.setToolTip("Overlap between adjacent sweep tiles")
-        self.sweep_min_pitch = QDoubleSpinBox()
-        self.sweep_min_pitch.setRange(-90.0, 45.0)
-        self.sweep_min_pitch.setValue(-30.0)
-        self.sweep_min_pitch.setDecimals(0)
-        self.sweep_min_pitch.setSuffix("°")
-        self.sweep_min_pitch.setToolTip("Lowest pitch (-90=zenith, 0=horizon, default -30)")
-        self.sweep_max_pitch = QDoubleSpinBox()
-        self.sweep_max_pitch.setRange(0.0, 90.0)
-        self.sweep_max_pitch.setValue(90.0)
-        self.sweep_max_pitch.setDecimals(0)
-        self.sweep_max_pitch.setSuffix("°")
-        self.sweep_max_pitch.setToolTip("Highest pitch (+90=nadir/ground, default 90)")
         self.cc_min_confidence = QDoubleSpinBox()
         self.cc_min_confidence.setRange(0.0, 1.0)
         self.cc_min_confidence.setSingleStep(0.05)
         self.cc_min_confidence.setDecimals(2)
         self.cc_min_confidence.setValue(0.50)
         self.cc_min_confidence.setToolTip(
-            "Minimum detection confidence (neutral-ramp chroma agreement, 0-1). "
-            "Raise to reject partial-chart detections that produce wrong "
-            "rectified pose and bad swatches. 0.50 default, 0.75+ strict.")
-        self.cc_early_exit_confidence = QDoubleSpinBox()
-        self.cc_early_exit_confidence.setRange(0.0, 1.0)
-        self.cc_early_exit_confidence.setSingleStep(0.05)
-        self.cc_early_exit_confidence.setDecimals(2)
-        self.cc_early_exit_confidence.setValue(0.50)
-        self.cc_early_exit_confidence.setToolTip(
-            "Sweep stops when a tile scores at or above this (0-1). "
-            "Default matches Min confidence so the first accepted hit ends "
-            "the sweep. Raise it above Min to keep searching for a better "
-            "tile before stopping. Clamped to >= Min at runtime.")
-        f.addRow("Sweep FOV",       self.sweep_fov)
-        f.addRow("Sweep overlap",   self.sweep_overlap)
-        f.addRow("Min pitch",       self.sweep_min_pitch)
-        f.addRow("Max pitch",       self.sweep_max_pitch)
+            "Minimum auto-detect confidence inside the user-drawn rect. "
+            "If the auto-detect fails or scores below this, use 'Place chart "
+            "corners' to set the 4 corners manually.")
         f.addRow("Min confidence",  self.cc_min_confidence)
-        f.addRow("Early-exit conf", self.cc_early_exit_confidence)
-        self._adv_groups.append(grp)
+
+        # Search rect indicator (set by drawing on the Source preview)
+        self._cc_rect_label = QLabel("(none — draw on Source preview)")
+        self._cc_rect_label.setStyleSheet("color: #606080; font-size: 10px;")
+        self.cc_search_rect: Optional[tuple] = None
+        rect_row = QHBoxLayout()
+        rect_row.addWidget(self._cc_rect_label)
+        rect_row.addStretch()
+        clear_rect_btn = QPushButton("Clear")
+        clear_rect_btn.setMaximumWidth(50)
+        clear_rect_btn.clicked.connect(self._clear_cc_rect)
+        rect_row.addWidget(clear_rect_btn)
+        f.addRow("Search rect", rect_row)
+
+        # Auto-detect kept as a hidden code path; manual placement is the
+        # advertised workflow. (Auto-detect was unreliable on real charts
+        # — see _on_detect_chart_in_rect for a dev-only entry point.)
+        self.detect_chart_btn = QPushButton("Detect Chart In Rect")
+        self.detect_chart_btn.setVisible(False)
+        self.pick_chart_btn = QPushButton("Place Chart Corners")
+        self.pick_chart_btn.setToolTip(
+            "Open the rectilinear crop of the search rect and click 4 corners "
+            "(TL → TR → BR → BL).")
+        self._cc_corners_label = QLabel("(not set)")
+        self._cc_corners_label.setStyleSheet("color: #606080; font-size: 10px;")
+        self.cc_manual_corners: Optional[list] = None
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.pick_chart_btn)
+        f.addRow("Place chart", btn_row)
+        corners_row = QHBoxLayout()
+        corners_row.addWidget(self._cc_corners_label)
+        corners_row.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setMaximumWidth(50)
+        clear_btn.clicked.connect(self._clear_cc_corners)
+        corners_row.addWidget(clear_btn)
+        f.addRow("Manual corners", corners_row)
+
+        # Chart Detection is always visible — primary workflow, not "advanced".
+        self._chart_detection_group = grp
 
         for grp in self._adv_groups:
             self._lay.addWidget(grp)
+        # Add chart detection last so it sits at the bottom of the settings
+        # column, near the action buttons.
+        self._lay.addWidget(self._chart_detection_group)
 
     def _sync_calibration_mode(self):
         show_advanced = (self.calibration_mode.currentText() == "advanced")
         for grp in self._adv_groups:
             grp.setVisible(show_advanced)
+
+    def _clear_cc_corners(self):
+        self.cc_manual_corners = None
+        self._cc_corners_label.setText("(not set)")
+        self._cc_corners_label.setStyleSheet("color: #606080; font-size: 10px;")
+
+    def _set_cc_corners(self, corners: list):
+        self.cc_manual_corners = corners
+        self._cc_corners_label.setText(f"4 corners set")
+        self._cc_corners_label.setStyleSheet("color: #58c080; font-size: 10px;")
+
+    def _clear_cc_rect(self):
+        self.cc_search_rect = None
+        self._cc_rect_label.setText("(none — draw on Source preview)")
+        self._cc_rect_label.setStyleSheet("color: #606080; font-size: 10px;")
+
+    def _set_cc_rect(self, rect_uv: Optional[tuple]):
+        if rect_uv is None:
+            self._clear_cc_rect()
+            return
+        u0, v0, u1, v1 = rect_uv
+        self.cc_search_rect = (float(u0), float(v0), float(u1), float(v1))
+        self._cc_rect_label.setText(
+            f"u=[{u0:.3f}, {u1:.3f}]  v=[{v0:.3f}, {v1:.3f}]")
+        self._cc_rect_label.setStyleSheet("color: #58c080; font-size: 10px;")
 
     def _reset_photographic_controls(self):
         self._set_base_intensity_value(1.0)
@@ -882,12 +1394,10 @@ class SettingsPanel(QScrollArea):
         cfg.lobe_neutralise = self.lobe_neutralise.value()
         cfg.sun_gain_ceiling = self.sun_gain_ceiling.value()
         cfg.sun_gain_rolloff = self.sun_gain_rolloff.value()
-        cfg.sweep_fov = self.sweep_fov.value()
-        cfg.sweep_overlap = self.sweep_overlap.value()
         cfg.cc_min_confidence = self.cc_min_confidence.value()
-        cfg.cc_early_exit_confidence = self.cc_early_exit_confidence.value()
-        cfg.sweep_min_pitch = self.sweep_min_pitch.value()
-        cfg.sweep_max_pitch = self.sweep_max_pitch.value()
+        cfg.cc_search_rect = self.cc_search_rect
+        cfg.cc_manual_corners = self.cc_manual_corners
+        cfg.validate_energy = bool(self.validate_energy.isChecked())
 
         return cfg
 
@@ -945,7 +1455,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HDRI Calibration  ·  VFX Pipeline Tool")
-        self.resize(1380, 880)
+        self.resize(1280, 860)
+        # _file_items kept as a 0-or-1 length list so the rest of the code can
+        # still index it; batch UI was removed but the data model is unchanged.
         self._file_items:   List[FileItem]           = []
         self._current_item: Optional[FileItem]       = None
         self._worker:       Optional[PipelineWorker] = None
@@ -953,7 +1465,24 @@ class MainWindow(QMainWindow):
         self._pool          = QThreadPool(); self._pool.setMaxThreadCount(1)
         self._running       = False; self._abort_flag = False
         self._syncing_settings = False
+        self.setAcceptDrops(True)  # window-wide drag/drop
         self._build_ui(); self._check_hdri_cal()
+
+    # Drag-and-drop on the whole window ──
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            for u in e.mimeData().urls():
+                if u.toLocalFile().lower().endswith(
+                        (".exr", ".hdr", ".jpg", ".jpeg", ".png", ".webp")):
+                    e.acceptProposedAction()
+                    return
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls()
+                 if u.toLocalFile().lower().endswith(
+                     (".exr", ".hdr", ".jpg", ".jpeg", ".png", ".webp"))]
+        if paths:
+            self._on_files_dropped(paths[:1])  # single-file workflow
 
     def _build_ui(self):
         self.setStyleSheet(VFX_STYLE)
@@ -965,63 +1494,45 @@ class MainWindow(QMainWindow):
         self._val_btn.clicked.connect(self._on_validate)
         self._abort_btn = QPushButton("■  Abort"); self._abort_btn.setObjectName("abort_btn")
         self._abort_btn.setEnabled(False); self._abort_btn.clicked.connect(self._on_abort)
+        self._open_btn = QPushButton("📂  Open")
+        self._open_btn.clicked.connect(self._on_browse_open)
+        self._clear_btn = QPushButton("✕  Clear")
+        self._clear_btn.setToolTip("Unload the current file")
+        self._clear_btn.clicked.connect(self._clear_queue)
+        self._out_btn = QPushButton("📁  Output Folder")
+        self._out_btn.clicked.connect(self._open_output_folder)
+        tb.addWidget(self._open_btn); tb.addWidget(self._clear_btn)
+        tb.addSeparator()
         tb.addWidget(self._run_btn); tb.addWidget(self._val_btn); tb.addWidget(self._abort_btn)
+        tb.addSeparator()
+        tb.addWidget(self._out_btn)
         tb.addSeparator()
         self._progress = QProgressBar(); self._progress.setMaximumWidth(180)
         self._progress.setMaximumHeight(12); self._progress.setVisible(False)
         tb.addWidget(self._progress)
 
+        # Current file indicator pinned to the right of the toolbar.
+        self._file_label = QLabel("No file loaded — drag & drop EXR / HDR / PNG / WebP")
+        self._file_label.setStyleSheet("color: #808098; padding-left: 12px;")
+        tb.addWidget(self._file_label)
+
         sp = QSplitter(Qt.Horizontal); self.setCentralWidget(sp)
 
-        # LEFT
-        left = QWidget(); left.setMinimumWidth(220); left.setMaximumWidth(320)
-        ll = QVBoxLayout(left); ll.setContentsMargins(8,8,8,8); ll.setSpacing(6)
-        hdr = QLabel("HDRI Cal"); hdr.setObjectName("header")
-        sub = QLabel("IBL Calibration Pipeline"); sub.setObjectName("subheader")
-        ll.addWidget(hdr); ll.addWidget(sub)
-        div = QFrame(); div.setObjectName("divider"); div.setFixedHeight(1); ll.addWidget(div)
-        self._drop = DropZone(); self._drop.files_dropped.connect(self._on_files_dropped)
-        ll.addWidget(self._drop)
-        qh = QHBoxLayout(); qh.addWidget(QLabel("Queue"))
-        bc = QPushButton("Clear Files"); bc.setMinimumWidth(88); bc.setMaximumHeight(22)
-        bc.clicked.connect(self._clear_queue); qh.addStretch(); qh.addWidget(bc); ll.addLayout(qh)
-
-        qh2 = QHBoxLayout()
-        self._remove_btn = QPushButton("Remove Selected")
-        self._remove_btn.setMaximumHeight(22)
-        self._remove_btn.clicked.connect(self._remove_selected)
-        self._requeue_btn = QPushButton("Requeue Selected")
-        self._requeue_btn.setMaximumHeight(22)
-        self._requeue_btn.clicked.connect(self._requeue_selected)
-        ll_btn = QPushButton("Open Output Folder")
-        ll_btn.setMaximumHeight(22)
-        ll_btn.clicked.connect(self._open_output_folder)
-        qh2.addWidget(self._remove_btn)
-        qh2.addWidget(self._requeue_btn)
-        ll.addLayout(qh2)
-        ll.addWidget(ll_btn)
-
-        self._file_list = QListWidget()
-        self._file_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._file_list.currentRowChanged.connect(self._on_file_selected)
-        ll.addWidget(self._file_list)
-        self._q_status = QLabel("0 files"); self._q_status.setObjectName("subheader")
-        ll.addWidget(self._q_status); sp.addWidget(left)
-
-        # CENTRE
+        # LEFT (preview + log/report)
         centre = QWidget(); cl = QVBoxLayout(centre); cl.setContentsMargins(4,4,4,4); cl.setSpacing(4)
         vs = QSplitter(Qt.Vertical)
         self._preview = PreviewPanel(); vs.addWidget(self._preview)
+        self._preview.search_rect_drawn.connect(self._on_search_rect_drawn)
         bot = QTabWidget(); self._log = LogPanel(); self._report = ReportPanel()
         bot.addTab(self._log, "Log"); bot.addTab(self._report, "Report"); vs.addWidget(bot)
         vs.setSizes([540, 200]); cl.addWidget(vs); sp.addWidget(centre)
 
-        # RIGHT
-        right = QWidget(); right.setMinimumWidth(270); right.setMaximumWidth(350)
+        # RIGHT (settings)
+        right = QWidget(); right.setMinimumWidth(280); right.setMaximumWidth(360)
         rl = QVBoxLayout(right); rl.setContentsMargins(4,4,4,4)
         lbl = QLabel("Settings"); lbl.setObjectName("section"); rl.addWidget(lbl)
         self._settings = SettingsPanel(); rl.addWidget(self._settings); sp.addWidget(right)
-        sp.setSizes([270, 780, 310])
+        sp.setSizes([960, 320])
 
         self._source_preview_timer = QTimer(self)
         self._source_preview_timer.setSingleShot(True)
@@ -1029,7 +1540,7 @@ class MainWindow(QMainWindow):
         self._connect_settings_signals()
 
         self._status = QStatusBar(); self.setStatusBar(self._status)
-        self._status.showMessage("Ready  ·  Drop EXR / HDR / PNG / WebP files to begin")
+        self._status.showMessage("Ready  ·  Drop EXR / HDR / PNG / WebP into the window to begin")
 
     def _connect_settings_signals(self):
         for signal in [
@@ -1049,14 +1560,171 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.valueChanged,
             self._settings.sun_gain_ceiling.valueChanged,
             self._settings.sun_gain_rolloff.valueChanged,
-            self._settings.sweep_fov.editingFinished,
-            self._settings.sweep_overlap.editingFinished,
-            self._settings.sweep_min_pitch.editingFinished,
-            self._settings.sweep_max_pitch.editingFinished,
             self._settings.cc_min_confidence.editingFinished,
-            self._settings.cc_early_exit_confidence.editingFinished,
+            self._settings.validate_energy.toggled,
         ]:
             signal.connect(self._on_settings_changed)
+        self._settings.pick_chart_btn.clicked.connect(self._on_pick_chart_corners)
+        self._settings.detect_chart_btn.clicked.connect(self._on_detect_chart_in_rect)
+
+    def _on_search_rect_drawn(self, rect_uv: tuple):
+        """User dragged out a search rect on the Source preview. Only records
+        the rect — no detection, no preview rebuild."""
+        self._settings._set_cc_rect(rect_uv)
+        # Clear any stale manual corners so they don't override a fresh rect.
+        self._settings._clear_cc_corners()
+        # Persist on the current FileItem without triggering a source preview
+        # refresh (which reloads the EXR/PNG and takes seconds).
+        idx = self._selected_index()
+        if idx is not None:
+            fi = self._file_items[idx]
+            fi.config = self._settings.build_config(fi.path)
+        u0, v0, u1, v1 = rect_uv
+        self._status.showMessage(
+            f"Search rect set:  u=[{u0:.3f}, {u1:.3f}]  v=[{v0:.3f}, {v1:.3f}]  "
+            f"— click 'Place Chart Corners' to set the chart.")
+
+    def _load_selected_erp(self) -> Optional[np.ndarray]:
+        """Load the currently selected HDRI as a linear float32 latlong."""
+        idx = self._selected_index()
+        if idx is None:
+            QMessageBox.warning(self, "No file selected",
+                                "Select an HDRI file first.")
+            return None
+        fi = self._file_items[idx]
+        try:
+            import hdri_cal as hc
+            img, _meta = hc.load_image_any(fi.path, target_colorspace="acescg")
+            return np.asarray(img, dtype=np.float32)
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed",
+                                 f"Could not load HDRI:\n{e}")
+            return None
+
+    def _on_detect_chart_in_rect(self):
+        rect_uv = self._settings.cc_search_rect
+        if rect_uv is None:
+            QMessageBox.information(
+                self, "No search rectangle",
+                "Draw a search rectangle on the Source preview first, then "
+                "click 'Detect Chart In Rect'.")
+            return
+        erp = self._load_selected_erp()
+        if erp is None:
+            return
+        try:
+            from colorchecker_erp import find_colorchecker_in_rect
+        except Exception as e:
+            QMessageBox.critical(self, "Detector unavailable", str(e))
+            return
+        # Always write debug JPEGs for the button-triggered detect so the user
+        # can isolate projection vs detection issues with cc_debug.py.
+        fi = self._file_items[self._selected_index()]
+        debug_dir = os.path.abspath(os.path.join(
+            os.path.dirname(fi.path) or ".",
+            "cc_debug_out", "detect_" + Path(fi.path).stem))
+        os.makedirs(debug_dir, exist_ok=True)
+        self._log.append(f"[detect] debug dir: {debug_dir}")
+        # Also dump the linear ERP crop (before display-map) so cc_debug.py
+        # can compare what the detector sees vs the source.
+        try:
+            from colorchecker_erp import (
+                erp_to_rectilinear, _rect_uv_to_tile_params,
+                _linear_to_u8_for_display,
+            )
+            yaw, pitch, fov = _rect_uv_to_tile_params(tuple(rect_uv))
+            u0, v0, u1, v1 = rect_uv
+            span_u = abs(u1 - u0) * 360.0
+            span_v = abs(v1 - v0) * 180.0
+            if span_u >= span_v:
+                out_w = 1024
+                out_h = max(64, int(round(1024 * (span_v / max(span_u, 1e-6)))))
+            else:
+                out_h = 1024
+                out_w = max(64, int(round(1024 * (span_u / max(span_v, 1e-6)))))
+            tile_linear, _ = erp_to_rectilinear(erp, yaw, pitch, fov, out_w, out_h)
+            # Save a 32-bit-ish linear .exr too, for completeness
+            try:
+                cv2.imwrite(os.path.join(debug_dir, "rect_tile_linear.exr"),
+                            cv2.cvtColor(tile_linear, cv2.COLOR_RGB2BGR))
+            except Exception:
+                pass
+            disp = _linear_to_u8_for_display(tile_linear)
+            # Also write under the name the preview pane picks up (Chart Tile tab).
+            for name in ("rect_tile_display.jpg", "cc_detected_tile.jpg"):
+                cv2.imwrite(os.path.join(debug_dir, name),
+                            cv2.cvtColor(disp, cv2.COLOR_RGB2BGR))
+            # Surface the tile in the GUI's Chart Tile preview immediately.
+            self._preview.update_preview(
+                os.path.join(debug_dir, "cc_detected_tile.jpg"))
+        except Exception as e:
+            self._log.append_warn(f"[detect] could not save extra debug: {e}")
+
+        self._status.showMessage("Detecting chart in rect ...")
+        QApplication.processEvents()
+        swatches, info = find_colorchecker_in_rect(
+            erp, rect_uv=tuple(rect_uv), colorspace="acescg",
+            debug_dir=debug_dir,
+            min_confidence=float(self._settings.cc_min_confidence.value()),
+        )
+        # List what actually landed on disk so the user knows immediately.
+        try:
+            files = sorted(os.listdir(debug_dir))
+            self._log.append(f"[detect] wrote {len(files)} files to {debug_dir}:")
+            for f in files:
+                self._log.append(f"    {f}")
+        except Exception:
+            pass
+        if info.get("found"):
+            centres_uv = info.get("swatch_centres_uv") or []
+            if len(centres_uv) == 24:
+                # Approximate chart quad from outer swatch centres.
+                pts = np.array(centres_uv, dtype=np.float32)
+                tl = pts[0]; tr = pts[5]; br = pts[23]; bl = pts[18]
+                self._settings._set_cc_corners([
+                    (float(tl[0]), float(tl[1])),
+                    (float(tr[0]), float(tr[1])),
+                    (float(br[0]), float(br[1])),
+                    (float(bl[0]), float(bl[1])),
+                ])
+                self._on_settings_changed()
+            self._status.showMessage(
+                f"Chart found  conf={info.get('confidence', 0):.2f}")
+            self._log.append(
+                f"[detect] found  conf={info.get('confidence', 0):.2f}  "
+                f"yaw={info.get('best_tile_yaw_deg', 0):.1f}° "
+                f"pitch={info.get('best_tile_pitch_deg', 0):.1f}° "
+                f"fov={info.get('best_tile_fov_deg', 0):.1f}°")
+        else:
+            self._status.showMessage(
+                "Chart not detected — try 'Place Chart Corners' to set "
+                "them manually.")
+            self._log.append_warn(
+                f"[detect] no chart in rect  "
+                f"conf={info.get('confidence', 0):.2f}")
+            # Pop the debug folder open so the user can see what was written.
+            try:
+                os.startfile(debug_dir)
+            except Exception:
+                pass
+
+    def _on_pick_chart_corners(self):
+        rect_uv = self._settings.cc_search_rect
+        if rect_uv is None:
+            QMessageBox.information(
+                self, "No search rectangle",
+                "Draw a search rectangle on the Source preview first, then "
+                "click 'Place Chart Corners'.")
+            return
+        erp = self._load_selected_erp()
+        if erp is None:
+            return
+        dlg = ChartCornerPicker(erp_linear=erp, rect_uv=tuple(rect_uv),
+                                parent=self)
+        if dlg.exec() == QDialog.Accepted and dlg.corners_uv is not None:
+            self._settings._set_cc_corners(dlg.corners_uv)
+            self._on_settings_changed()
+            self._status.showMessage("Chart corners set manually (4 points)")
 
     def _apply_config_to_settings(self, cfg: PipelineConfig):
         self._syncing_settings = True
@@ -1078,12 +1746,15 @@ class MainWindow(QMainWindow):
             self._settings.lobe_neutralise.setValue(float(getattr(cfg, "lobe_neutralise", 1.0)))
             self._settings.sun_gain_ceiling.setValue(float(getattr(cfg, "sun_gain_ceiling", 2000.0)))
             self._settings.sun_gain_rolloff.setValue(float(getattr(cfg, "sun_gain_rolloff", 500.0)))
-            self._settings.sweep_fov.setValue(float(getattr(cfg, "sweep_fov", 70.0)))
-            self._settings.sweep_overlap.setValue(float(getattr(cfg, "sweep_overlap", 10.0)))
-            self._settings.sweep_min_pitch.setValue(float(getattr(cfg, "sweep_min_pitch", -30.0)))
-            self._settings.sweep_max_pitch.setValue(float(getattr(cfg, "sweep_max_pitch", 90.0)))
             self._settings.cc_min_confidence.setValue(float(getattr(cfg, "cc_min_confidence", 0.50)))
-            self._settings.cc_early_exit_confidence.setValue(float(getattr(cfg, "cc_early_exit_confidence", 0.50)))
+            self._settings.validate_energy.setChecked(bool(getattr(cfg, "validate_energy", False)))
+            rect = getattr(cfg, "cc_search_rect", None)
+            self._settings._set_cc_rect(rect)
+            corners = getattr(cfg, "cc_manual_corners", None)
+            if corners:
+                self._settings._set_cc_corners(corners)
+            else:
+                self._settings._clear_cc_corners()
             self._settings._sync_calibration_mode()
         finally:
             self._syncing_settings = False
@@ -1109,21 +1780,32 @@ class MainWindow(QMainWindow):
             return
         self._request_source_preview_refresh()
 
-    # ── File queue ────────────────────────────────────────────────────────
+    # ── Single-file load ──────────────────────────────────────────────────
     def _on_files_dropped(self, paths):
-        added = 0
-        for p in paths:
-            if not any(fi.path == p for fi in self._file_items):
-                fi = FileItem(p)
-                fi.config = self._settings.build_config(p)
-                self._file_items.append(fi)
-                self._ensure_source_preview(fi)
-                it = QListWidgetItem(f"{ICON_WAIT}  {fi.name}"); it.setForeground(QColor(fi.color()))
-                self._file_list.addItem(it); added += 1
+        if not paths:
+            return
+        if self._running:
+            self._status.showMessage("Cannot load while a job is running")
+            return
+        p = paths[0]
+        # Replace current file (single-file workflow).
+        self._file_items.clear()
+        self._current_item = None
+        self._preview.clear(); self._report.clear()
+        fi = FileItem(p)
+        fi.config = self._settings.build_config(p)
+        self._file_items.append(fi)
+        self._ensure_source_preview(fi)
         self._update_q()
-        if self._file_list.count() and self._file_list.currentRow() < 0:
-            self._file_list.setCurrentRow(0)
-        if added: self._status.showMessage(f"Added {added} file(s)")
+        self._on_file_selected(0)
+        self._status.showMessage(f"Loaded: {fi.name}")
+
+    def _on_browse_open(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open HDRI", "",
+            "HDRI Images (*.exr *.hdr *.jpg *.jpeg *.png *.webp);;All Files (*.*)")
+        if path:
+            self._on_files_dropped([path])
 
     def _request_source_preview_refresh(self, *_args):
         if not hasattr(self, "_source_preview_timer"):
@@ -1140,49 +1822,12 @@ class MainWindow(QMainWindow):
             self._on_file_selected(idx)
 
     def _selected_index(self):
-        row = self._file_list.currentRow()
-        if row < 0 or row >= len(self._file_items):
-            return None
-        return row
-
-    def _remove_selected(self):
-        if self._running:
-            return
-        idx = self._selected_index()
-        if idx is None:
-            return
-        self._file_items.pop(idx)
-        self._file_list.takeItem(idx)
-        if not self._file_items:
-            self._current_item = None
-            self._preview.clear()
-            self._report.clear()
-        else:
-            self._file_list.setCurrentRow(min(idx, len(self._file_items) - 1))
-        self._update_q()
-        self._status.showMessage("Removed selected file")
-
-    def _requeue_selected(self):
-        idx = self._selected_index()
-        if idx is None:
-            return
-        fi = self._file_items[idx]
-        if fi.status == "running":
-            return
-        source_preview = fi.source_preview
-        fi.status = "waiting"
-        fi.warnings = []
-        fi.report = {}
-        fi.previews = [source_preview] if source_preview else []
-        self._refresh_item(idx)
-        if self._current_item is fi:
-            self._on_file_selected(idx)
-        self._update_q()
-        self._status.showMessage(f"Requeued: {fi.name}")
+        return 0 if self._file_items else None
 
     def _open_output_folder(self):
         idx = self._selected_index()
         if idx is None:
+            QMessageBox.information(self, "No file", "Load a file first.")
             return
         fi = self._file_items[idx]
         cfg = self._current_config_for(fi)
@@ -1191,12 +1836,20 @@ class MainWindow(QMainWindow):
         try:
             os.startfile(out_dir)
         except Exception as e:
-            QMessageBox.warning(self, "Open Folder", f"Could not open output folder:\n{e}")
+            QMessageBox.warning(self, "Open Folder",
+                                f"Could not open output folder:\n{e}")
 
     def _clear_queue(self):
-        if self._running: return
-        self._file_items.clear(); self._file_list.clear()
-        self._preview.clear(); self._report.clear(); self._update_q()
+        if self._running:
+            return
+        self._file_items.clear()
+        self._current_item = None
+        self._preview.clear()
+        self._report.clear()
+        self._update_q()
+        self._settings._clear_cc_rect()
+        self._settings._clear_cc_corners()
+        self._status.showMessage("Cleared")
 
     def _photographic_rgb_scale(self, cfg: PipelineConfig):
         import hdri_cal as hc
@@ -1265,20 +1918,19 @@ class MainWindow(QMainWindow):
             return None
 
     def _update_q(self):
-        n = len(self._file_items)
-        ok = sum(1 for fi in self._file_items if fi.status == "ok")
-        w  = sum(1 for fi in self._file_items if fi.status == "warn")
-        e  = sum(1 for fi in self._file_items if fi.status == "error")
-        parts = [f"{n} file{'s' if n!=1 else ''}"]
-        if ok: parts.append(f"{ok} ✓")
-        if w:  parts.append(f"{w} ⚠")
-        if e:  parts.append(f"{e} ✕")
-        self._q_status.setText("  ·  ".join(parts))
+        if not self._file_items:
+            self._file_label.setText(
+                "No file loaded — drag & drop EXR / HDR / PNG / WebP")
+            self._file_label.setStyleSheet("color: #808098; padding-left: 12px;")
+            return
+        fi = self._file_items[0]
+        self._file_label.setText(f"{fi.icon()}  {fi.name}")
+        self._file_label.setStyleSheet(
+            f"color: {fi.color()}; padding-left: 12px; font-weight: 600;")
 
     def _refresh_item(self, idx):
-        if idx < 0 or idx >= self._file_list.count(): return
-        fi = self._file_items[idx]; it = self._file_list.item(idx)
-        it.setText(f"{fi.icon()}  {fi.name}"); it.setForeground(QColor(fi.color()))
+        # Single-file mode — the toolbar label is updated by _update_q().
+        self._update_q()
 
     def _on_file_selected(self, row):
         if row < 0 or row >= len(self._file_items): return
@@ -1287,16 +1939,65 @@ class MainWindow(QMainWindow):
         self._ensure_source_preview(fi)
         self._preview.clear()
         for p in fi.previews: self._preview.update_preview(p)
+        if fi.source_preview and os.path.exists(fi.source_preview):
+            self._preview.update_preview(fi.source_preview)
+        # Re-apply any persisted search rect overlay on top of the source.
+        self._preview.set_search_rect(self._settings.cc_search_rect)
         self._report.update(fi.report, fi.warnings)
 
     # ── Run / Validate ────────────────────────────────────────────────────
     def _on_run(self):
-        if not self._file_items: QMessageBox.information(self, "No files", "Add HDRI files first."); return
-        if not self._running: self._run_all(False)
+        if not self._file_items:
+            QMessageBox.information(self, "No file",
+                                    "Drop or open an HDRI file first.")
+            return
+        if self._running:
+            return
+        if not self._prompt_chart_setup_if_needed():
+            return
+        self._run_single(validate_only=False)
+
+    def _prompt_chart_setup_if_needed(self) -> bool:
+        """If the user hasn't set up chart detection, ask what they want.
+        Returns True if the run should proceed, False if it was cancelled."""
+        if (self._settings.cc_manual_corners is not None
+                or self._settings.cc_search_rect is not None):
+            return True
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("ColorChecker not set up")
+        msg.setText("No chart corners are set.\n\n"
+                    "Place the chart now, or skip chart-based calibration?")
+        manual_btn = msg.addButton("Place corners", QMessageBox.AcceptRole)
+        skip_btn = msg.addButton("Skip chart", QMessageBox.DestructiveRole)
+        cancel_btn = msg.addButton(QMessageBox.Cancel)
+        msg.setDefaultButton(manual_btn)
+        msg.exec()
+        clicked = msg.clickedButton()
+
+        if clicked is cancel_btn:
+            return False
+        if clicked is skip_btn:
+            self._log.append("Chart detection skipped — using base settings only.")
+            return True
+        # Manual placement needs a search rect first.
+        if self._settings.cc_search_rect is None:
+            QMessageBox.information(
+                self, "Draw a search rectangle",
+                "Drag a rectangle on the Source preview to mark where the "
+                "ColorChecker is, then click 'Place Chart Corners'.")
+            return False
+        self._on_pick_chart_corners()
+        return False
 
     def _on_validate(self):
-        if not self._file_items: QMessageBox.information(self, "No files", "Add HDRI files first."); return
-        if not self._running: self._run_validate_all()
+        if not self._file_items:
+            QMessageBox.information(self, "No file", "Load a file first.")
+            return
+        if self._running:
+            return
+        self._run_single(validate_only=True)
 
     def _on_abort(self):
         self._abort_flag = True
@@ -1305,51 +2006,50 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, state):
         self._running = state
-        self._run_btn.setEnabled(not state); self._val_btn.setEnabled(not state)
-        self._abort_btn.setEnabled(state); self._progress.setVisible(state)
-        self._remove_btn.setEnabled(not state)
-        self._requeue_btn.setEnabled(True)
+        self._run_btn.setEnabled(not state)
+        self._val_btn.setEnabled(not state)
+        self._abort_btn.setEnabled(state)
+        self._progress.setVisible(state)
+        self._open_btn.setEnabled(not state)
+        self._clear_btn.setEnabled(not state)
 
     def _run_all(self, validate_only=False):
-        self._abort_flag = False; self._set_running(True); self._log.clear()
-        waiting = [i for i, fi in enumerate(self._file_items) if fi.status in ("waiting","warn","error")]
-        if not waiting: self._set_running(False); return
-        self._progress.setRange(0, len(waiting)); self._progress.setValue(0)
-        self._run_queue = list(waiting); self._run_done = 0
-        self._process_next(validate_only)
+        # Kept for backwards compat — single-file path.
+        self._run_single(validate_only=validate_only)
 
-    def _run_validate_all(self):
-        self._set_running(True); self._log.clear()
-        for i, fi in enumerate(self._file_items):
-            if self._abort_flag: break
-            fi.status = "running"; self._refresh_item(i)
-            self._file_list.setCurrentRow(i); QApplication.processEvents()
+    def _run_single(self, validate_only: bool = False):
+        if not self._file_items:
+            return
+        fi = self._file_items[0]
+        if validate_only:
+            self._set_running(True); self._log.clear()
+            fi.status = "running"; self._refresh_item(0); QApplication.processEvents()
             result = run_validate(fi.path, self._current_config_for(fi))
             fi.warnings = result.get("warnings", []); fi.report = result
             if not result.get("ok"):
-                fi.status = "error"; self._log.append_error(f"{fi.name}: {result.get('error')}")
+                fi.status = "error"
+                self._log.append_error(f"{fi.name}: {result.get('error')}")
             else:
                 fi.status = "warn" if fi.warnings else "ok"
-                clipped = "⚠ CLIPPED" if result.get("likely_clipped") else f"clip={result.get('clip_fraction',0):.3%}"
+                clipped = ("⚠ CLIPPED" if result.get("likely_clipped")
+                           else f"clip={result.get('clip_fraction', 0):.3%}")
                 self._log.append(
-                    f"{fi.name}  {result.get('resolution','?')}  "
-                    f"E_upper={result.get('E_upper',0):.3f}  {clipped}  "
-                    f"chroma={result.get('chroma_imbalance',0):.3f}",
+                    f"{fi.name}  {result.get('resolution', '?')}  "
+                    f"E_upper={result.get('E_upper', 0):.3f}  {clipped}  "
+                    f"chroma={result.get('chroma_imbalance', 0):.3f}",
                     "#80c0f0" if not fi.warnings else "#d8c040")
-            self._refresh_item(i)
-        self._update_q(); self._set_running(False)
-        self._status.showMessage("Validation complete")
-        if self._file_items: self._file_list.setCurrentRow(0)
-
-    def _process_next(self, validate_only=False):
-        if self._abort_flag or not self._run_queue:
+            self._refresh_item(0)
             self._set_running(False)
-            self._status.showMessage("Aborted" if self._abort_flag else f"Done — {self._run_done} file(s)")
-            self._update_q(); return
-        idx = self._run_queue.pop(0); fi = self._file_items[idx]
-        fi.status = "running"; fi.warnings = []; fi.previews = [fi.source_preview] if fi.source_preview else []
-        self._refresh_item(idx); self._file_list.setCurrentRow(idx)
-        cfg = self._current_config_for(fi); cfg.validate_only = validate_only
+            self._status.showMessage("Validation complete")
+            return
+
+        self._abort_flag = False
+        self._set_running(True); self._log.clear()
+        self._progress.setRange(0, 1); self._progress.setValue(0)
+        fi.status = "running"; fi.warnings = []
+        fi.previews = [fi.source_preview] if fi.source_preview else []
+        self._refresh_item(0)
+        cfg = self._current_config_for(fi); cfg.validate_only = False
         os.makedirs(cfg.debug_dir, exist_ok=True)
         self._status.showMessage(f"Processing: {fi.name}")
         self._log.append(f"\n{'─'*60}\n▶  {fi.name}", "#6080b8")
@@ -1357,8 +2057,8 @@ class MainWindow(QMainWindow):
         self._signals.log.connect(self._log.append)
         self._signals.warning.connect(self._log.append_warn)
         self._signals.preview.connect(self._on_preview)
-        self._signals.done.connect(lambda r, i=idx, f=fi: self._on_done(r, i, f, validate_only))
-        self._signals.error.connect(lambda e, i=idx, f=fi: self._on_error(e, i, f, validate_only))
+        self._signals.done.connect(lambda r, f=fi: self._on_done(r, f))
+        self._signals.error.connect(lambda e, f=fi: self._on_error(e, f))
         self._worker = PipelineWorker(cfg, self._signals)
         self._pool.start(self._worker)
 
@@ -1366,19 +2066,21 @@ class MainWindow(QMainWindow):
         if self._current_item: self._current_item.previews.append(path)
         self._preview.update_preview(path)
 
-    def _on_done(self, result, idx, fi, validate_only):
+    def _on_done(self, result, fi):
         fi.warnings = result.get("warnings", []); fi.report = result.get("report", {})
         fi.status = "warn" if fi.warnings else "ok"
-        self._refresh_item(idx); self._report.update(fi.report, fi.warnings)
-        self._run_done += 1; self._progress.setValue(self._progress.value() + 1)
+        self._refresh_item(0); self._report.update(fi.report, fi.warnings)
+        self._progress.setValue(1)
         self._log.append(f"✓  {fi.name}  complete", "#48c080")
-        QTimer.singleShot(50, lambda: self._process_next(validate_only))
+        self._set_running(False)
+        self._status.showMessage("Done")
 
-    def _on_error(self, err, idx, fi, validate_only):
+    def _on_error(self, err, fi):
         fi.status = "error"; fi.warnings = [err[:200]]
-        self._refresh_item(idx); self._log.append_error(f"{fi.name}:\n{err}")
-        self._run_done += 1; self._progress.setValue(self._progress.value() + 1)
-        QTimer.singleShot(50, lambda: self._process_next(validate_only))
+        self._refresh_item(0); self._log.append_error(f"{fi.name}:\n{err}")
+        self._progress.setValue(1)
+        self._set_running(False)
+        self._status.showMessage("Error")
 
     def _check_hdri_cal(self):
         try:

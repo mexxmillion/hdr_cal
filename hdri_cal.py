@@ -1368,7 +1368,8 @@ def calibrate_exposure_from_sphere(env_linear, plate_linear,
 
 try:
     from colorchecker_erp import (
-        find_colorchecker_in_erp,
+        find_colorchecker_in_rect,
+        find_colorchecker_manual,
         solve_color_matrix_from_swatches,
         apply_color_matrix,
         CC24_LINEAR_SRGB,
@@ -1797,22 +1798,31 @@ def _run_pipeline(args):
         cc_debug = os.path.join(args.debug_dir, "colorchecker")
         os.makedirs(cc_debug, exist_ok=True)
 
-        if checker_src == "__hdri__":
-            log("Searching for ColorChecker in HDRI latlong "
-                "(gnomonic tile sweep) ...")
-            cc_measured, cc_det_info = find_colorchecker_in_erp(
-                img,   # raw linear, no WB yet
+        cc_manual_corners = getattr(args, "cc_manual_corners", None)
+        cc_search_rect = getattr(args, "cc_search_rect", None)
+        if cc_manual_corners and checker_src == "__hdri__":
+            log("Using manually placed chart corners ...")
+            cc_measured, cc_det_info = find_colorchecker_manual(
+                img,
+                corners_uv=cc_manual_corners,
                 colorspace=working_cs,
                 debug_dir=cc_debug,
-                read_backend=getattr(args, "cc_read_backend", "auto"),
-                compare_backends=getattr(args, "cc_compare_backends", False),
-                sweep_fov=getattr(args, "sweep_fov", 50.0),
-                sweep_overlap=getattr(args, "sweep_overlap", 10.0),
-                sweep_min_pitch=getattr(args, "sweep_min_pitch", -30.0),
-                sweep_max_pitch=getattr(args, "sweep_max_pitch", 90.0),
-                min_confidence=getattr(args, "cc_min_confidence", 0.55),
-                early_exit_confidence=getattr(args, "cc_early_exit_confidence", 0.75),
             )
+        elif cc_search_rect and checker_src == "__hdri__":
+            log(f"Searching for ColorChecker in user rect "
+                f"{tuple(round(v, 3) for v in cc_search_rect)} ...")
+            cc_measured, cc_det_info = find_colorchecker_in_rect(
+                img,
+                rect_uv=tuple(cc_search_rect),
+                colorspace=working_cs,
+                debug_dir=cc_debug,
+                min_confidence=getattr(args, "cc_min_confidence", 0.50),
+            )
+        elif checker_src == "__hdri__":
+            log("Chart search skipped: no search rect drawn and no manual "
+                "corners — using existing no-chart fallback.")
+            cc_measured = None
+            cc_det_info = {"found": False, "reason": "no_search_rect_or_corners"}
         else:
             log(f"Loading ColorChecker plate: {checker_src}")
             cc_img_raw, _ = load_image_any(checker_src, target_colorspace=working_cs)
@@ -2356,15 +2366,6 @@ def _run_pipeline(args):
         _cos_up_exp = np.clip(_dirs_exp[..., 1], 0.0, None)
         E_upper_for_exp = float(np.sum(_lum_wb_exp * _cos_up_exp * _dOmega_exp))
 
-        if chart_is_in_hdri:
-            # Chart is inside the HDRI — classic formula: exposure = albedo / patch22_luma.
-            # Assumes chart is cleanly lit. Use --colorchecker plate.jpg + --chart-facing
-            # for pose-corrected exposure when chart is in shadow or at a known angle.
-            pose_mode  = "hdri_internal_classic"
-            E_on_chart = math.pi   # E=π → predicted = albedo → scale = albedo / measured
-            pose_note  = "Chart inside HDRI — classic formula (albedo / patch22_luma). Assumed clean."
-            log(f"  chart inside HDRI — using classic exposure formula (assumed clean illumination)")
-
         def _E_toward_exp(direction):
             D   = np.asarray(direction, dtype=np.float32)
             D  /= np.linalg.norm(D) + 1e-8
@@ -2375,23 +2376,25 @@ def _run_pipeline(args):
         POSE_TRIPOD_MAX = 130   # 50–130°      → vertical / tripod
         POSE_CONF_MIN   = 0.25  # below this, don't trust the detected normal
 
-        # Pose correction only runs for external reference plates.
-        # chart_is_in_hdri already set pose_mode/E_on_chart/pose_note above.
-        if not chart_is_in_hdri:
-          if chart_facing_override == "up":
+        # Pose-aware exposure runs whenever we have a confident chart normal,
+        # whether the chart is in the HDRI (manual corners / rect detect) or
+        # on a separate plate. The classic E=π fallback only kicks in if we
+        # have no usable pose data.
+        pose_mode = None
+        if chart_facing_override == "up":
             pose_mode  = "floor_forced"
             E_on_chart = E_upper_for_exp
             pose_note  = "--chart-facing up: E_upper used as incident"
 
-          elif chart_facing_override == "sun":
+        elif chart_facing_override == "sun":
             _sun_dir_for_exp = hot["center_dir"] if "hot" in dir() else np.array([0,1,0])
             pose_mode  = "sun_forced"
             E_on_chart = _E_toward_exp(_sun_dir_for_exp)
             pose_note  = "--chart-facing sun: E toward sun direction used"
 
-          elif (chart_normal_world is not None
-                and chart_normal_theta is not None
-                and chart_confidence >= POSE_CONF_MIN):
+        elif (chart_normal_world is not None
+              and chart_normal_theta is not None
+              and chart_confidence >= POSE_CONF_MIN):
             n = np.asarray(chart_normal_world, dtype=np.float32)
             if chart_normal_theta < POSE_FLOOR_MAX:
                 pose_mode  = "floor_detected"
@@ -2408,11 +2411,14 @@ def _run_pipeline(args):
                 E_on_chart = math.pi
                 pose_note  = (f"chart normal facing down (θ={chart_normal_theta:.1f}°) "
                               f"— detection unreliable, assuming E=π")
-          else:
+        else:
             pose_mode  = "fallback_no_pose"
             E_on_chart = math.pi
             pose_note  = (f"pose confidence {chart_confidence:.3f} < {POSE_CONF_MIN} "
                           f"or no pose data — assuming chart was metered toward key light (E=π)")
+
+        if chart_is_in_hdri and pose_mode and pose_mode != "fallback_no_pose":
+            log(f"  chart inside HDRI — pose-aware exposure: {pose_mode}")
 
         # ── Compute exposure scale ─────────────────────────────────────────
         # predicted_patch22_luma: what patch 22 SHOULD measure if scene is
@@ -2836,22 +2842,26 @@ def _run_pipeline(args):
         })
 
     # ── Validation render: final HDR → grey sphere ─────────────────────────
-    # This is the ground truth check. If the pipeline is correct, the sphere
-    # mean RGB must equal meter_target on every channel independently.
-    log("── Final validation sphere render ──")
-    final_sphere, final_sphere_mask = render_gray_ball_vectorized(
-        corrected, albedo=args.albedo, res=args.sphere_res)
-    save_png_preview(os.path.join(args.debug_dir, "08_verify_sphere_final.png"), final_sphere)
-    # Compute validation stats from the single render (no second render needed)
-    _fsph_valid = final_sphere[final_sphere_mask]
-    final_verify_rgb = _fsph_valid.mean(axis=0) if len(_fsph_valid) else np.zeros(3)
-    _fv_luma = float(0.2126*final_verify_rgb[0] + 0.7152*final_verify_rgb[1] + 0.0722*final_verify_rgb[2])
-    _fv_rg = float((final_verify_rgb[0]-final_verify_rgb[1]) / (_fv_luma+1e-8))
-    _fv_bg = float((final_verify_rgb[2]-final_verify_rgb[1]) / (_fv_luma+1e-8))
-    log(f"Sphere verify [final]: mean RGB={final_verify_rgb.tolist()}")
-    log(f"  luma={_fv_luma:.4f}  R-G={_fv_rg:+.4f}  B-G={_fv_bg:+.4f} (should be ~0)")
-    if abs(_fv_rg) > 0.05 or abs(_fv_bg) > 0.05:
-        warn(f"Sphere [final] colour cast: R-G={_fv_rg:+.3f} B-G={_fv_bg:+.3f}")
+    # Ground-truth diagnostic — sphere mean RGB should match meter_target per
+    # channel. Gated on validate_energy (~1-2 s at sphere_res=96).
+    if bool(getattr(args, "validate_energy", False)):
+        log("── Final validation sphere render ──")
+        final_sphere, final_sphere_mask = render_gray_ball_vectorized(
+            corrected, albedo=args.albedo, res=args.sphere_res)
+        save_png_preview(os.path.join(args.debug_dir, "08_verify_sphere_final.png"), final_sphere)
+        _fsph_valid = final_sphere[final_sphere_mask]
+        final_verify_rgb = _fsph_valid.mean(axis=0) if len(_fsph_valid) else np.zeros(3)
+        _fv_luma = float(0.2126*final_verify_rgb[0] + 0.7152*final_verify_rgb[1] + 0.0722*final_verify_rgb[2])
+        _fv_rg = float((final_verify_rgb[0]-final_verify_rgb[1]) / (_fv_luma+1e-8))
+        _fv_bg = float((final_verify_rgb[2]-final_verify_rgb[1]) / (_fv_luma+1e-8))
+        log(f"Sphere verify [final]: mean RGB={final_verify_rgb.tolist()}")
+        log(f"  luma={_fv_luma:.4f}  R-G={_fv_rg:+.4f}  B-G={_fv_bg:+.4f} (should be ~0)")
+        if abs(_fv_rg) > 0.05 or abs(_fv_bg) > 0.05:
+            warn(f"Sphere [final] colour cast: R-G={_fv_rg:+.3f} B-G={_fv_bg:+.3f}")
+    else:
+        log("Final validation sphere render: skipped (enable in Advanced settings)")
+        final_verify_rgb = np.zeros(3, dtype=np.float32)
+        _fv_luma = _fv_rg = _fv_bg = 0.0
 
     meta["sphere"] = {
         "albedo":                args.albedo,
@@ -2995,300 +3005,304 @@ def _run_pipeline(args):
     #   → albedo × π / π = albedo   ✓
     #   → grey sphere = albedo × π / 4 ≈ 0.1414  (sphere ≠ flat card)
 
-    log("── Energy & calibration validation ──────────────────────────────────")
-    a = args.albedo
-
-    _dirs_v, _dOmega_v = latlong_dirs(corrected.shape[0], corrected.shape[1])
-    _lum_v = luminance(corrected)
-
-    # ── Helper: irradiance toward an arbitrary unit direction ─────────────
-    def _E_dir(direction, img=corrected):
-        """Cosine-weighted irradiance on a flat Lambertian receiver facing `direction`."""
-        D   = np.asarray(direction, dtype=np.float32)
-        D  /= np.linalg.norm(D) + 1e-8
-        cos = np.clip((_dirs_v * D[None, None, :]).sum(axis=-1), 0.0, None)
-        lum = luminance(img)
-        return float(np.sum(lum * cos * _dOmega_v))
-
-    def _E_dir_rgb(direction, img=corrected):
-        """Per-channel version."""
-        D   = np.asarray(direction, dtype=np.float32)
-        D  /= np.linalg.norm(D) + 1e-8
-        cos = np.clip((_dirs_v * D[None, None, :]).sum(axis=-1), 0.0, None)
-        return np.array([float(np.sum(img[..., c] * cos * _dOmega_v))
-                         for c in range(3)])
-
-    # ── 6-direction cardinal irradiance map ───────────────────────────────
-    # Each value = what an incident light meter reads pointing that direction.
-    # After correct calibration E_sun_facing should be ≈ π.
-    sun_dir = hot["center_dir"].astype(np.float32)
-    sun_dir_neg = -sun_dir
-
-    cardinal = {
-        "↑  sky     ": ( 0,  1,  0),
-        "↓  ground  ": ( 0, -1,  0),
-        "→  east    ": ( 1,  0,  0),
-        "←  west    ": (-1,  0,  0),
-        "↗  north   ": ( 0,  0,  1),
-        "↙  south   ": ( 0,  0, -1),
-        "☀  sun     ": sun_dir.tolist(),
-        "☀  anti-sun": sun_dir_neg.tolist(),
-    }
-
-    E_upper = _E_dir(( 0,  1,  0))
-    E_lower = _E_dir(( 0, -1,  0))
-    E_sun   = _E_dir(sun_dir)
-    sun_vertical_dir = np.array([sun_dir[0], 0.0, sun_dir[2]], dtype=np.float32)
-    if float(np.linalg.norm(sun_vertical_dir)) < 1e-6:
-        sun_vertical_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    if not bool(getattr(args, "validate_energy", False)):
+        log("Energy & calibration validation: skipped "
+            "(enable in Advanced settings)")
     else:
-        sun_vertical_dir /= np.linalg.norm(sun_vertical_dir) + 1e-8
-    E_vertical_sun = _E_dir(sun_vertical_dir)
-    E_full  = float(np.sum(_lum_v * _dOmega_v))
+      log("── Energy & calibration validation ──────────────────────────────────")
+      a = args.albedo
 
-    E_upper_rgb = _E_dir_rgb(( 0,  1,  0))
-    E_sun_rgb   = _E_dir_rgb(sun_dir)
-    E_vertical_sun_rgb = _E_dir_rgb(sun_vertical_dir)
-    E_upper_norm = E_upper_rgb / (np.mean(E_upper_rgb) + 1e-8)
-    E_sun_norm   = E_sun_rgb   / (np.mean(E_sun_rgb)   + 1e-8)
-    E_vertical_sun_norm = E_vertical_sun_rgb / (np.mean(E_vertical_sun_rgb) + 1e-8)
-    E_lower_rgb  = _E_dir_rgb(( 0, -1,  0))
+      _dirs_v, _dOmega_v = latlong_dirs(corrected.shape[0], corrected.shape[1])
+      _lum_v = luminance(corrected)
 
-    log(f"")
-    log(f"  Sun direction : θ={hot['theta_deg']:.1f}°  elevation={90-hot['theta_deg']:.1f}°  "
-        f"φ={hot['phi_deg']:.1f}°")
+      # ── Helper: irradiance toward an arbitrary unit direction ─────────────
+      def _E_dir(direction, img=corrected):
+          """Cosine-weighted irradiance on a flat Lambertian receiver facing `direction`."""
+          D   = np.asarray(direction, dtype=np.float32)
+          D  /= np.linalg.norm(D) + 1e-8
+          cos = np.clip((_dirs_v * D[None, None, :]).sum(axis=-1), 0.0, None)
+          lum = luminance(img)
+          return float(np.sum(lum * cos * _dOmega_v))
 
-    log(f"")
-    log(f"  ── Incident irradiance (light meter readings) ──────────────────")
-    log(f"  {'Direction':<18}  {'E (luma)':<10}  {'R':<8}  {'G':<8}  {'B':<8}  "
-        f"{'R/G':<6}  {'B/G':<6}  {'Card (luma)':<12}  status")
-    log(f"  {'─'*18}  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}  "
-        f"{'─'*6}  {'─'*6}  {'─'*12}  {'─'*12}")
+      def _E_dir_rgb(direction, img=corrected):
+          """Per-channel version."""
+          D   = np.asarray(direction, dtype=np.float32)
+          D  /= np.linalg.norm(D) + 1e-8
+          cos = np.clip((_dirs_v * D[None, None, :]).sum(axis=-1), 0.0, None)
+          return np.array([float(np.sum(img[..., c] * cos * _dOmega_v))
+                           for c in range(3)])
 
-    for label, direction in cardinal.items():
-        E_rgb = _E_dir_rgb(direction)
-        E_lum = float(np.mean(E_rgb))          # approx luma of irradiance
-        card  = a * E_lum / math.pi            # what a grey card reads
-        rg    = E_rgb[0] / (E_rgb[1] + 1e-8)
-        bg    = E_rgb[2] / (E_rgb[1] + 1e-8)
-        # Status: is this channel balanced and is E ≈ π?
-        chroma_ok = abs(rg - 1.0) < 0.10 and abs(bg - 1.0) < 0.10
-        e_ok      = abs(E_lum - math.pi) / math.pi < 0.15
-        status = ("✓" if (chroma_ok and e_ok) else
-                  "⚠ cast" if not chroma_ok else
-                  "⚠ level")
-        log(f"  {label:<18}  {E_lum:<10.4f}  {E_rgb[0]:<8.4f}  {E_rgb[1]:<8.4f}  "
-            f"{E_rgb[2]:<8.4f}  {rg:<6.3f}  {bg:<6.3f}  {card:<12.5f}  {status}")
+      # ── 6-direction cardinal irradiance map ───────────────────────────────
+      # Each value = what an incident light meter reads pointing that direction.
+      # After correct calibration E_sun_facing should be ≈ π.
+      sun_dir = hot["center_dir"].astype(np.float32)
+      sun_dir_neg = -sun_dir
 
-    # ── Key E=π check (the main calibration invariant) ────────────────────
-    log(f"")
-    log(f"  ── E = π calibration check ─────────────────────────────────────")
-    log(f"  Physical target  : π = {math.pi:.5f}")
-    log(f"  E_upper (sky ↑)  : {E_upper:.5f}  {'✓' if abs(E_upper-math.pi)/math.pi < 0.15 else '⚠'}")
-    log(f"  E_sun   (☀ dir)  : {E_sun:.5f}  {'✓' if abs(E_sun-math.pi)/math.pi < 0.15 else '⚠'}")
-    log(f"  E_sun/π          : {E_sun/math.pi:.4f}  (1.00 = perfectly calibrated toward sun)")
-    log(f"  E_upper/π        : {E_upper/math.pi:.4f}  (1.00 = perfectly calibrated upward)")
-    log(f"")
+      cardinal = {
+          "↑  sky     ": ( 0,  1,  0),
+          "↓  ground  ": ( 0, -1,  0),
+          "→  east    ": ( 1,  0,  0),
+          "←  west    ": (-1,  0,  0),
+          "↗  north   ": ( 0,  0,  1),
+          "↙  south   ": ( 0,  0, -1),
+          "☀  sun     ": sun_dir.tolist(),
+          "☀  anti-sun": sun_dir_neg.tolist(),
+      }
 
-    # ── Grey card / grey sphere prediction table ──────────────────────────
-    pred_card_up     = a * E_upper / math.pi
-    pred_card_dn     = a * E_lower / math.pi
-    pred_card_sun    = a * E_sun   / math.pi
-    pred_card_rgb_up = a * E_upper_rgb / math.pi
-    pred_card_rgb_sun= a * E_sun_rgb   / math.pi
-    pred_sphere_full = a * (E_upper + E_lower) / 4.0
-    pred_sphere_up   = a * E_upper / 4.0
-    pred_sphere_sun  = a * E_sun   / 4.0    # sphere placed at sun, upper-hemi only
+      E_upper = _E_dir(( 0,  1,  0))
+      E_lower = _E_dir(( 0, -1,  0))
+      E_sun   = _E_dir(sun_dir)
+      sun_vertical_dir = np.array([sun_dir[0], 0.0, sun_dir[2]], dtype=np.float32)
+      if float(np.linalg.norm(sun_vertical_dir)) < 1e-6:
+          sun_vertical_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+      else:
+          sun_vertical_dir /= np.linalg.norm(sun_vertical_dir) + 1e-8
+      E_vertical_sun = _E_dir(sun_vertical_dir)
+      E_full  = float(np.sum(_lum_v * _dOmega_v))
 
-    log(f"  ── Grey card predictions (albedo={a:.4f}) ─────────────────────")
-    log(f"  {'Surface':<28}  {'luma':<8}  {'R':<8}  {'G':<8}  {'B':<8}  note")
-    log(f"  {'─'*28}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*20}")
+      E_upper_rgb = _E_dir_rgb(( 0,  1,  0))
+      E_sun_rgb   = _E_dir_rgb(sun_dir)
+      E_vertical_sun_rgb = _E_dir_rgb(sun_vertical_dir)
+      E_upper_norm = E_upper_rgb / (np.mean(E_upper_rgb) + 1e-8)
+      E_sun_norm   = E_sun_rgb   / (np.mean(E_sun_rgb)   + 1e-8)
+      E_vertical_sun_norm = E_vertical_sun_rgb / (np.mean(E_vertical_sun_rgb) + 1e-8)
+      E_lower_rgb  = _E_dir_rgb(( 0, -1,  0))
 
-    def _card_row(label, E_lum_val, E_rgb_val, note=""):
-        card_l = a * E_lum_val / math.pi
-        card_r = a * E_rgb_val[0] / math.pi
-        card_g = a * E_rgb_val[1] / math.pi
-        card_b = a * E_rgb_val[2] / math.pi
-        log(f"  {label:<28}  {card_l:<8.5f}  {card_r:<8.5f}  {card_g:<8.5f}  {card_b:<8.5f}  {note}")
+      log(f"")
+      log(f"  Sun direction : θ={hot['theta_deg']:.1f}°  elevation={90-hot['theta_deg']:.1f}°  "
+          f"φ={hot['phi_deg']:.1f}°")
 
-    _card_row("flat card facing ↑ (sky)",
-              E_upper, E_upper_rgb,
-              f"{'≈ albedo ✓' if abs(pred_card_up - a) < a*0.15 else '⚠ not metered'}")
-    _card_row("flat card facing ↓ (ground)",
-              E_lower, E_lower_rgb, "fill light / bounce")
-    _card_row("flat card facing ☀ (sun dir)",
-              E_sun, E_sun_rgb,
-              f"{'≈ albedo ✓' if abs(pred_card_sun - a) < a*0.15 else '⚠ not at target'}")
+      log(f"")
+      log(f"  ── Incident irradiance (light meter readings) ──────────────────")
+      log(f"  {'Direction':<18}  {'E (luma)':<10}  {'R':<8}  {'G':<8}  {'B':<8}  "
+          f"{'R/G':<6}  {'B/G':<6}  {'Card (luma)':<12}  status")
+      log(f"  {'─'*18}  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}  "
+          f"{'─'*6}  {'─'*6}  {'─'*12}  {'─'*12}")
 
-    log(f"  {'─'*28}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}")
-    log(f"  {'grey sphere (full env)':<28}  {pred_sphere_full:<8.5f}  "
-        f"{'':8}  {'':8}  {'':8}  albedo × (E_up+E_dn) / 4")
-    log(f"  {'grey sphere (upper hemi)':<28}  {pred_sphere_up:<8.5f}  "
-        f"{'':8}  {'':8}  {'':8}  albedo × E_upper / 4")
-    log(f"  {'grey sphere (sun facing)':<28}  {pred_sphere_sun:<8.5f}  "
-        f"{'':8}  {'':8}  {'':8}  albedo × E_sun / 4")
-    log(f"")
+      for label, direction in cardinal.items():
+          E_rgb = _E_dir_rgb(direction)
+          E_lum = float(np.mean(E_rgb))          # approx luma of irradiance
+          card  = a * E_lum / math.pi            # what a grey card reads
+          rg    = E_rgb[0] / (E_rgb[1] + 1e-8)
+          bg    = E_rgb[2] / (E_rgb[1] + 1e-8)
+          # Status: is this channel balanced and is E ≈ π?
+          chroma_ok = abs(rg - 1.0) < 0.10 and abs(bg - 1.0) < 0.10
+          e_ok      = abs(E_lum - math.pi) / math.pi < 0.15
+          status = ("✓" if (chroma_ok and e_ok) else
+                    "⚠ cast" if not chroma_ok else
+                    "⚠ level")
+          log(f"  {label:<18}  {E_lum:<10.4f}  {E_rgb[0]:<8.4f}  {E_rgb[1]:<8.4f}  "
+              f"{E_rgb[2]:<8.4f}  {rg:<6.3f}  {bg:<6.3f}  {card:<12.5f}  {status}")
 
-    # ── Rendered sphere (actual ray integration, ground truth) ────────────
-    log(f"  ── Rendered sphere (ray integration) ────────────────────────────")
-    _rend_sphere, _rend_mask = render_gray_ball_vectorized(corrected, albedo=a, res=args.sphere_res)
-    _rend_rgb   = np.array([float(np.mean(_rend_sphere[..., c][_rend_mask])) for c in range(3)])
-    rendered_sphere_mean = float(np.mean(_rend_rgb))
+      # ── Key E=π check (the main calibration invariant) ────────────────────
+      log(f"")
+      log(f"  ── E = π calibration check ─────────────────────────────────────")
+      log(f"  Physical target  : π = {math.pi:.5f}")
+      log(f"  E_upper (sky ↑)  : {E_upper:.5f}  {'✓' if abs(E_upper-math.pi)/math.pi < 0.15 else '⚠'}")
+      log(f"  E_sun   (☀ dir)  : {E_sun:.5f}  {'✓' if abs(E_sun-math.pi)/math.pi < 0.15 else '⚠'}")
+      log(f"  E_sun/π          : {E_sun/math.pi:.4f}  (1.00 = perfectly calibrated toward sun)")
+      log(f"  E_upper/π        : {E_upper/math.pi:.4f}  (1.00 = perfectly calibrated upward)")
+      log(f"")
 
-    log(f"  rendered sphere RGB : R={_rend_rgb[0]:.5f}  G={_rend_rgb[1]:.5f}  "
-        f"B={_rend_rgb[2]:.5f}  mean={rendered_sphere_mean:.5f}")
-    log(f"  analytical (full)   : {pred_sphere_full:.5f}")
-    energy_err = abs(rendered_sphere_mean - pred_sphere_full) / (pred_sphere_full + 1e-8)
-    log(f"  deviation           : {energy_err:.2%}  "
-        f"{'✓ within 10%' if energy_err < 0.10 else '⚠ > 10% — check gain ceiling or lobe neutralisation'}")
-    log(f"")
+      # ── Grey card / grey sphere prediction table ──────────────────────────
+      pred_card_up     = a * E_upper / math.pi
+      pred_card_dn     = a * E_lower / math.pi
+      pred_card_sun    = a * E_sun   / math.pi
+      pred_card_rgb_up = a * E_upper_rgb / math.pi
+      pred_card_rgb_sun= a * E_sun_rgb   / math.pi
+      pred_sphere_full = a * (E_upper + E_lower) / 4.0
+      pred_sphere_up   = a * E_upper / 4.0
+      pred_sphere_sun  = a * E_sun   / 4.0    # sphere placed at sun, upper-hemi only
 
-    # ── WB quality ────────────────────────────────────────────────────────
-    log(f"  ── White balance quality ────────────────────────────────────────")
-    log(f"  E_upper chroma (R/G B/G) : "
-        f"R={E_upper_norm[0]:.4f}  G={E_upper_norm[1]:.4f}  B={E_upper_norm[2]:.4f}  "
-        f"(ideal 1:1:1)")
-    log(f"  E_sun   chroma (R/G B/G) : "
-        f"R={E_sun_norm[0]:.4f}  G={E_sun_norm[1]:.4f}  B={E_sun_norm[2]:.4f}")
-    chroma_upper = float(np.max(np.abs(E_upper_norm - 1.0)))
-    chroma_sun   = float(np.max(np.abs(E_sun_norm   - 1.0)))
-    log(f"  max chroma imbalance     : upper={chroma_upper:.4f}  sun={chroma_sun:.4f}  "
-        f"(< 0.05 good, < 0.10 acceptable)")
+      log(f"  ── Grey card predictions (albedo={a:.4f}) ─────────────────────")
+      log(f"  {'Surface':<28}  {'luma':<8}  {'R':<8}  {'G':<8}  {'B':<8}  note")
+      log(f"  {'─'*28}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*20}")
 
-    if wb_from_chart:
-        log(f"  WB source: chart patch 22  (photometric ground truth)")
-    else:
-        log(f"  WB source: {meta.get('white_balance', {}).get('method', 'unknown')}")
-    log(f"")
+      def _card_row(label, E_lum_val, E_rgb_val, note=""):
+          card_l = a * E_lum_val / math.pi
+          card_r = a * E_rgb_val[0] / math.pi
+          card_g = a * E_rgb_val[1] / math.pi
+          card_b = a * E_rgb_val[2] / math.pi
+          log(f"  {label:<28}  {card_l:<8.5f}  {card_r:<8.5f}  {card_g:<8.5f}  {card_b:<8.5f}  {note}")
 
-    # ── Sun disc diagnostics ──────────────────────────────────────────────
-    log(f"  ── Sun disc diagnostics ─────────────────────────────────────────")
-    lobe_solid_angle = float(np.sum(hot["mask"] * _dOmega_v))
-    sun_solid_angle_deg2 = math.degrees(math.sqrt(lobe_solid_angle)) ** 2
-    # Real sun solid angle ≈ 6.8e-5 sr = 0.00022 sr
-    REAL_SUN_SR = 6.8e-5
-    log(f"  lobe solid angle  : {lobe_solid_angle:.6f} sr  "
-        f"(real sun ≈ {REAL_SUN_SR:.2e} sr, "
-        f"lobe is {lobe_solid_angle/REAL_SUN_SR:.0f}× larger — "
-        f"{'reasonable halo' if lobe_solid_angle < REAL_SUN_SR * 500 else 'very large — threshold may be too low'})")
-    log(f"  peak luma         : {hot['hottest']:.2f}  "
-        f"(at threshold {args.sun_threshold:.3f}: "
-        f"low={hot['low']:.2f} high={hot['high']:.2f})")
-    log(f"  lobe pixel count  : soft={hot['mask_pixel_count_soft']}  "
-        f"strong={hot['mask_pixel_count_strong']}")
+      _card_row("flat card facing ↑ (sky)",
+                E_upper, E_upper_rgb,
+                f"{'≈ albedo ✓' if abs(pred_card_up - a) < a*0.15 else '⚠ not metered'}")
+      _card_row("flat card facing ↓ (ground)",
+                E_lower, E_lower_rgb, "fill light / bounce")
+      _card_row("flat card facing ☀ (sun dir)",
+                E_sun, E_sun_rgb,
+                f"{'≈ albedo ✓' if abs(pred_card_sun - a) < a*0.15 else '⚠ not at target'}")
 
-    # Estimated physical sun peak (what it should be if calibrated)
-    # A disc of solid angle Ω_sun with E=π contributes: L_sun = π / Ω_sun
-    estimated_physical_peak = math.pi / (REAL_SUN_SR + 1e-10)
-    log(f"  estimated physical sun peak radiance : {estimated_physical_peak:.0f} "
-        f"(E=π / Ω_sun)")
-    log(f"  measured lobe peak in input          : {hot['hottest'] / (args.albedo / 0.18):.2f}  "
-        f"(exposure-adjusted)")
-    compression = estimated_physical_peak / (hot['hottest'] / (args.albedo / 0.18) + 1.0)
-    log(f"  estimated compression ratio          : {compression:.0f}× "
-        f"({'severe clipping' if compression > 100 else 'moderate clipping' if compression > 10 else 'mild'})")
-    log(f"")
+      log(f"  {'─'*28}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}")
+      log(f"  {'grey sphere (full env)':<28}  {pred_sphere_full:<8.5f}  "
+          f"{'':8}  {'':8}  {'':8}  albedo × (E_up+E_dn) / 4")
+      log(f"  {'grey sphere (upper hemi)':<28}  {pred_sphere_up:<8.5f}  "
+          f"{'':8}  {'':8}  {'':8}  albedo × E_upper / 4")
+      log(f"  {'grey sphere (sun facing)':<28}  {pred_sphere_sun:<8.5f}  "
+          f"{'':8}  {'':8}  {'':8}  albedo × E_sun / 4")
+      log(f"")
 
-    # ── Per-channel gain solve summary ────────────────────────────────────
-    if "gain_diag" in solution:
-        gd = solution["gain_diag"]
-        log(f"  ── Sun gain solve summary ───────────────────────────────────────")
-        log(f"  method    : {gd.get('method', '?')}")
-        if gd.get("method") == "irradiance":
-            e_base = np.array(gd.get("E_base_rgb", gd.get("E_base", [0.0, 0.0, 0.0])), dtype=np.float32)
-            e_lobe = np.array(gd.get("E_lobe_rgb", gd.get("E_lobe", [0.0, 0.0, 0.0])), dtype=np.float32)
-            log(f"  target    : {gd.get('target_summary', gd.get('mode', '?'))}")
-            log(f"  E_base    : R={e_base[0]:.4f}  G={e_base[1]:.4f}  B={e_base[2]:.4f}")
-            log(f"  E_lobe×1  : R={e_lobe[0]:.6f}  G={e_lobe[1]:.6f}  B={e_lobe[2]:.6f}")
-            log(f"  E_target  : {gd['E_target']:.5f}  ({gd.get('mode', '?')})")
-            E_b = e_base
-            E_l = e_lobe
-            E_t = gd['E_target']
-            E_final_per_ch = E_b + E_l * solution['gains_per_channel']
-            log(f"  E_final   : R={E_final_per_ch[0]:.4f}  G={E_final_per_ch[1]:.4f}  "
-                f"B={E_final_per_ch[2]:.4f}  (should be ≈ {E_t:.4f} each)")
-            log(f"  gains     : R={solution['gains_per_channel'][0]:.2f}×  "
-                f"G={solution['gains_per_channel'][1]:.2f}×  "
-                f"B={solution['gains_per_channel'][2]:.2f}×")
-        log(f"")
+      # ── Rendered sphere (actual ray integration, ground truth) ────────────
+      log(f"  ── Rendered sphere (ray integration) ────────────────────────────")
+      _rend_sphere, _rend_mask = render_gray_ball_vectorized(corrected, albedo=a, res=args.sphere_res)
+      _rend_rgb   = np.array([float(np.mean(_rend_sphere[..., c][_rend_mask])) for c in range(3)])
+      rendered_sphere_mean = float(np.mean(_rend_rgb))
 
-    # ── Final summary table ───────────────────────────────────────────────
-    log(f"  ╔══════════════════════════════════════════════════════════════╗")
-    log(f"  ║  CALIBRATION SUMMARY                                        ║")
-    log(f"  ╠══════════════════════════════════════════════════════════════╣")
-    _solve_summary_text = solution.get("gain_diag", {}).get("target_summary", "grey card facing sky = albedo")
-    log(f"  ║  Target: {_solve_summary_text} ({a:.4f})            ║")
-    log(f"  ║                                                              ║")
-    log(f"  ║  Predicted values (use to validate on-set references):      ║")
-    log(f"  ║    Grey card facing ↑ sky   : {pred_card_up:>8.5f}                  ║")
-    log(f"  ║    Grey card facing ☀ sun   : {pred_card_sun:>8.5f}                  ║")
-    log(f"  ║    Grey card facing ↓ ground: {pred_card_dn:>8.5f}                  ║")
-    log(f"  ║    Grey sphere (full env)   : {pred_sphere_full:>8.5f}                  ║")
-    log(f"  ║    Grey sphere (upper only) : {pred_sphere_up:>8.5f}                  ║")
-    log(f"  ║    Rendered sphere (actual) : {rendered_sphere_mean:>8.5f}                  ║")
-    log(f"  ║                                                              ║")
-    _solve_mode = solution.get("gain_diag", {}).get("mode", "card_up")
-    if _solve_mode == "card_sun":
-        e_pi_check = E_sun / math.pi
-        _solve_metric_label = "E_sun / pi"
-        chroma_ok_final = chroma_sun < 0.10
-    elif _solve_mode == "card_vertical_sun":
-        e_pi_check = E_vertical_sun / math.pi
-        _solve_metric_label = "E_vertical_sun / pi"
-        chroma_ok_final = float(np.max(np.abs(E_vertical_sun_norm - 1.0))) < 0.10
-    else:
-        e_pi_check = E_upper / math.pi
-        _solve_metric_label = "E_upper / pi"
-        chroma_ok_final = chroma_upper < 0.10
-    solve_ok = abs(e_pi_check - 1.0) < 0.15
-    log(f"  ║  {_solve_metric_label} = {e_pi_check:.4f}  {'✓ calibrated' if solve_ok else '⚠ off — check solve'}            ║")
-    log(f"  ║  Sun chroma = {chroma_sun:.4f}  {'✓ neutral' if chroma_ok_final else '⚠ coloured — expected for low sun'}        ║")
-    log(f"  ║  Rendered vs analytical = {energy_err:.2%}   {'✓' if energy_err < 0.10 else '⚠'}                    ║")
-    log(f"  ╚══════════════════════════════════════════════════════════════╝")
+      log(f"  rendered sphere RGB : R={_rend_rgb[0]:.5f}  G={_rend_rgb[1]:.5f}  "
+          f"B={_rend_rgb[2]:.5f}  mean={rendered_sphere_mean:.5f}")
+      log(f"  analytical (full)   : {pred_sphere_full:.5f}")
+      energy_err = abs(rendered_sphere_mean - pred_sphere_full) / (pred_sphere_full + 1e-8)
+      log(f"  deviation           : {energy_err:.2%}  "
+          f"{'✓ within 10%' if energy_err < 0.10 else '⚠ > 10% — check gain ceiling or lobe neutralisation'}")
+      log(f"")
 
-    # Sanity check warnings
-    if energy_err > 0.10:
-        warn(f"⚠ Rendered sphere ({rendered_sphere_mean:.4f}) deviates "
-             f"{energy_err:.1%} from analytical ({pred_sphere_full:.4f}). "
-             f"Check lobe neutralisation or gain ceiling hit.")
-    if chroma_upper > 0.05:
-        warn(f"⚠ Upper-hemi chroma imbalance {chroma_upper:.3f} — WB may be off, "
-             f"")
-    if chroma_sun > 0.10:
-        warn(f"⚠ Sun-dir chroma imbalance {chroma_sun:.3f} after solve — "
-             f"sky colour cast is large relative to sun energy. "
-             f"Rendered output may have residual colour tint.")
+      # ── WB quality ────────────────────────────────────────────────────────
+      log(f"  ── White balance quality ────────────────────────────────────────")
+      log(f"  E_upper chroma (R/G B/G) : "
+          f"R={E_upper_norm[0]:.4f}  G={E_upper_norm[1]:.4f}  B={E_upper_norm[2]:.4f}  "
+          f"(ideal 1:1:1)")
+      log(f"  E_sun   chroma (R/G B/G) : "
+          f"R={E_sun_norm[0]:.4f}  G={E_sun_norm[1]:.4f}  B={E_sun_norm[2]:.4f}")
+      chroma_upper = float(np.max(np.abs(E_upper_norm - 1.0)))
+      chroma_sun   = float(np.max(np.abs(E_sun_norm   - 1.0)))
+      log(f"  max chroma imbalance     : upper={chroma_upper:.4f}  sun={chroma_sun:.4f}  "
+          f"(< 0.05 good, < 0.10 acceptable)")
 
-    meta["energy_validation"] = {
-        "E_upper":                  E_upper,
-        "E_lower":                  E_lower,
-        "E_sun":                    E_sun,
-        "E_full":                   E_full,
-        "E_upper_rgb":              E_upper_rgb.tolist(),
-        "E_lower_rgb":              E_lower_rgb.tolist(),
-        "E_sun_rgb":                E_sun_rgb.tolist(),
-        "E_upper_chroma_norm":      E_upper_norm.tolist(),
-        "E_sun_chroma_norm":        E_sun_norm.tolist(),
-        "E_upper_over_pi":          E_upper / math.pi,
-        "E_sun_over_pi":            E_sun   / math.pi,
-        "pred_card_facing_up":      pred_card_up,
-        "pred_card_facing_down":    pred_card_dn,
-        "pred_card_facing_sun":     pred_card_sun,
-        "pred_card_rgb_facing_up":  pred_card_rgb_up.tolist(),
-        "pred_card_rgb_facing_sun": pred_card_rgb_sun.tolist(),
-        "pred_sphere_full":         pred_sphere_full,
-        "pred_sphere_upper_only":   pred_sphere_up,
-        "pred_sphere_sun_facing":   pred_sphere_sun,
-        "rendered_sphere_mean":     rendered_sphere_mean,
-        "rendered_sphere_rgb":      _rend_rgb.tolist(),
-        "rendered_vs_analytical_err": energy_err,
-        "sun_lobe_solid_angle_sr":  lobe_solid_angle,
-        "sun_compression_estimate": compression,
-        "chroma_imbalance_upper":   chroma_upper,
-        "chroma_imbalance_sun":     chroma_sun,
-        "solve_target_mode":        "card_up_neutral",
-        "albedo":                   a,
-    }
+      if wb_from_chart:
+          log(f"  WB source: chart patch 22  (photometric ground truth)")
+      else:
+          log(f"  WB source: {meta.get('white_balance', {}).get('method', 'unknown')}")
+      log(f"")
+
+      # ── Sun disc diagnostics ──────────────────────────────────────────────
+      log(f"  ── Sun disc diagnostics ─────────────────────────────────────────")
+      lobe_solid_angle = float(np.sum(hot["mask"] * _dOmega_v))
+      sun_solid_angle_deg2 = math.degrees(math.sqrt(lobe_solid_angle)) ** 2
+      # Real sun solid angle ≈ 6.8e-5 sr = 0.00022 sr
+      REAL_SUN_SR = 6.8e-5
+      log(f"  lobe solid angle  : {lobe_solid_angle:.6f} sr  "
+          f"(real sun ≈ {REAL_SUN_SR:.2e} sr, "
+          f"lobe is {lobe_solid_angle/REAL_SUN_SR:.0f}× larger — "
+          f"{'reasonable halo' if lobe_solid_angle < REAL_SUN_SR * 500 else 'very large — threshold may be too low'})")
+      log(f"  peak luma         : {hot['hottest']:.2f}  "
+          f"(at threshold {args.sun_threshold:.3f}: "
+          f"low={hot['low']:.2f} high={hot['high']:.2f})")
+      log(f"  lobe pixel count  : soft={hot['mask_pixel_count_soft']}  "
+          f"strong={hot['mask_pixel_count_strong']}")
+
+      # Estimated physical sun peak (what it should be if calibrated)
+      # A disc of solid angle Ω_sun with E=π contributes: L_sun = π / Ω_sun
+      estimated_physical_peak = math.pi / (REAL_SUN_SR + 1e-10)
+      log(f"  estimated physical sun peak radiance : {estimated_physical_peak:.0f} "
+          f"(E=π / Ω_sun)")
+      log(f"  measured lobe peak in input          : {hot['hottest'] / (args.albedo / 0.18):.2f}  "
+          f"(exposure-adjusted)")
+      compression = estimated_physical_peak / (hot['hottest'] / (args.albedo / 0.18) + 1.0)
+      log(f"  estimated compression ratio          : {compression:.0f}× "
+          f"({'severe clipping' if compression > 100 else 'moderate clipping' if compression > 10 else 'mild'})")
+      log(f"")
+
+      # ── Per-channel gain solve summary ────────────────────────────────────
+      if "gain_diag" in solution:
+          gd = solution["gain_diag"]
+          log(f"  ── Sun gain solve summary ───────────────────────────────────────")
+          log(f"  method    : {gd.get('method', '?')}")
+          if gd.get("method") == "irradiance":
+              e_base = np.array(gd.get("E_base_rgb", gd.get("E_base", [0.0, 0.0, 0.0])), dtype=np.float32)
+              e_lobe = np.array(gd.get("E_lobe_rgb", gd.get("E_lobe", [0.0, 0.0, 0.0])), dtype=np.float32)
+              log(f"  target    : {gd.get('target_summary', gd.get('mode', '?'))}")
+              log(f"  E_base    : R={e_base[0]:.4f}  G={e_base[1]:.4f}  B={e_base[2]:.4f}")
+              log(f"  E_lobe×1  : R={e_lobe[0]:.6f}  G={e_lobe[1]:.6f}  B={e_lobe[2]:.6f}")
+              log(f"  E_target  : {gd['E_target']:.5f}  ({gd.get('mode', '?')})")
+              E_b = e_base
+              E_l = e_lobe
+              E_t = gd['E_target']
+              E_final_per_ch = E_b + E_l * solution['gains_per_channel']
+              log(f"  E_final   : R={E_final_per_ch[0]:.4f}  G={E_final_per_ch[1]:.4f}  "
+                  f"B={E_final_per_ch[2]:.4f}  (should be ≈ {E_t:.4f} each)")
+              log(f"  gains     : R={solution['gains_per_channel'][0]:.2f}×  "
+                  f"G={solution['gains_per_channel'][1]:.2f}×  "
+                  f"B={solution['gains_per_channel'][2]:.2f}×")
+          log(f"")
+
+      # ── Final summary table ───────────────────────────────────────────────
+      log(f"  ╔══════════════════════════════════════════════════════════════╗")
+      log(f"  ║  CALIBRATION SUMMARY                                        ║")
+      log(f"  ╠══════════════════════════════════════════════════════════════╣")
+      _solve_summary_text = solution.get("gain_diag", {}).get("target_summary", "grey card facing sky = albedo")
+      log(f"  ║  Target: {_solve_summary_text} ({a:.4f})            ║")
+      log(f"  ║                                                              ║")
+      log(f"  ║  Predicted values (use to validate on-set references):      ║")
+      log(f"  ║    Grey card facing ↑ sky   : {pred_card_up:>8.5f}                  ║")
+      log(f"  ║    Grey card facing ☀ sun   : {pred_card_sun:>8.5f}                  ║")
+      log(f"  ║    Grey card facing ↓ ground: {pred_card_dn:>8.5f}                  ║")
+      log(f"  ║    Grey sphere (full env)   : {pred_sphere_full:>8.5f}                  ║")
+      log(f"  ║    Grey sphere (upper only) : {pred_sphere_up:>8.5f}                  ║")
+      log(f"  ║    Rendered sphere (actual) : {rendered_sphere_mean:>8.5f}                  ║")
+      log(f"  ║                                                              ║")
+      _solve_mode = solution.get("gain_diag", {}).get("mode", "card_up")
+      if _solve_mode == "card_sun":
+          e_pi_check = E_sun / math.pi
+          _solve_metric_label = "E_sun / pi"
+          chroma_ok_final = chroma_sun < 0.10
+      elif _solve_mode == "card_vertical_sun":
+          e_pi_check = E_vertical_sun / math.pi
+          _solve_metric_label = "E_vertical_sun / pi"
+          chroma_ok_final = float(np.max(np.abs(E_vertical_sun_norm - 1.0))) < 0.10
+      else:
+          e_pi_check = E_upper / math.pi
+          _solve_metric_label = "E_upper / pi"
+          chroma_ok_final = chroma_upper < 0.10
+      solve_ok = abs(e_pi_check - 1.0) < 0.15
+      log(f"  ║  {_solve_metric_label} = {e_pi_check:.4f}  {'✓ calibrated' if solve_ok else '⚠ off — check solve'}            ║")
+      log(f"  ║  Sun chroma = {chroma_sun:.4f}  {'✓ neutral' if chroma_ok_final else '⚠ coloured — expected for low sun'}        ║")
+      log(f"  ║  Rendered vs analytical = {energy_err:.2%}   {'✓' if energy_err < 0.10 else '⚠'}                    ║")
+      log(f"  ╚══════════════════════════════════════════════════════════════╝")
+
+      # Sanity check warnings
+      if energy_err > 0.10:
+          warn(f"⚠ Rendered sphere ({rendered_sphere_mean:.4f}) deviates "
+               f"{energy_err:.1%} from analytical ({pred_sphere_full:.4f}). "
+               f"Check lobe neutralisation or gain ceiling hit.")
+      if chroma_upper > 0.05:
+          warn(f"⚠ Upper-hemi chroma imbalance {chroma_upper:.3f} — WB may be off, "
+               f"")
+      if chroma_sun > 0.10:
+          warn(f"⚠ Sun-dir chroma imbalance {chroma_sun:.3f} after solve — "
+               f"sky colour cast is large relative to sun energy. "
+               f"Rendered output may have residual colour tint.")
+
+      meta["energy_validation"] = {
+          "E_upper":                  E_upper,
+          "E_lower":                  E_lower,
+          "E_sun":                    E_sun,
+          "E_full":                   E_full,
+          "E_upper_rgb":              E_upper_rgb.tolist(),
+          "E_lower_rgb":              E_lower_rgb.tolist(),
+          "E_sun_rgb":                E_sun_rgb.tolist(),
+          "E_upper_chroma_norm":      E_upper_norm.tolist(),
+          "E_sun_chroma_norm":        E_sun_norm.tolist(),
+          "E_upper_over_pi":          E_upper / math.pi,
+          "E_sun_over_pi":            E_sun   / math.pi,
+          "pred_card_facing_up":      pred_card_up,
+          "pred_card_facing_down":    pred_card_dn,
+          "pred_card_facing_sun":     pred_card_sun,
+          "pred_card_rgb_facing_up":  pred_card_rgb_up.tolist(),
+          "pred_card_rgb_facing_sun": pred_card_rgb_sun.tolist(),
+          "pred_sphere_full":         pred_sphere_full,
+          "pred_sphere_upper_only":   pred_sphere_up,
+          "pred_sphere_sun_facing":   pred_sphere_sun,
+          "rendered_sphere_mean":     rendered_sphere_mean,
+          "rendered_sphere_rgb":      _rend_rgb.tolist(),
+          "rendered_vs_analytical_err": energy_err,
+          "sun_lobe_solid_angle_sr":  lobe_solid_angle,
+          "sun_compression_estimate": compression,
+          "chroma_imbalance_upper":   chroma_upper,
+          "chroma_imbalance_sun":     chroma_sun,
+          "solve_target_mode":        "card_up_neutral",
+          "albedo":                   a,
+      }
 
     # ── 11. JSON report ───────────────────────────────────────────────────
     meta["notes"] = [

@@ -76,7 +76,9 @@ class Win(QMainWindow):
         b = QPushButton("Browse"); b.clicked.connect(self._browse); row.addWidget(b)
         self._go = QPushButton("Process"); self._go.clicked.connect(self._run); self._go.setEnabled(False); row.addWidget(self._go)
         self._mode = QComboBox()
-        modes = ["yolo"] if HAVE_YOLO else []
+        modes = ["internal (two-pass)"] if HAVE_YOLO else []
+        if HAVE_YOLO:
+            modes.append("yolo (ccd wrapper)")
         modes += ["segmentation", "both"]
         self._mode.addItems(modes); row.addWidget(QLabel("Method:")); row.addWidget(self._mode)
         row.addStretch(); lay.addLayout(row)
@@ -130,7 +132,67 @@ class Win(QMainWindow):
         parts = [img.copy()]
         mode = self._mode.currentText()
         run_seg = mode in ("segmentation", "both")
-        run_yolo = mode in ("yolo", "both") and HAVE_YOLO
+        run_yolo = mode in ("yolo (ccd wrapper)", "both") and HAVE_YOLO
+        run_internal = mode.startswith("internal") and HAVE_YOLO
+
+        if run_internal:
+            self._p("\n--- Internal two-pass (same code path as the GUI) ---")
+            try:
+                # The hdri_cal repo's own pipeline. Feeding a rectilinear JPEG
+                # (e.g. rect_tile.jpg from cc_debug_out/colorchecker/) into this
+                # mode tests *only* the detection logic, isolating it from the
+                # ERP→rectilinear projection step.
+                import colorchecker_erp as ce
+                # Treat the image as already linear-ish for detector purposes:
+                # the detector display-maps internally, so feeding it the
+                # ERP debug JPEG (which is already display-mapped) just goes
+                # through the tone-mapper a second time — that's still valid
+                # for testing geometry. For best results, feed the *linear*
+                # ERP crop saved by the pipeline (or any JPEG; YOLO is robust).
+                tile_linear = img_f.copy()
+                cc24_ref = ce.get_cc24_reference("acescg")
+                # map_uv only matters for ERP-space backprojection — pass a
+                # dummy identity map that just maps tile px → tile px / size.
+                hh, ww = tile_linear.shape[:2]
+                xs = np.linspace(0.0, 1.0, ww, dtype=np.float32)
+                ys = np.linspace(0.0, 1.0, hh, dtype=np.float32)
+                gu, gv = np.meshgrid(xs, ys)
+                dummy_map = np.stack([gu, gv], axis=-1).astype(np.float32)
+                # Match the GUI: segmentation first, YOLO fallback.
+                det = ce._detect_in_tile_segmentation(
+                    tile_linear, dummy_map,
+                    yaw=0.0, pitch=0.0, tile_fov_deg=70.0,
+                    cc24_ref=cc24_ref,
+                    debug_dir=None, tile_label="ccdebug",
+                )
+                if det is None:
+                    self._p("  segmentation found nothing — falling back to YOLO")
+                    det = ce._detect_in_tile(
+                        tile_linear, dummy_map,
+                        yaw=0.0, pitch=0.0, tile_fov_deg=70.0,
+                        cc24_ref=cc24_ref,
+                        debug_dir=None, tile_label="ccdebug",
+                        save_debug=False,
+                    )
+                if det is None:
+                    self._p("  Internal pipeline: NO detection (see console "
+                            "for [cc-erp] pass-1/pass-2 logs above).")
+                else:
+                    self._p(f"  Internal pipeline: HIT  conf={det.confidence:.3f}  "
+                            f"method={det.detection_method}")
+                    self._p(f"  Quad (TL,TR,BR,BL): "
+                            f"{[(round(float(p[0]),1), round(float(p[1]),1)) for p in det.quad_tile]}")
+                    _draw_quad(vis, det.quad_tile, (255, 100, 255), 3)
+                    sw = det.swatches_linear
+                    for j in range(min(24, sw.shape[0])):
+                        self._p(f"    {j+1:2d} {CC24[j]:16s}  "
+                                f"R={sw[j,0]:.4f} G={sw[j,1]:.4f} B={sw[j,2]:.4f}")
+                    parts.append(_strip(sw, "internal two-pass"))
+                    if det.cc_rectified is not None:
+                        rect_u8 = np.clip(det.cc_rectified * 255, 0, 255).astype(np.uint8)
+                        parts.append(rect_u8)
+            except Exception as e:
+                self._p(f"  ERROR: {e}"); traceback.print_exc()
 
         if run_yolo:
             self._p("\n--- YOLO Inference ---")
