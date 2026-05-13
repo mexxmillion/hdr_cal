@@ -2,7 +2,13 @@
 
 A photometrically accurate HDRI reconstruction and calibration tool for VFX / IBL workflows.
 
-Takes a clipped or LDR equirectangular environment map, finds the sun lobe, reconstructs missing energy, applies white balance from a ColorChecker chart (or grey sphere), and outputs a calibrated EXR suitable for image-based lighting in production renderers.
+Takes a clipped or LDR equirectangular environment map, applies white balance and exposure from a ColorChecker chart you place by hand, gain-solves the sun lobe, and writes a calibrated EXR ready for image-based lighting.
+
+The workflow is intentionally narrow:
+1. **Place the chart** — draw a search rectangle on the latlong preview, click 4 corners.
+2. **Process** — WB and exposure from patch 22, sun-lobe gain solve, save EXR.
+
+That's it. No batch queue, no auto-detect black box, no second-pass rebalance steps.
 
 ---
 
@@ -10,306 +16,216 @@ Takes a clipped or LDR equirectangular environment map, finds the sun lobe, reco
 
 | File | Purpose |
 |---|---|
-| `hdri_cal.py` | Core pipeline — CLI and callable API |
-| `colorchecker_erp.py` | ColorChecker detection in equirectangular images |
-| `hdri_cal_gui.py` | PySide6 GUI frontend |
+| `hdri_cal_gui.py` | PySide6 GUI — primary entry point |
+| `hdri_cal.py` | Pipeline core — CLI + callable API |
+| `colorchecker_erp.py` | ColorChecker sampling on equirectangular images |
+| `cc_debug.py` | Stand-alone CC detection debugger (drop a JPG/PNG to test) |
 
 ---
 
 ## Installation
 
-### 1. Install Python dependencies
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. OpenEXR backend
+OpenEXR backend (needed for `.exr` read/write) — usually picked up automatically from `opencv-python`. If EXR fails:
 
-`imageio` needs an OpenEXR backend to read and write `.exr` files. The easiest path is to let OpenCV handle it (already installed via `opencv-python`), which works automatically on most platforms. If you hit EXR read errors:
-
-**Windows**
 ```bash
+# Windows
 pip install imageio[openexr]
-```
 
-**macOS**
-```bash
-brew install openexr
-pip install openexr
-```
+# macOS
+brew install openexr && pip install openexr
 
-**Linux**
-```bash
-sudo apt install libopenexr-dev
-pip install openexr
+# Linux
+sudo apt install libopenexr-dev && pip install openexr
 ```
-
-### 3. YOLOv8 model (optional, auto-downloads)
-
-The first time the pipeline searches for a ColorChecker it will download the YOLOv8 segmentation model (~88 MB) from Hugging Face into:
-```
-~/.colour-science/colour-checker-detection/
-```
-This only happens once. Requires an internet connection on first run. Set `--wb-source sphere` to skip chart search entirely if offline.
 
 ---
 
-## Quick Start
+## GUI usage (recommended)
 
 ```bash
-# Auto mode — if a chart is found, use it; otherwise leave WB/exposure alone
-python hdri_cal.py shot.exr --out shot_cal.exr
-
-# Treat a linear-sRGB HDR/EXR correctly and convert it to ACEScg on load
-python hdri_cal.py shot_srgb.exr --colorspace srgb --out shot_cal.exr
-
-# Validate only (no EXR written)
-python hdri_cal.py shot.exr --validate-only
-
-# GUI
 python hdri_cal_gui.py
 ```
 
+### Workflow
+
+1. **Drag and drop** an EXR / HDR / PNG / WebP onto the window (or click **📂 Open**).
+2. On the **Source** tab, **drag a rectangle** over the chart. The rect is just a hint for the corner-picker — it controls the FOV/yaw/pitch of the rectilinear crop you'll work on.
+3. Click **Place Chart Corners**. A second window opens showing a rectilinear projection of your rect. Click 4 corners in order **TL → TR → BR → BL**. As soon as 4 are placed, the CC24 reference-swatch overlay renders in your quad so you can visually verify the placement. **Drag any corner** to fine-tune.
+4. Click **▶ Process**. The pipeline runs the chart WB + exposure, sun-lobe gain solve, and writes the EXR.
+
+### Viewer controls
+
+- **Viewer EV slider** (top of preview): −10 … +6 EV scrub. Display only — doesn't change the saved data. Reads the `.f16.npy` linear companion the pipeline writes next to each preview PNG.
+- **Pixel probe** (bottom of preview): hover any tab to see `x / y / R / G / B / luma` in scene-linear (ACEScg) plus the resolved display swatch at the current viewer EV.
+
+### Preview tabs
+
+| Tab | Source |
+|---|---|
+| **Source** | The loaded HDRI (where you draw the search rect) |
+| **WB** | After white balance applied |
+| **Exposed** | After exposure scale applied |
+| **Lobe** | The hot-lobe mask |
+| **Chart Tile** | Rectilinear crop of the search rect |
+| **Rectified** | Chart warped to a canonical CC24 grid |
+| **Swatches** | Measured swatches vs reference |
+| **Solved** | Post sun-lobe gain |
+| **Final** | The actual output EXR |
+| **Sphere** | Rendered grey sphere — only when **Validation** is enabled |
+
+### Settings
+
+**Output**
+- `Suffix` / `Output dir` / `Debug dir` / `Resolution` — file locations and processing res.
+
+**Calibration**
+- `Mode`: `auto` (the supported workflow) or `advanced` (exposes every internal knob).
+- `Input primaries`: `auto` / `acescg` / `srgb`. `auto` interprets `.exr`/`.hdr` as ACEScg and LDR images as sRGB.
+- `Exposure`: ±8 EV camera-style stops. Drives the input intensity multiplier (`2^EV`).
+- `Temperature` / `Tint`: photographic WB.
+- `Reset Photographic`: snap back to `0 EV / 6500 K / 0.0`.
+- `Centre HDRI on sun`: rotate the latlong so the sun sits at the centre column.
+
+**Chart Detection**
+- Status of the search rect + 4-corner placement, with `✕` Clear icons.
+- `Place Chart Corners` opens the picker.
+
+**Advanced (only visible in Advanced mode)**
+- `WB source` / `Exposure source`: `auto` / `chart` / `sphere` / `meter` / `none`. Auto mode forces `chart` when the user has placed corners, otherwise falls back to pixel-average meter.
+- `Sun solve`: `auto` / `energy_conservation` / `sun_facing_card` / `sun_facing_vertical` / `none`.
+- `Albedo`: target grey reflectance (default 0.18).
+- `Sun threshold` / `Lobe neutralise` / `Gain ceiling` / `Gain rolloff`.
+- **`Run energy & calibration validation`** (off by default) — opt-in diagnostic that renders a grey sphere and prints the irradiance map / E=π check / grey-card predictions. Adds ~1–2 s.
+
+### Actions
+
+Bottom of the settings column:
+- **📂 Open** / **✕ Clear** — load or unload a file.
+- **▶ Process** — full pipeline → output EXR.
+- **⚡ Validate** — quick metrics, no EXR written.
+- **■ Abort** — kill a running job.
+- **📁 Output Folder** — open the output directory.
+
 ---
 
-## Current Pipeline
-
-The pipeline now works in this order:
-
-```
-load -> input-primaries conversion -> ACEScg working space
-  -> orientation validate
-  -> optional ColorChecker search / rectified pass-2 read
-  -> WB source solve
-  -> exposure source solve
-  -> hot lobe extraction
-  -> HDRI centering
-  -> sun solve
-  -> optional final balance trim
-  -> save EXR + previews + report.json
-```
-
-Important behavior:
-- Internal processing is always in `ACEScg`.
-- `--colorspace srgb` means: interpret HDR/EXR input as linear sRGB, then convert to linear ACEScg before any processing.
-- LDR inputs such as `.jpg`, `.jpeg`, `.png`, and `.webp` are treated as sRGB-encoded images, decoded to linear sRGB, then converted to ACEScg.
-- In `auto` mode, if no chart is found, WB and exposure both fall back to `none`.
-
----
-
-## CLI Reference
-
-### Basic usage
+## CLI usage
 
 ```bash
-python hdri_cal.py INPUT [options]
+# Process with a chart (you've placed corners in the GUI and saved a config),
+# or pass --colorchecker-in-hdri to use the manual flow at the CLI level
+python hdri_cal.py shot.exr --out shot_cal.exr
+
+# Treat a linear-sRGB HDR as sRGB primaries
+python hdri_cal.py shot_srgb.exr --colorspace srgb --out shot_cal.exr
+
+# Validate only — no EXR written, just a report.json
+python hdri_cal.py shot.exr --validate-only
 ```
 
-Accepted inputs:
-- `.exr`
-- `.hdr`
-- `.jpg`
-- `.jpeg`
-- `.png`
-- `.webp`
+### Inputs
 
-### Core flags
+`.exr`, `.hdr`, `.jpg`, `.jpeg`, `.png`, `.webp`. EXR/HDR default to ACEScg; LDR formats default to sRGB and are linearised+converted on load.
+
+### Key flags
 
 | Flag | Default | Description |
 |---|---|---|
 | `--out PATH` | `corrected.exr` | Output calibrated EXR |
-| `--debug-dir DIR` | `debug_hdri` | Debug previews and `report.json` |
-| `--res` | `full` | `full`, `half`, `quarter` |
-| `--colorspace` | auto | Force input primaries: `acescg` or `srgb` |
-| `--validate-only` | off | Validate only, no EXR output |
-| `--center-hdri` | on | Center azimuth on the dominant hot lobe |
-| `--no-center-hdri` | off | Disable centering |
-
-### White balance and exposure
-
-| Flag | Default | Description |
-|---|---|---|
-| `--wb-source` | `auto` | `auto`, `chart`, `none` |
-| `--exposure-source` | `auto` | `auto`, `chart`, `none` |
+| `--debug-dir DIR` | `debug_hdri` | Debug previews + `report.json` |
+| `--res` | `full` | `full` / `half` / `quarter` |
+| `--colorspace` | auto | `acescg` or `srgb` — forces input-primaries interpretation |
+| `--validate-only` | off | No EXR written, just report.json |
+| `--center-hdri` / `--no-center-hdri` | on | Rotate sun to phi=0 |
+| `--wb-source` | `auto` | `auto` / `chart` / `sphere` / `meter` / `none` |
+| `--exposure-source` | `auto` | same set as `--wb-source` |
 | `--albedo` | `0.18` | Target grey reflectance |
-
-Auto behavior:
-- `WB`: chart if found, else none
-- `Exposure`: chart if found, else none
-
-### Sun solve and final trim
-
-| Flag | Default | Description |
-|---|---|---|
-| `--sphere-solve` | `energy_conservation` | `energy_conservation`, `sun_facing_card`, `sun_facing_vertical`, `none` |
-| `--final-balance-target` | `none` | `none` or `auto` |
+| `--sphere-solve` | `auto` | `auto` (= energy_conservation) / `sun_facing_card` / `sun_facing_vertical` / `none` |
 | `--sun-threshold` | `0.1` | Lobe boundary fraction below peak |
-| `--lobe-neutralise` | `1.0` | White the lobe before gain solve |
+| `--lobe-neutralise` | `1.0` | Desaturate the lobe before gain (1.0 = fully achromatic) |
 | `--sun-gain-ceiling` | `2000` | Hard cap on per-channel sun gain |
-| `--sun-gain-rolloff` | `500` | Soft rolloff start |
+| `--sun-gain-rolloff` | `500` | Soft rolloff start before the ceiling |
 
-`--sphere-solve` meanings:
-- `energy_conservation`: upward-facing grey card target
-- `sun_facing_card`: grey card whose normal points at the sun
-- `sun_facing_vertical`: vertical grey card rotated toward the sun azimuth
-- `none`: skip sun solve
-
-`--final-balance-target auto`:
-- measures the imaginary target card implied by `--sphere-solve`
-- computes one final global RGB multiplier
-- trims the output so that target is neutral at `albedo`
-
-### ColorChecker options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--colorchecker PATH` | — | Separate ColorChecker plate |
-| `--colorchecker-in-hdri` | off | Search chart inside the HDRI |
-| `--cc-read-backend` | `colour` | `auto`, `colour`, `contour` |
-| `--cc-compare-backends` | off | Save comparison overlays |
-
-Notes:
-- The current default read path is `colour`.
-- The detector uses a coarse tile sweep plus centered refinement.
-- Final swatch measurement comes from the rectified pass-2 checker read.
+When `--wb-source chart` is requested and a chart was found, the chart is used **unconditionally** — no confidence gating.
 
 ---
 
-## Common Workflows
+## Pipeline
 
-### Recommended auto mode
-```bash
-python hdri_cal.py shot.exr --out shot_cal.exr
+```
+load → input-primaries conversion → ACEScg working space
+  → orientation validate
+  → chart sampling (manual corners on the latlong)
+  → WB scale from patch 22  (R = G = B at patch 22)
+  → exposure scale = albedo / patch22_luma
+  → hot-lobe mask + sun gain solve
+  → save EXR + previews + .f16.npy companions + report.json
 ```
 
-### Sun solve only, no chart WB/exposure
-```bash
-python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve energy_conservation
-```
+What's **not** in the pipeline (by design):
+- No WB blending. The chart is ground truth.
+- No final post-WB rebalance. WB+exposure already lock patch 22 to albedo.
+- No chart-vs-sphere disagreement warnings.
+- No automatic colour-cast warnings.
+- No "chart-neutral guarantee" snap. The math is correct by construction.
 
-### Target a card facing the sun
-```bash
-python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve sun_facing_card
-```
-
-### Target a vertical card facing the sun azimuth
-```bash
-python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve sun_facing_vertical
-```
-
-### Add the final post-balance trim
-```bash
-python hdri_cal.py shot.exr --out shot_cal.exr   --wb-source none   --exposure-source none   --center-hdri   --sphere-solve sun_facing_vertical   --final-balance-target auto
-```
-
-### Validate only
-```bash
-python hdri_cal.py shot.exr --validate-only
-```
+What patch 22 reads in the final EXR: **exactly `albedo / albedo / albedo`**.
 
 ---
 
-## GUI
+## Debug outputs
 
-The GUI now has two top-level modes:
-- `auto`
-- `advanced`
+Per-run, in `<debug-dir>/`:
 
-### Auto mode
-- If a chart is found, use chart WB/exposure.
-- If no chart is found, leave WB/exposure unchanged.
-- You can still set:
-  - `Input primaries`
-  - `Intensity`
-  - `Temperature`
-  - `Tint`
-  - `Centre HDRI on sun`
+```
+01_wb_preview.png             + .f16.npy + .f16.json
+02_exposed_preview.png        + .f16.npy + .f16.json
+03_hot_mask.png
+07_corrected_preview.png      + .f16.npy + .f16.json
+08_final_hdri_preview.png     + .f16.npy + .f16.json
+08_verify_sphere_final.png    (only if Validation is enabled)
+colorchecker/
+    manual_tile_detected.jpg
+    manual_rectified.png
+    cc_swatch_comparison.jpg
+report.json
+```
 
-### Advanced mode
-Advanced reveals explicit controls for:
-- `WB source`
-- `Exposure source`
-- `Sun solve`
-- `Final balance`
-- `Albedo`
-- `Sun threshold`
-- `Lobe neutralise`
-- `Gain ceiling`
-- `Gain rolloff`
+`.f16.npy` is float16 RGB scene-linear (working colorspace). `.f16.json` is a sidecar with the colorspace tag and the 99.5-percentile anchor the PNG was normalised to. The GUI uses both for the viewer-EV slider and the pixel probe.
 
-### Source preview
-The GUI provides an immediate `Source` preview on file drop/select.
-It is re-rendered when you change, per queued file:
-- `Input primaries`
-- `Intensity`
-- `Temperature`
-- `Tint`
-
-Each queued HDRI stores its own settings, so one file can be `acescg` and another `srgb` with different photographic adjustments.
-
-### Photographic controls
-- `Intensity`: global preview/manual input multiplier
-- `Temperature`: photographic WB temperature
-- `Tint`: `+1.00 = magenta`, `-1.00 = green`
-- `Reset Photographic`: restore `1.0 / 6500 K / 0.0`
-
-The controls now support both:
-- slider scrubbing
-- direct typed numeric entry
-
-### Preview tabs
-The GUI preview tabs now include:
-- `Source`
-- `WB`
-- `Exposed`
-- `Lobe`
-- `Chart Tile`
-- `Rectified`
-- `Swatches`
-- `Solved`
-- `Balanced`
-- `Final`
-
-### Queue actions
-You can now:
-- remove a selected file
-- requeue a selected file
-- clear all files
-- open the output folder
+The GUI's **Detect** path (currently hidden — manual placement is the supported workflow) additionally writes `cc_debug_out/detect_<stem>/` containing `rect_tile_*.{jpg,exr}` and `cc_detected_tile.jpg` for triage with `cc_debug.py`.
 
 ---
+
 ## Troubleshooting
 
-**ColorChecker not found**
-- Ensure the chart is visible and reasonably well-lit in the HDRI
-- Try `--wb-source sphere` to skip chart search
-- Check `debug_dir/colorchecker/` for detection debug images
+**Chart corners drift / probe says non-neutral after Process**
+- Make sure you've placed exactly 4 corners and they sit inside the swatches, not on the black surround.
+- Drag corners to fine-tune. The reference-swatch overlay updates live; aim for visual coincidence.
 
-**WB disagreement warning**
-- Chart may be in shadow — use `--wb-source chart --exposure-source sphere`
-- Chart may be misidentified — check `cc_swatch_comparison.jpg` in debug dir
+**Output looks blue / has a cast**
+- Check that **WB source** wasn't forced off in Advanced mode. In auto mode with corners placed, the chart is used unconditionally.
 
-**Gain ceiling hit warnings**
-- Input is severely clipped — raise `--sun-gain-ceiling 5000`
-- Very low remaining lobe energy — some clipping is unrecoverable
-
-**Blue/wrong-coloured sun disc**
-- Ensure `--lobe-neutralise` is at `1.0` (default)
-- Check if base dome E_upper is already coloured (coloured sky is expected, sun will compensate)
+**GUI freezes briefly when I change settings**
+- Only colorspace / Exposure / Temperature / Tint rebuild the Source preview (because they change what gets displayed). Everything else now just persists the config — no disk reload.
 
 **EXR read errors**
-- Install OpenEXR system library (see Installation above)
-- Try renaming to `.hdr` and running — imageio has a different backend path for Radiance HDR
+- Install the OpenEXR system library (see Installation).
+
+**Manual placement on EXRs with the chart in the lower half showed sky**
+- Fixed in `_rect_uv_to_tile_params` — pitch sign was inverted. Update to the latest commit.
 
 ---
 
 ## Notes on colorspace
 
-- `.exr` / `.hdr` files are assumed **ACEScg (AP1 linear)** unless `--colorspace srgb` is set
-- `.jpg` / `.png` files are assumed **sRGB** and linearised automatically
-- CC24 reference patch values are spectral reflectances — neutral patches are achromatic in both colorspaces, so WB derivation is colorspace-agnostic
-- All internal math runs in linear light
+- `.exr` / `.hdr` assumed **ACEScg (AP1 linear)** unless `--colorspace srgb`.
+- `.jpg` / `.png` / `.webp` assumed **sRGB**, linearised on load, then converted to ACEScg.
+- CC24 neutral patches are achromatic (R=G=B), so chart WB derivation is colorspace-agnostic.
+- All internal math runs in linear light.
 
 ---
 
