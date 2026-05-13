@@ -300,6 +300,33 @@ def save_png_preview(path, img_linear, percentile=99.5, source_colorspace="acesc
     display_linear = _to_display_srgb_linear(np.clip(img_linear / denom, 0.0, None), source_colorspace)
     view = linear_to_srgb(np.clip(display_linear, 0.0, 1.0))
     imageio.imwrite(path, np.clip(view * 255 + 0.5, 0, 255).astype(np.uint8))
+    # Float16 companion containing the *raw* scene-linear data in the
+    # working colorspace (no normalisation, no colorspace conversion,
+    # no clipping). The GUI's pixel probe reads true scene values from
+    # this; the viewer-EV slider does display mapping on the fly. A
+    # tiny sidecar .json stores the colorspace tag + the 99.5-pct anchor
+    # so EV=0 still renders the same view the PNG shows.
+    try:
+        h, w = img_linear.shape[:2]
+        s = min(1024.0 / max(w, h), 1.0)
+        if s < 1.0:
+            new_w, new_h = max(1, int(w * s)), max(1, int(h * s))
+            scene_small = cv2.resize(img_linear, (new_w, new_h),
+                                     interpolation=cv2.INTER_AREA)
+        else:
+            scene_small = img_linear
+        npy_path = os.path.splitext(path)[0] + ".f16.npy"
+        meta_path = os.path.splitext(path)[0] + ".f16.json"
+        np.save(npy_path, scene_small.astype(np.float16))
+        with open(meta_path, "w") as _f:
+            json.dump({
+                "colorspace":   source_colorspace,
+                "anchor_99p5":  float(denom),
+                "is_scene_linear": True,
+            }, _f)
+    except Exception:
+        # Companion is optional — pipeline doesn't fail if it can't write.
+        pass
     log(f"Saved preview: {path}")
 
 def save_mask_preview(path, mask):
@@ -2376,12 +2403,21 @@ def _run_pipeline(args):
         POSE_TRIPOD_MAX = 130   # 50–130°      → vertical / tripod
         POSE_CONF_MIN   = 0.25  # below this, don't trust the detected normal
 
-        # Pose-aware exposure runs whenever we have a confident chart normal,
-        # whether the chart is in the HDRI (manual corners / rect detect) or
-        # on a separate plate. The classic E=π fallback only kicks in if we
-        # have no usable pose data.
+        # Chart inside the HDRI: classic formula.  Calibration *defines*
+        # exposure_scale = albedo / measured_chart_luma, which is what the
+        # pose-aware branches collapse to when E = π. Substituting any other
+        # E here makes the chart no longer normalise to its own albedo —
+        # neutrals stop reading neutral grey. Pose info still flows
+        # downstream for the sun-lobe energy solve.
         pose_mode = None
-        if chart_facing_override == "up":
+        if chart_is_in_hdri:
+            pose_mode  = "hdri_internal_classic"
+            E_on_chart = math.pi
+            pose_note  = ("Chart inside HDRI — classic formula "
+                          "(albedo / patch22_luma). E=π.")
+            log(f"  chart inside HDRI — classic exposure formula (E=π)")
+
+        elif chart_facing_override == "up":
             pose_mode  = "floor_forced"
             E_on_chart = E_upper_for_exp
             pose_note  = "--chart-facing up: E_upper used as incident"
@@ -2416,9 +2452,6 @@ def _run_pipeline(args):
             E_on_chart = math.pi
             pose_note  = (f"pose confidence {chart_confidence:.3f} < {POSE_CONF_MIN} "
                           f"or no pose data — assuming chart was metered toward key light (E=π)")
-
-        if chart_is_in_hdri and pose_mode and pose_mode != "fallback_no_pose":
-            log(f"  chart inside HDRI — pose-aware exposure: {pose_mode}")
 
         # ── Compute exposure scale ─────────────────────────────────────────
         # predicted_patch22_luma: what patch 22 SHOULD measure if scene is
@@ -2970,6 +3003,11 @@ def _run_pipeline(args):
 
     # ── 10. Save final EXR ────────────────────────────────────────────────
     save_exr(args.out, corrected)
+    # Also save a display preview of the actual final HDRI output, with the
+    # .f16.npy / .json companions so the GUI Final tab probes real scene
+    # values just like the Source tab.
+    save_png_preview(os.path.join(args.debug_dir, "08_final_hdri_preview.png"),
+                     corrected)
 
     # ── 10b. Energy validation ────────────────────────────────────────────
     # Analytical integration of the final EXR — no rendering loop, purely

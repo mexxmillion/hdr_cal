@@ -10,7 +10,7 @@ Requires:
 """
 
 from __future__ import annotations
-import sys, os, json, traceback, types
+import sys, os, json, traceback, types, math
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List
@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QTabWidget, QFrame, QToolBar,
     QStatusBar, QMessageBox, QAbstractItemView, QDialog,
 )
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot, QPoint, QPointF
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot, QPoint, QPointF, QEvent
 from PySide6.QtGui import (
     QPixmap, QDragEnterEvent, QDropEvent, QColor,
     QPainter, QPen, QImage, QMouseEvent,
@@ -330,8 +330,9 @@ class PipelineWorker(QRunnable):
             for fname in [
                 "01_wb_preview.png", "02_exposed_preview.png",
                 "03_hot_mask.png",   "07_corrected_preview.png",
-                "08_verify_sphere_final.png",
                 "07b_final_balanced_preview.png",
+                "08_final_hdri_preview.png",
+                "08_verify_sphere_final.png",
                 "colorchecker/cc_detected_tile.jpg",
                 "colorchecker/cc_rectified_final.jpg",
                 "colorchecker/cc_swatch_comparison.jpg",
@@ -844,25 +845,109 @@ class FileItem:
 
 
 # ── Preview panel ──────────────────────────────────────────────────────────────
+def _linear_to_srgb_u8(img_linear: np.ndarray, ev: float = 0.0) -> np.ndarray:
+    """Apply 2^ev exposure to display-sRGB-LINEAR data, then sRGB-encode to u8.
+    Handles the full HDR range — useful for underexposing many stops to peek
+    into restored highlights or overexposing to inspect shadows."""
+    lin = np.asarray(img_linear, dtype=np.float32)
+    if abs(ev) > 1e-3:
+        lin = lin * (2.0 ** float(ev))
+    lin = np.clip(lin, 0.0, 1.0)
+    enc = np.where(lin <= 0.0031308,
+                   lin * 12.92,
+                   1.055 * np.power(np.clip(lin, 1e-9, None), 1.0 / 2.4) - 0.055)
+    return np.clip(enc * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _u8_srgb_to_linear(img_u8_rgb: np.ndarray) -> np.ndarray:
+    """Decode an sRGB u8 image to display-linear float32. Fallback for when
+    no .f16.npy companion is available — limited to the dynamic range that
+    survived the original 99.5-pct normalisation."""
+    a = img_u8_rgb.astype(np.float32) / 255.0
+    return np.where(a <= 0.04045,
+                    a / 12.92,
+                    ((a + 0.055) / 1.055) ** 2.4)
+
+
 class PreviewPanel(QWidget):
     # Emitted when the user drags out a search rect on the Source tab.
     search_rect_drawn = Signal(tuple)  # (u0, v0, u1, v1)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
+        lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
+
+        # Top strip: viewer-LUT exposure slider. Re-tone-maps every preview
+        # without touching the underlying pipeline calibration.
+        strip = QWidget(); sl = QHBoxLayout(strip)
+        sl.setContentsMargins(6, 2, 6, 2); sl.setSpacing(6)
+        sl.addWidget(QLabel("Viewer EV"))
+        self._ev_slider = QSlider(Qt.Horizontal)
+        self._ev_slider.setRange(-100, 60)  # -10.0 to +6.0 in 0.1 EV steps
+        self._ev_slider.setValue(0)
+        self._ev_slider.setMinimumWidth(180)
+        self._ev_slider.setToolTip(
+            "Exposure offset applied to the displayed previews only. "
+            "Underlying calibration is unchanged.\n"
+            "Range: −10 … +6 EV when linear .f16.npy companions are present.")
+        self._ev_value = QLabel("0.0 EV")
+        self._ev_value.setMinimumWidth(54)
+        self._ev_value.setStyleSheet("color: #c0c0d8; font-family: monospace;")
+        reset_ev = QPushButton("0")
+        reset_ev.setFixedWidth(24)
+        reset_ev.setToolTip("Reset viewer exposure to 0 EV")
+        reset_ev.clicked.connect(lambda: self._ev_slider.setValue(0))
+        sl.addWidget(self._ev_slider, 1)
+        sl.addWidget(self._ev_value)
+        sl.addWidget(reset_ev)
+        lay.addWidget(strip)
+        self._ev_slider.valueChanged.connect(self._on_ev_changed)
+
         self._tabs = QTabWidget(); lay.addWidget(self._tabs)
         self._labels: dict[str, QLabel] = {}
+        # Per-tab caches.
+        # _scene: raw scene-linear float32 in the working colorspace (probed by
+        #         the pixel-picker). Loaded from .f16.npy companions when
+        #         present, otherwise reconstructed from the PNG (limited).
+        # _meta: dict from the .f16.json sidecar — colorspace + 99.5-pct
+        #        anchor so the EV slider can match the PNG's auto-exposure
+        #        at EV=0.
+        self._scene: dict[str, np.ndarray] = {}
+        self._meta:  dict[str, dict] = {}
+
+        # Pixel probe strip — shown at the bottom of the panel.
+        probe = QFrame()
+        probe.setStyleSheet(
+            "QFrame { background: #0d0d18; border-top: 1px solid #303040; }"
+            "QLabel { color: #c0c0d8; font-family: 'Consolas','Menlo',monospace;"
+            " font-size: 11px; }")
+        ph = QHBoxLayout(probe); ph.setContentsMargins(6, 3, 6, 3); ph.setSpacing(10)
+        self._probe_xy = QLabel("x=---  y=---")
+        self._probe_xy.setMinimumWidth(140)
+        self._probe_r = QLabel("R:  ---");  self._probe_r.setStyleSheet("color: #ff5555;")
+        self._probe_g = QLabel("G:  ---");  self._probe_g.setStyleSheet("color: #66dd66;")
+        self._probe_b = QLabel("B:  ---");  self._probe_b.setStyleSheet("color: #5599ff;")
+        self._probe_l = QLabel("L:  ---");  self._probe_l.setStyleSheet("color: #c0c0d8;")
+        self._probe_swatch = QFrame()
+        self._probe_swatch.setFixedSize(20, 16)
+        self._probe_swatch.setStyleSheet("background: #000; border: 1px solid #404050;")
+        for w in (self._probe_xy, self._probe_swatch,
+                  self._probe_r, self._probe_g, self._probe_b, self._probe_l):
+            ph.addWidget(w)
+        ph.addStretch()
+        lay.addWidget(probe)
 
         # Source tab uses a RectDrawLabel so the user can drag out a search rect.
         self._source_label = RectDrawLabel()
         self._source_label.setStyleSheet("background: #10101a;")
         self._source_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._source_label.setMouseTracking(True)
         self._source_label.rect_drawn.connect(self.search_rect_drawn.emit)
         sc_src = QScrollArea(); sc_src.setWidget(self._source_label)
         sc_src.setWidgetResizable(True)
         self._tabs.addTab(sc_src, "Source")
         self._labels["source_preview.png"] = self._source_label
+        self._source_label.installEventFilter(self)
 
         for name, key in [
             ("WB",         "01_wb_preview.png"),
@@ -873,19 +958,131 @@ class PreviewPanel(QWidget):
             ("Swatches",   "cc_swatch_comparison.jpg"),
             ("Solved",     "07_corrected_preview.png"),
             ("Balanced",   "07b_final_balanced_preview.png"),
-            ("Final",      "08_verify_sphere_final.png"),
+            ("Final",      "08_final_hdri_preview.png"),
+            ("Sphere",     "08_verify_sphere_final.png"),
         ]:
             lbl = QLabel(); lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("background: #10101a;")
             lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             sc = QScrollArea(); sc.setWidget(lbl); sc.setWidgetResizable(True)
             self._tabs.addTab(sc, name); self._labels[key] = lbl
+        # Enable the pixel probe on every label.
+        for k, lbl in self._labels.items():
+            lbl.setMouseTracking(True)
+            lbl.installEventFilter(self)
         self.clear()
+
+    def _current_ev(self) -> float:
+        return self._ev_slider.value() / 10.0
+
+    def _on_ev_changed(self, _v):
+        ev = self._current_ev()
+        self._ev_value.setText(f"{ev:+.1f} EV")
+        for key in list(self._scene.keys()):
+            self._render_into_label(key)
+
+    def _scene_to_display_linear(self, scene_rgb: np.ndarray,
+                                  meta: dict) -> np.ndarray:
+        """Working-colorspace scene-linear → display sRGB linear, divided by
+        the same 99.5-pct anchor the PNG used so EV=0 matches that view."""
+        a = np.asarray(scene_rgb, dtype=np.float32)
+        cs = (meta or {}).get("colorspace", "acescg").lower()
+        if cs == "acescg":
+            try:
+                from colorchecker_erp import acescg_to_srgb_linear
+                a = acescg_to_srgb_linear(a)
+            except Exception:
+                pass  # leave as-is if converter unavailable
+        anchor = float((meta or {}).get("anchor_99p5", 1.0)) or 1.0
+        return a / max(anchor, 1e-6)
+
+    def _render_into_label(self, key: str):
+        lbl = self._labels.get(key)
+        scene = self._scene.get(key)
+        if lbl is None or scene is None:
+            return
+        meta = self._meta.get(key, {})
+        disp_lin = self._scene_to_display_linear(scene, meta)
+        adjusted = _linear_to_srgb_u8(disp_lin, self._current_ev())
+        h, w = adjusted.shape[:2]
+        adjusted = np.ascontiguousarray(adjusted)
+        qimg = QImage(adjusted.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        px = QPixmap.fromImage(qimg)
+        if isinstance(lbl, RectDrawLabel):
+            lbl.set_base_pixmap(px)
+            lbl.setStyleSheet("background:#10101a;")
+            lbl.setText("")
+        else:
+            lbl.setPixmap(px.scaled(
+                lbl.width() or 600, lbl.height() or 400,
+                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lbl.setStyleSheet("background:#10101a;"); lbl.setText("")
 
     def set_search_rect(self, rect_uv: Optional[tuple]):
         self._source_label.set_rect_uv(rect_uv)
 
+    # ── Pixel probe ───────────────────────────────────────────────────────
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.MouseMove:
+            # Find which key this label belongs to and sample.
+            for key, lbl in self._labels.items():
+                if lbl is obj:
+                    self._probe_at(key, lbl, ev.position())
+                    break
+        elif ev.type() == QEvent.Leave:
+            self._probe_clear()
+        return super().eventFilter(obj, ev)
+
+    def _probe_at(self, key: str, lbl: QLabel, widget_pos: QPointF):
+        scene = self._scene.get(key)
+        if scene is None:
+            return
+        pm = lbl.pixmap()
+        if pm is None or pm.isNull():
+            return
+        lbl_w, lbl_h = lbl.width(), lbl.height()
+        pm_w, pm_h = pm.width(), pm.height()
+        ox = (lbl_w - pm_w) / 2.0
+        oy = (lbl_h - pm_h) / 2.0
+        u = (widget_pos.x() - ox) / max(pm_w, 1)
+        v = (widget_pos.y() - oy) / max(pm_h, 1)
+        if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            self._probe_clear()
+            return
+        h, w = scene.shape[:2]
+        ix = int(np.clip(u * w, 0, w - 1))
+        iy = int(np.clip(v * h, 0, h - 1))
+        r, g, b = (float(c) for c in scene[iy, ix, :3])
+        # Rec.709 luminance on scene-linear data (approximate in ACEScg —
+        # exact AP1 luma weights are slightly different but close enough).
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        cs = (self._meta.get(key, {}) or {}).get("colorspace", "?")
+        self._probe_xy.setText(f"x={ix:<5d} y={iy:<5d}  [{cs}]")
+        # Scene values can be HDR — widen the format to handle big numbers.
+        self._probe_r.setText(f"R:{r:9.4f}")
+        self._probe_g.setText(f"G:{g:9.4f}")
+        self._probe_b.setText(f"B:{b:9.4f}")
+        self._probe_l.setText(f"L:{luma:9.4f}")
+        # Swatch coloured at current viewer EV so it matches what's on screen.
+        meta = self._meta.get(key, {})
+        disp_pt = self._scene_to_display_linear(
+            np.array([[[r, g, b]]], dtype=np.float32), meta)
+        sw = _linear_to_srgb_u8(disp_pt, self._current_ev())
+        sr, sg, sb = (int(c) for c in sw[0, 0])
+        self._probe_swatch.setStyleSheet(
+            f"background: rgb({sr},{sg},{sb}); border: 1px solid #404050;")
+
+    def _probe_clear(self):
+        self._probe_xy.setText("x=---  y=---")
+        self._probe_r.setText("R:  ---")
+        self._probe_g.setText("G:  ---")
+        self._probe_b.setText("B:  ---")
+        self._probe_l.setText("L:  ---")
+        self._probe_swatch.setStyleSheet("background: #000; border: 1px solid #404050;")
+
     def clear(self):
+        self._scene.clear()
+        self._meta.clear()
         for key, lbl in self._labels.items():
             if isinstance(lbl, RectDrawLabel):
                 lbl.set_base_pixmap(QPixmap())
@@ -900,17 +1097,47 @@ class PreviewPanel(QWidget):
         fname = os.path.basename(path)
         for key, lbl in self._labels.items():
             if fname == os.path.basename(key) or path.endswith(key):
-                px = QPixmap(path)
-                if not px.isNull():
-                    if isinstance(lbl, RectDrawLabel):
-                        lbl.set_base_pixmap(px)
-                        lbl.setStyleSheet("background:#10101a;")
-                        lbl.setText("")
-                    else:
-                        lbl.setPixmap(px.scaled(
-                            lbl.width() or 600, lbl.height() or 400,
-                            Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                        lbl.setStyleSheet("background:#10101a;"); lbl.setText("")
+                # Prefer the .f16.npy scene-linear companion.
+                npy = os.path.splitext(path)[0] + ".f16.npy"
+                meta_path = os.path.splitext(path)[0] + ".f16.json"
+                scene: Optional[np.ndarray] = None
+                meta: dict = {}
+                if os.path.exists(npy):
+                    try:
+                        arr = np.load(npy)
+                        if arr.ndim == 3 and arr.shape[2] >= 3:
+                            scene = arr[..., :3].astype(np.float32)
+                    except Exception as e:
+                        print(f"[preview] failed to load {npy}: {e}")
+                if scene is not None and os.path.exists(meta_path):
+                    try:
+                        with open(meta_path) as _f:
+                            meta = json.load(_f)
+                    except Exception:
+                        meta = {}
+                if scene is None:
+                    # Fallback: reconstruct from the PNG (display-linear,
+                    # limited DR — probe values will be approximate).
+                    bgr = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                    if bgr is None:
+                        continue
+                    if bgr.ndim == 2:
+                        bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+                    if bgr.shape[2] == 4:
+                        bgr = bgr[..., :3]
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    if rgb.dtype != np.uint8:
+                        mx = float(rgb.max()) if rgb.size else 1.0
+                        if mx > 1.5:
+                            rgb = np.clip(rgb / max(mx, 1.0) * 255.0, 0, 255).astype(np.uint8)
+                        else:
+                            rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+                    scene = _u8_srgb_to_linear(rgb)
+                    meta = {"colorspace": "srgb", "anchor_99p5": 1.0,
+                            "is_scene_linear": False}
+                self._scene[key] = scene
+                self._meta[key]  = meta
+                self._render_into_label(key)
                 break
 
 
@@ -965,17 +1192,20 @@ class ReportPanel(QWidget):
 
 class SliderField(QWidget):
     def __init__(self, minimum: int, maximum: int, initial: int, formatter,
-                 *, decimals: int = 0, scale: float = 1.0, suffix: str = "", parent=None):
+                 *, decimals: int = 0, scale: float = 1.0, suffix: str = "",
+                 spin_width: int = 108, slider_min_width: int = 130,
+                 parent=None):
         super().__init__(parent)
         self._formatter = formatter
         self._scale = float(scale)
         self._syncing = False
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(minimum, maximum)
         self.slider.setValue(initial)
+        self.slider.setMinimumWidth(slider_min_width)
         self.spin = QDoubleSpinBox()
         self.spin.setRange(minimum / self._scale, maximum / self._scale)
         self.spin.setDecimals(decimals)
@@ -983,18 +1213,22 @@ class SliderField(QWidget):
         if suffix:
             self.spin.setSuffix(suffix)
         self.spin.setValue(initial / self._scale)
-        self.label = QLabel()
-        self.label.setMinimumWidth(72)
-        self.label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin.setFixedWidth(spin_width)
+        self.spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lay.addWidget(self.slider, 1)
-        lay.addWidget(self.spin)
-        lay.addWidget(self.label)
+        lay.addWidget(self.spin, 0)
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.spin.valueChanged.connect(self._on_spin_changed)
         self._refresh_label(self.slider.value())
 
+    # Keep the trailing-label-style hook so external callers stay valid.
+    label = None
+
     def _refresh_label(self, value: int):
-        self.label.setText(self._formatter(value))
+        # Label widget removed for the new compact layout — the spin already
+        # shows the current value with its suffix. Hook preserved for any
+        # subclasses or callers that wired into it.
+        pass
 
     def _on_slider_changed(self, value: int):
         self._refresh_label(value)
@@ -1028,7 +1262,6 @@ class SliderField(QWidget):
     def setToolTip(self, text: str):
         self.slider.setToolTip(text)
         self.spin.setToolTip(text)
-        self.label.setToolTip(text)
         super().setToolTip(text)
 
 
@@ -1086,18 +1319,32 @@ class SettingsPanel(QScrollArea):
         self.center_hdri.setChecked(True)
         self.center_hdri.setToolTip("Shift azimuth so the sun sits at the centre column (phi=0)")
 
-        self.base_intensity = SliderField(1, 1600, 100, lambda v: f"{v / 100.0:.2f}x", decimals=2, scale=100.0)
-        self.base_intensity.setToolTip("Base input intensity multiplier for preview and optional manual override")
+        # Exposure compensation in stops (EV). Internally we still drive the
+        # pipeline's base_intensity multiplier (2^EV) so nothing downstream
+        # changes — only the UI shows stops, like a camera EV dial.
+        # Slider int = EV × 10  →  range −8.0..+8.0 in 0.1-EV steps.
+        self.base_intensity = SliderField(
+            -80, 80, 0, lambda v: f"{v / 10.0:+.1f} EV",
+            decimals=1, scale=10.0, suffix=" EV")
+        self.base_intensity.setToolTip(
+            "Exposure compensation in stops (EV). "
+            "+1 EV = 2× brighter, −1 EV = ½× brighter. "
+            "Drives the same base_intensity multiplier the pipeline uses, "
+            "so this is a real exposure offset, not a viewer effect.")
 
-        self.base_temperature = SliderField(2000, 15000, 6500, lambda v: f"{v:d} K", decimals=0, scale=1.0, suffix=" K")
+        self.base_temperature = SliderField(
+            2000, 15000, 6500, lambda v: f"{v:d} K",
+            decimals=0, scale=1.0, suffix=" K")
         self.base_temperature.setToolTip("Photographic white balance temperature")
 
-        self.base_tint = SliderField(-100, 100, 0, lambda v: f"{v / 100.0:+.2f}", decimals=2, scale=100.0)
-        self.base_tint.setToolTip("Tint adjustment: +1.00 = magenta, -1.00 = green")
+        self.base_tint = SliderField(
+            -100, 100, 0, lambda v: f"{v / 100.0:+.2f}",
+            decimals=2, scale=100.0)
+        self.base_tint.setToolTip("Tint adjustment: +1.00 = magenta, −1.00 = green")
 
         f.addRow("Mode",            self.calibration_mode)
         f.addRow("Input primaries", self.input_colorspace)
-        f.addRow("Intensity",       self.base_intensity)
+        f.addRow("Exposure",        self.base_intensity)
         f.addRow("Temperature",     self.base_temperature)
         f.addRow("Tint",            self.base_tint)
         reset_row = QHBoxLayout()
@@ -1327,7 +1574,9 @@ class SettingsPanel(QScrollArea):
         self._set_base_tint_value(0.0)
 
     def _base_intensity_value(self) -> float:
-        return self.base_intensity.value() / 100.0
+        """Return the pipeline-facing multiplier from the EV slider."""
+        ev = self.base_intensity.value() / 10.0
+        return float(2.0 ** ev)
 
     def _base_temperature_value(self) -> float:
         return float(self.base_temperature.value())
@@ -1336,7 +1585,13 @@ class SettingsPanel(QScrollArea):
         return self.base_tint.value() / 100.0
 
     def _set_base_intensity_value(self, value: float):
-        self.base_intensity.setValue(int(round(max(0.01, min(16.0, value)) * 100.0)))
+        """Accept either a multiplier (legacy configs) or an EV directly via
+        the slider widget — here we always receive the multiplier and convert
+        to EV for display."""
+        mult = float(max(1e-6, min(256.0, value)))
+        ev = math.log2(mult) if mult > 0 else 0.0
+        ev = max(-8.0, min(8.0, ev))
+        self.base_intensity.setValue(int(round(ev * 10.0)))
 
     def _set_base_temperature_value(self, value: float):
         self.base_temperature.setValue(int(round(max(2000.0, min(15000.0, value)))))
@@ -1476,7 +1731,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HDRI Calibration  ·  VFX Pipeline Tool")
-        self.resize(1280, 860)
+        # Big enough that the right column doesn't squeeze the spinbox arrows.
+        self.resize(1500, 900)
+        self.setMinimumSize(1100, 720)
         # _file_items kept as a 0-or-1 length list so the rest of the code can
         # still index it; batch UI was removed but the data model is unchanged.
         self._file_items:   List[FileItem]           = []
@@ -1554,7 +1811,9 @@ class MainWindow(QMainWindow):
         vs.setSizes([540, 200]); cl.addWidget(vs); sp.addWidget(centre)
 
         # RIGHT (current file + settings + action buttons all together)
-        right = QWidget(); right.setMinimumWidth(340); right.setMaximumWidth(440)
+        right = QWidget()
+        right.setMinimumWidth(380)
+        right.setMaximumWidth(480)
         rl = QVBoxLayout(right); rl.setContentsMargins(6, 6, 6, 6); rl.setSpacing(4)
 
         # Header: current file
@@ -1593,7 +1852,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(actions)
 
         sp.addWidget(right)
-        sp.setSizes([940, 380])
+        sp.setSizes([1080, 420])
 
         self._source_preview_timer = QTimer(self)
         self._source_preview_timer.setSingleShot(True)
@@ -2007,6 +2266,20 @@ class MainWindow(QMainWindow):
             out = np.clip(view * 255.0, 0, 255).astype(np.uint8)
             out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
             cv2.imwrite(preview_path, out_bgr)
+            # Raw scene-linear companion (working colorspace ACEScg, no
+            # normalisation) so the GUI probe can read true scene values.
+            try:
+                npy_path = os.path.splitext(preview_path)[0] + ".f16.npy"
+                meta_path = os.path.splitext(preview_path)[0] + ".f16.json"
+                np.save(npy_path, img.astype(np.float16))
+                with open(meta_path, "w") as _f:
+                    json.dump({
+                        "colorspace":      "acescg",
+                        "anchor_99p5":     float(denom),
+                        "is_scene_linear": True,
+                    }, _f)
+            except Exception:
+                pass
             if fi.source_preview and fi.source_preview in fi.previews:
                 fi.previews.remove(fi.source_preview)
             fi.source_preview = preview_path
