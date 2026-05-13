@@ -833,6 +833,16 @@ class FileItem:
         self.status = "waiting"; self.warnings = []; self.report = {}; self.previews = []
         self.source_preview = None
         self.config = None
+        # In-memory cache of the raw loaded EXR (ACEScg linear).  Set on
+        # first load; reused on slider drags so we don't re-read disk
+        # every tick.  Cleared when the file or colorspace changes.
+        # _small is the same image downsampled to preview size; _anchor is
+        # the 99.5-percentile luma of the unscaled base, used as a fixed
+        # display anchor so EV=0 stays stable as the user moves Exposure.
+        self.loaded_base: Optional[np.ndarray] = None
+        self.loaded_base_small: Optional[np.ndarray] = None
+        self.loaded_base_anchor: float = 1.0
+        self.loaded_colorspace: Optional[str] = None
 
     def icon(self):
         return {"waiting": ICON_WAIT, "running": ICON_RUNNING, "ok": ICON_OK,
@@ -844,18 +854,31 @@ class FileItem:
 
 
 # ── Preview panel ──────────────────────────────────────────────────────────────
+def _build_srgb_lut(n: int = 4096) -> np.ndarray:
+    """Precompute a linear → sRGB u8 LUT once. Indexing into this is 10-20×
+    faster than np.power on the full image."""
+    x = np.arange(n, dtype=np.float32) / (n - 1)
+    enc = np.where(x <= 0.0031308,
+                   x * 12.92,
+                   1.055 * np.power(np.clip(x, 1e-9, None), 1.0 / 2.4) - 0.055)
+    return np.clip(enc * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+_SRGB_LUT = _build_srgb_lut(4096)
+_SRGB_LUT_LAST = _SRGB_LUT.shape[0] - 1
+
+
 def _linear_to_srgb_u8(img_linear: np.ndarray, ev: float = 0.0) -> np.ndarray:
-    """Apply 2^ev exposure to display-sRGB-LINEAR data, then sRGB-encode to u8.
-    Handles the full HDR range — useful for underexposing many stops to peek
-    into restored highlights or overexposing to inspect shadows."""
+    """Apply 2^ev exposure to display-sRGB-LINEAR data, then sRGB-encode to u8
+    via a precomputed LUT. Handles the full HDR range — clipping at the top
+    is expected when overexposing."""
     lin = np.asarray(img_linear, dtype=np.float32)
     if abs(ev) > 1e-3:
         lin = lin * (2.0 ** float(ev))
-    lin = np.clip(lin, 0.0, 1.0)
-    enc = np.where(lin <= 0.0031308,
-                   lin * 12.92,
-                   1.055 * np.power(np.clip(lin, 1e-9, None), 1.0 / 2.4) - 0.055)
-    return np.clip(enc * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    # Clip to [0,1] and quantise to LUT indices.
+    idx = np.clip(lin, 0.0, 1.0) * _SRGB_LUT_LAST
+    idx = idx.astype(np.int32)
+    return _SRGB_LUT[idx]
 
 
 def _u8_srgb_to_linear(img_u8_rgb: np.ndarray) -> np.ndarray:
@@ -1011,9 +1034,11 @@ class PreviewPanel(QWidget):
             lbl.setStyleSheet("background:#10101a;")
             lbl.setText("")
         else:
+            # Fast bilinear scaling — slider drags would otherwise stall on
+            # Qt.SmoothTransformation for large pixmaps.
             lbl.setPixmap(px.scaled(
                 lbl.width() or 600, lbl.height() or 400,
-                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                Qt.KeepAspectRatio, Qt.FastTransformation))
             lbl.setStyleSheet("background:#10101a;"); lbl.setText("")
 
     def set_search_rect(self, rect_uv: Optional[tuple]):
@@ -2172,7 +2197,12 @@ class MainWindow(QMainWindow):
                 return
             reset_settings = (clicked is reset_btn)
 
-        # Replace current file (single-file workflow).
+        # Replace current file (single-file workflow). Drop any cached
+        # full-res base array first so the old EXR is freed before we
+        # decode a new one.
+        for _fi in self._file_items:
+            _fi.loaded_base = None
+            _fi.loaded_base_small = None
         self._file_items.clear()
         self._current_item = None
         self._preview.clear(); self._report.clear()
@@ -2205,16 +2235,77 @@ class MainWindow(QMainWindow):
     def _request_source_preview_refresh(self, *_args):
         if not hasattr(self, "_source_preview_timer"):
             return
-        self._source_preview_timer.start(120)
+        # Single-shot timer — restart resets the countdown, so a fast drag
+        # only fires one refresh after the last tick.
+        self._source_preview_timer.start(60)
 
     def _refresh_selected_source_preview(self):
+        """Slider-drag path. Updates only the Source tab, in-memory, no disk
+        I/O. Operates on a downsampled cached EXR so each tick is ~10 ms
+        instead of ~150 ms."""
         idx = self._selected_index()
         if idx is None:
             return
         fi = self._file_items[idx]
-        self._ensure_source_preview(fi, force=True)
-        if self._current_item is fi:
-            self._on_file_selected(idx)
+        try:
+            import hdri_cal as hc
+            cfg = self._current_config_for(fi)
+            input_cs = cfg.colorspace
+            # First-time (or colorspace-changed) load: decode the EXR.
+            if (fi.loaded_base is None
+                    or fi.loaded_colorspace != input_cs):
+                img, _ = hc.load_image_any(
+                    fi.path, target_colorspace="acescg",
+                    input_colorspace=input_cs)
+                fi.loaded_base = np.clip(img, 0.0, None).astype(np.float32)
+                fi.loaded_colorspace = input_cs
+                fi.loaded_base_small = None  # invalidate downsampled cache
+            # Ensure downsampled cache + base anchor exist. Both are
+            # computed once per file load — slider drags just multiply
+            # the small array and reuse the anchor.
+            if fi.loaded_base_small is None:
+                h, w = fi.loaded_base.shape[:2]
+                max_w = 1400
+                if w > max_w:
+                    s = max_w / float(w)
+                    new_size = (max(8, int(round(w * s))),
+                                max(8, int(round(h * s))))
+                    fi.loaded_base_small = cv2.resize(
+                        fi.loaded_base, new_size,
+                        interpolation=cv2.INTER_AREA).astype(np.float32)
+                else:
+                    fi.loaded_base_small = fi.loaded_base
+                # Anchor: 99.5-pct of the unscaled small base luma.  Used
+                # as a fixed display reference so the Exposure slider
+                # produces a visible change instead of being normalised
+                # back out at EV=0.
+                _b = fi.loaded_base_small
+                _lum = (0.2126 * _b[..., 0]
+                        + 0.7152 * _b[..., 1]
+                        + 0.0722 * _b[..., 2])
+                _valid = _lum[np.isfinite(_lum)]
+                fi.loaded_base_anchor = float(max(
+                    np.percentile(_valid, 99.5) if _valid.size else 1.0, 1e-6))
+
+            small = fi.loaded_base_small
+            rgb_scale = self._photographic_rgb_scale(cfg)
+            adjusted = (small * rgb_scale[None, None, :]
+                        * float(cfg.base_intensity)).astype(np.float32)
+
+            # Push directly into the PreviewPanel's in-memory caches —
+            # bypasses the PNG + .f16.npy + .f16.json round-trip.
+            key = "source_preview.png"
+            self._preview._scene[key] = adjusted
+            self._preview._meta[key] = {
+                "colorspace":      "acescg",
+                "anchor_99p5":     fi.loaded_base_anchor,
+                "is_scene_linear": True,
+            }
+            self._preview._render_into_label(key)
+            # Reapply the search rect overlay (cleared by re-render).
+            self._preview.set_search_rect(self._settings.cc_search_rect)
+        except Exception as e:
+            print(f"[preview-refresh] {e}")
 
     def _selected_index(self):
         return 0 if self._file_items else None
@@ -2237,6 +2328,9 @@ class MainWindow(QMainWindow):
     def _clear_queue(self):
         if self._running:
             return
+        for _fi in self._file_items:
+            _fi.loaded_base = None
+            _fi.loaded_base_small = None
         self._file_items.clear()
         self._current_item = None
         self._preview.clear()
@@ -2287,8 +2381,16 @@ class MainWindow(QMainWindow):
             if not force and fi.source_preview == preview_path and os.path.exists(preview_path):
                 return fi.source_preview
             input_cs = cfg.colorspace
-            img, _ = hc.load_image_any(fi.path, target_colorspace="acescg", input_colorspace=input_cs)
-            base_img = np.clip(img, 0.0, None)
+            # Cache the loaded EXR on the FileItem so subsequent slider
+            # drags don't re-read disk every tick.
+            if (fi.loaded_base is None
+                    or fi.loaded_colorspace != input_cs):
+                img_load, _ = hc.load_image_any(
+                    fi.path, target_colorspace="acescg",
+                    input_colorspace=input_cs)
+                fi.loaded_base = np.clip(img_load, 0.0, None).astype(np.float32)
+                fi.loaded_colorspace = input_cs
+            base_img = fi.loaded_base
             rgb_scale = self._photographic_rgb_scale(cfg)
             img = base_img * rgb_scale[None, None, :] * float(cfg.base_intensity)
             h, w = img.shape[:2]
