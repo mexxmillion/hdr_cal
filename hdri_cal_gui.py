@@ -926,6 +926,9 @@ class PreviewPanel(QWidget):
         self._ev_slider.valueChanged.connect(self._on_ev_changed)
 
         self._tabs = QTabWidget(); lay.addWidget(self._tabs)
+        # Lazy re-render: when the user switches tabs, apply the current
+        # viewer-EV to whichever tab they just landed on.
+        self._tabs.currentChanged.connect(self._on_tab_changed)
         self._labels: dict[str, QLabel] = {}
         # Per-tab caches.
         # _scene: raw scene-linear float32 in the working colorspace (probed by
@@ -999,7 +1002,30 @@ class PreviewPanel(QWidget):
     def _on_ev_changed(self, _v):
         ev = self._current_ev()
         self._ev_value.setText(f"{ev:+.1f} EV")
-        for key in list(self._scene.keys()):
+        # Only re-render the active tab. Other tabs catch up lazily when
+        # the user switches to them.
+        current_key = self._current_tab_key()
+        if current_key is not None and current_key in self._scene:
+            self._render_into_label(current_key)
+        else:
+            for key in list(self._scene.keys()):
+                self._render_into_label(key)
+
+    def _current_tab_key(self) -> Optional[str]:
+        """Map the active tab text back to its preview-cache key."""
+        idx = self._tabs.currentIndex()
+        if idx < 0:
+            return None
+        # _labels keys are ordered the same way the tabs were added.
+        keys = list(self._labels.keys())
+        if 0 <= idx < len(keys):
+            return keys[idx]
+        return None
+
+    def _on_tab_changed(self, _idx: int):
+        """Pick up the current viewer-EV on whichever tab just became active."""
+        key = self._current_tab_key()
+        if key is not None and key in self._scene:
             self._render_into_label(key)
 
     def _scene_to_display_linear(self, scene_rgb: np.ndarray,
@@ -2241,10 +2267,21 @@ class MainWindow(QMainWindow):
 
     def _refresh_selected_source_preview(self):
         """Slider-drag path. Updates only the Source tab, in-memory, no disk
-        I/O. Operates on a downsampled cached EXR so each tick is ~10 ms
-        instead of ~150 ms."""
+        I/O. Skips entirely when the user is on a different tab — there's
+        nothing visible to update there, and the repaint cost was bleeding
+        into the active tab's interaction (e.g. scrolling the Final tab)."""
         idx = self._selected_index()
         if idx is None:
+            return
+        # If the user isn't looking at the Source tab, defer the work.  The
+        # next time they switch back to Source the cached scene-linear is
+        # rebuilt on demand by _ensure_source_preview / update_preview.
+        try:
+            current_tab_text = self._preview._tabs.tabText(
+                self._preview._tabs.currentIndex())
+        except Exception:
+            current_tab_text = "Source"
+        if current_tab_text != "Source":
             return
         fi = self._file_items[idx]
         try:
