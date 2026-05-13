@@ -1212,54 +1212,75 @@ class SettingsPanel(QScrollArea):
         self._adv_groups.append(grp)
 
         grp = QGroupBox("Chart Detection")
-        f = QFormLayout(grp)
+        v = QVBoxLayout(grp)
+        v.setContentsMargins(8, 14, 8, 8)
+        v.setSpacing(6)
+
+        # min-confidence is only used by the hidden auto-detect path
         self.cc_min_confidence = QDoubleSpinBox()
         self.cc_min_confidence.setRange(0.0, 1.0)
         self.cc_min_confidence.setSingleStep(0.05)
         self.cc_min_confidence.setDecimals(2)
         self.cc_min_confidence.setValue(0.50)
-        self.cc_min_confidence.setToolTip(
-            "Minimum auto-detect confidence inside the user-drawn rect. "
-            "If the auto-detect fails or scores below this, use 'Place chart "
-            "corners' to set the 4 corners manually.")
-        f.addRow("Min confidence",  self.cc_min_confidence)
+        self.cc_min_confidence.setVisible(False)
 
-        # Search rect indicator (set by drawing on the Source preview)
-        self._cc_rect_label = QLabel("(none — draw on Source preview)")
-        self._cc_rect_label.setStyleSheet("color: #606080; font-size: 10px;")
+        # Step 1 — search rect.  Clear button rides on the step header so
+        # nothing depends on the rightmost column having room for a button.
         self.cc_search_rect: Optional[tuple] = None
-        rect_row = QHBoxLayout()
-        rect_row.addWidget(self._cc_rect_label)
-        rect_row.addStretch()
-        clear_rect_btn = QPushButton("Clear")
-        clear_rect_btn.setMaximumWidth(50)
+        step1_row = QHBoxLayout()
+        step1_row.setSpacing(4)
+        step1 = QLabel("1.  Drag a rectangle on the Source preview")
+        step1.setStyleSheet("color: #8888a8; font-size: 11px;")
+        step1_row.addWidget(step1, 1)
+        clear_rect_btn = QPushButton("✕")
+        clear_rect_btn.setFixedSize(20, 20)
+        clear_rect_btn.setToolTip("Clear search rectangle")
         clear_rect_btn.clicked.connect(self._clear_cc_rect)
-        rect_row.addWidget(clear_rect_btn)
-        f.addRow("Search rect", rect_row)
+        step1_row.addWidget(clear_rect_btn, 0)
+        v.addLayout(step1_row)
 
-        # Auto-detect kept as a hidden code path; manual placement is the
-        # advertised workflow. (Auto-detect was unreliable on real charts
-        # — see _on_detect_chart_in_rect for a dev-only entry point.)
-        self.detect_chart_btn = QPushButton("Detect Chart In Rect")
-        self.detect_chart_btn.setVisible(False)
+        self._cc_rect_label = QLabel("(none)")
+        self._cc_rect_label.setStyleSheet(
+            "color: #606080; font-size: 10px; padding-left: 14px;")
+        self._cc_rect_label.setWordWrap(True)
+        v.addWidget(self._cc_rect_label)
+
+        # Spacer divider
+        div = QFrame(); div.setFrameShape(QFrame.HLine)
+        div.setStyleSheet("color: #303040;")
+        div.setFixedHeight(1)
+        v.addWidget(div)
+
+        # Step 2 — place corners.
+        self.cc_manual_corners: Optional[list] = None
+        step2_row = QHBoxLayout()
+        step2_row.setSpacing(4)
+        step2 = QLabel("2.  Place the 4 chart corners")
+        step2.setStyleSheet("color: #8888a8; font-size: 11px;")
+        step2.setToolTip("Order: TL → TR → BR → BL")
+        step2_row.addWidget(step2, 1)
+        clear_btn = QPushButton("✕")
+        clear_btn.setFixedSize(20, 20)
+        clear_btn.setToolTip("Clear placed corners")
+        clear_btn.clicked.connect(self._clear_cc_corners)
+        step2_row.addWidget(clear_btn, 0)
+        v.addLayout(step2_row)
+
         self.pick_chart_btn = QPushButton("Place Chart Corners")
+        self.pick_chart_btn.setMinimumHeight(28)
         self.pick_chart_btn.setToolTip(
             "Open the rectilinear crop of the search rect and click 4 corners "
-            "(TL → TR → BR → BL).")
+            "(TL → TR → BR → BL). Drag any corner afterward to fine-tune.")
+        v.addWidget(self.pick_chart_btn)
+
         self._cc_corners_label = QLabel("(not set)")
-        self._cc_corners_label.setStyleSheet("color: #606080; font-size: 10px;")
-        self.cc_manual_corners: Optional[list] = None
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self.pick_chart_btn)
-        f.addRow("Place chart", btn_row)
-        corners_row = QHBoxLayout()
-        corners_row.addWidget(self._cc_corners_label)
-        corners_row.addStretch()
-        clear_btn = QPushButton("Clear")
-        clear_btn.setMaximumWidth(50)
-        clear_btn.clicked.connect(self._clear_cc_corners)
-        corners_row.addWidget(clear_btn)
-        f.addRow("Manual corners", corners_row)
+        self._cc_corners_label.setStyleSheet(
+            "color: #606080; font-size: 10px; padding-left: 14px;")
+        v.addWidget(self._cc_corners_label)
+
+        # Hidden auto-detect (dev only — preserved code path)
+        self.detect_chart_btn = QPushButton("Detect Chart In Rect")
+        self.detect_chart_btn.setVisible(False)
 
         # Chart Detection is always visible — primary workflow, not "advanced".
         self._chart_detection_group = grp
@@ -1486,35 +1507,40 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         self.setStyleSheet(VFX_STYLE)
-        tb = QToolBar(); tb.setMovable(False); tb.setIconSize(QSize(16,16)); self.addToolBar(tb)
 
-        self._run_btn = QPushButton("▶  Process"); self._run_btn.setObjectName("run_btn")
+        # Action buttons live in the right settings column now — the top
+        # toolbar is gone. Build the buttons here so the right panel can mount
+        # them at the bottom.
+        self._run_btn = QPushButton("▶  Process")
+        self._run_btn.setObjectName("run_btn")
+        self._run_btn.setMinimumHeight(34)
         self._run_btn.clicked.connect(self._on_run)
-        self._val_btn = QPushButton("⚡  Validate"); self._val_btn.setObjectName("validate_btn")
+        self._val_btn = QPushButton("⚡  Validate")
+        self._val_btn.setObjectName("validate_btn")
+        self._val_btn.setMinimumHeight(28)
         self._val_btn.clicked.connect(self._on_validate)
-        self._abort_btn = QPushButton("■  Abort"); self._abort_btn.setObjectName("abort_btn")
-        self._abort_btn.setEnabled(False); self._abort_btn.clicked.connect(self._on_abort)
+        self._abort_btn = QPushButton("■  Abort")
+        self._abort_btn.setObjectName("abort_btn")
+        self._abort_btn.setMinimumHeight(28)
+        self._abort_btn.setEnabled(False)
+        self._abort_btn.clicked.connect(self._on_abort)
         self._open_btn = QPushButton("📂  Open")
+        self._open_btn.setMinimumHeight(28)
         self._open_btn.clicked.connect(self._on_browse_open)
         self._clear_btn = QPushButton("✕  Clear")
+        self._clear_btn.setMinimumHeight(28)
         self._clear_btn.setToolTip("Unload the current file")
         self._clear_btn.clicked.connect(self._clear_queue)
         self._out_btn = QPushButton("📁  Output Folder")
+        self._out_btn.setMinimumHeight(28)
         self._out_btn.clicked.connect(self._open_output_folder)
-        tb.addWidget(self._open_btn); tb.addWidget(self._clear_btn)
-        tb.addSeparator()
-        tb.addWidget(self._run_btn); tb.addWidget(self._val_btn); tb.addWidget(self._abort_btn)
-        tb.addSeparator()
-        tb.addWidget(self._out_btn)
-        tb.addSeparator()
-        self._progress = QProgressBar(); self._progress.setMaximumWidth(180)
-        self._progress.setMaximumHeight(12); self._progress.setVisible(False)
-        tb.addWidget(self._progress)
+        self._progress = QProgressBar()
+        self._progress.setMaximumHeight(10)
+        self._progress.setVisible(False)
 
-        # Current file indicator pinned to the right of the toolbar.
         self._file_label = QLabel("No file loaded — drag & drop EXR / HDR / PNG / WebP")
-        self._file_label.setStyleSheet("color: #808098; padding-left: 12px;")
-        tb.addWidget(self._file_label)
+        self._file_label.setStyleSheet("color: #808098; padding: 4px 0px;")
+        self._file_label.setWordWrap(True)
 
         sp = QSplitter(Qt.Horizontal); self.setCentralWidget(sp)
 
@@ -1527,12 +1553,47 @@ class MainWindow(QMainWindow):
         bot.addTab(self._log, "Log"); bot.addTab(self._report, "Report"); vs.addWidget(bot)
         vs.setSizes([540, 200]); cl.addWidget(vs); sp.addWidget(centre)
 
-        # RIGHT (settings)
-        right = QWidget(); right.setMinimumWidth(280); right.setMaximumWidth(360)
-        rl = QVBoxLayout(right); rl.setContentsMargins(4,4,4,4)
-        lbl = QLabel("Settings"); lbl.setObjectName("section"); rl.addWidget(lbl)
-        self._settings = SettingsPanel(); rl.addWidget(self._settings); sp.addWidget(right)
-        sp.setSizes([960, 320])
+        # RIGHT (current file + settings + action buttons all together)
+        right = QWidget(); right.setMinimumWidth(340); right.setMaximumWidth(440)
+        rl = QVBoxLayout(right); rl.setContentsMargins(6, 6, 6, 6); rl.setSpacing(4)
+
+        # Header: current file
+        rl.addWidget(self._file_label)
+
+        # Settings (scrollable)
+        self._settings = SettingsPanel()
+        rl.addWidget(self._settings, 1)  # stretch — takes remaining space
+
+        # Action buttons block, anchored at the bottom
+        actions = QFrame()
+        actions.setObjectName("actions_block")
+        actions.setStyleSheet(
+            "#actions_block { border-top: 1px solid #303040; padding-top: 6px; }")
+        al = QVBoxLayout(actions); al.setContentsMargins(0, 6, 0, 0); al.setSpacing(4)
+
+        # Row 1: Open + Clear
+        r1 = QHBoxLayout(); r1.setSpacing(4)
+        r1.addWidget(self._open_btn); r1.addWidget(self._clear_btn)
+        al.addLayout(r1)
+
+        # Row 2: Process (full width, prominent)
+        al.addWidget(self._run_btn)
+
+        # Row 3: Validate + Abort
+        r3 = QHBoxLayout(); r3.setSpacing(4)
+        r3.addWidget(self._val_btn); r3.addWidget(self._abort_btn)
+        al.addLayout(r3)
+
+        # Row 4: Output folder
+        al.addWidget(self._out_btn)
+
+        # Progress bar
+        al.addWidget(self._progress)
+
+        rl.addWidget(actions)
+
+        sp.addWidget(right)
+        sp.setSizes([940, 380])
 
         self._source_preview_timer = QTimer(self)
         self._source_preview_timer.setSingleShot(True)
