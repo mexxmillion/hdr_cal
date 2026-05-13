@@ -167,12 +167,145 @@ load → input-primaries conversion → ACEScg working space
 
 What's **not** in the pipeline (by design):
 - No WB blending. The chart is ground truth.
-- No final post-WB rebalance. WB+exposure already lock patch 22 to albedo.
-- No chart-vs-sphere disagreement warnings.
-- No automatic colour-cast warnings.
-- No "chart-neutral guarantee" snap. The math is correct by construction.
 
-What patch 22 reads in the final EXR: **exactly `albedo / albedo / albedo`**.
+---
+
+## Algorithm
+
+This section describes what each step actually does so you can reason about the output.
+
+### 1. Chart sampling (manual placement)
+
+The user clicks 4 corners (TL → TR → BR → BL) on a rectilinear crop of the latlong. We:
+
+1. Build a gnomonic projection of the search rect: `yaw = (cu - 0.5) · 360°`, `pitch = (cv - 0.5) · 180°`, `fov = max(span_u_deg, span_v_deg)`. The output tile aspect matches the rect aspect so the chart isn't squished.
+2. Map the 4 corner UVs to tile pixel coordinates by nearest-neighbour lookup through the projection's `map_uv`.
+3. Warp the linear HDR tile through a perspective transform from the user's quad into a canonical CC24 rectangle. Rectified target size and per-swatch sampling window scale to the source quad's pixel span.
+4. Sample 24 swatches inside an inner sub-rect of each grid cell. Try all 4 rotations of the quad and pick the one whose neutral-ramp luma best correlates with the CC24 reference.
+
+The output is **24 RGB samples in linear ACEScg**. Patch index 21 (`Neutral 5`) drives WB and exposure; the other patches are stored for later debug/diagnostics but don't drive the calibration.
+
+> The pre-WB chroma of the measured patch 22 is logged but never used as a gating metric. A warm-lit chart will read non-neutral before WB — that's *the* condition WB exists to correct.
+
+### 2. White balance
+
+Goal: make `Neutral 5` read `R = G = B`.
+
+```
+measured  = cc_measured[21]                        # (3,) ACEScg linear
+reference = CC24_LINEAR_SRGB[21]                   # ≈ (0.188, 0.188, 0.188)
+scale_raw = reference / measured                   # per-channel
+wb_scale  = scale_raw / scale_raw[1]               # G-normalise → green stays at 1.0
+wb_img    = img * wb_scale                         # apply globally
+```
+
+G-normalising preserves luminance — only chromaticity shifts. After this step `cc_measured[21] · wb_scale` has `R = G = B` exactly.
+
+### 3. Exposure
+
+Goal: make `Neutral 5` read `albedo` (default `0.18`) on all channels.
+
+```
+meas_luma_post = luminance(cc_measured[21] · wb_scale)
+exposure_scale = albedo / meas_luma_post
+exposed        = wb_img · exposure_scale
+```
+
+Why this is `albedo / measured_luma` and not something fancier:
+
+For a chart inside the HDRI, the chart pixels **are** scene pixels — they carry the same exposure relationship as everything else. The calibration definition is "make the chart read its own albedo." Substitute `E_on_chart = π` into the general predicted-luma formula `albedo · E / π` and you get exactly `albedo`; the formula collapses to `exposure_scale = albedo / measured`. This is independent of the chart's orientation, because we're only normalising its already-measured radiance, not predicting it from external irradiance.
+
+After exposure: `cc_measured[21]` in the corrected HDRI = `(albedo, albedo, albedo)` exactly.
+
+### 4. Hot-lobe extraction
+
+The sun is detected by thresholding luminance:
+
+```
+peak_lum  = percentile(lum, 99.99)
+threshold = peak_lum · sun_threshold       # default 0.1 → top 10% of peak
+mask      = lum > threshold                # boolean per pixel
+```
+
+Connected components are merged into a single lobe centred on the brightest cluster. The lobe's direction and solid angle drop into `hot["center_dir"]`, `hot["mask"]`, etc.
+
+`--center-hdri` (default on) rotates the latlong so the lobe centre lands on `phi = 0` (centre column).
+
+### 5. Sun lobe gain solve
+
+Goal: each colour channel's total upward irradiance equals π (the value a perfectly-lit Lambertian grey card would integrate to).
+
+Decompose the corrected HDRI:
+
+```
+base = exposed · (1 - lobe_mask)      # everything except the sun
+lobe = exposed · lobe_mask            # the sun
+```
+
+Then compute per-channel cosine-weighted irradiance integrals over the upper hemisphere:
+
+```
+E_base[c] = Σ base[..., c] · max(cos(θ), 0) · dΩ
+E_lobe[c] = Σ lobe[..., c] · max(cos(θ), 0) · dΩ
+```
+
+Solve for per-channel gain:
+
+```
+gain[c] = (π - E_base[c]) / E_lobe[c]      # what makes E_base + gain·E_lobe = π
+gain[c] = clamp(gain[c], 0, ceiling) with smooth rolloff above ceiling - rolloff
+```
+
+`apply_sun_gain_per_channel`:
+
+1. **Neutralise the lobe** (`--lobe-neutralise`, default 1.0): inside the lobe mask, replace each pixel's RGB by its luminance broadcast across all channels. Sun discs read as ~5800 K blackbodies; after WB they should be near-neutral anyway, and any residual per-channel imbalance in a clipped sun is sensor artefact, not real spectral content.
+2. **Apply gain** to lobe pixels only: `lobe_gained = lobe_neutralised · gain[None, None, :]`.
+3. **Recombine**: `corrected = base + lobe_gained`.
+
+Critically, `gain` is applied **only inside `lobe_mask`**. The chart on the ground (`lobe_mask = 0` there) is untouched. Patch 22 stays at `(albedo, albedo, albedo)` from step 3.
+
+### 6. What the chart guarantees
+
+After all five steps the output EXR has these invariants when a chart was placed:
+
+| Pixel | RGB |
+|---|---|
+| Patch 22 (Neutral 5) | exactly `(albedo, albedo, albedo)` |
+| Patch 19 (white) | albedo · CC24_LINEAR_SRGB[18] / CC24_LINEAR_SRGB[21] in each channel — preserved by WB+exposure ratio |
+| Sun-disc lobe pixels | neutral and gain-solved so the integrated upper hemisphere is `(π, π, π)` |
+| Everything else | preserved chromatic content, exposure rescaled by `wb_scale · exposure_scale` |
+
+Equivalent statement: **a grey card placed on the ground in this HDRI renders to exactly `albedo` luminance in all three channels.** That's the calibration definition.
+
+### 7. Resolution helpers
+
+Three knobs that influence the lobe gain solve:
+
+- `--sun-threshold` (default `0.1`): fraction of peak luma below which pixels are NOT considered part of the lobe. Higher = tighter sun, lower = wider sun.
+- `--sun-gain-ceiling` (default `2000`): maximum per-channel gain. Severely clipped suns hit this; raise if energy validation reports < 90% recovery.
+- `--sun-gain-rolloff` (default `500`): the gain transitions smoothly into the ceiling instead of snapping. `gain = ceiling - (ceiling - raw) · exp(-(raw - rolloff)/rolloff)` once `raw > rolloff`.
+
+### 8. Optional validation suite
+
+Off by default. When the **Run energy & calibration validation** checkbox is on (or `validate_energy = True` in the config), after the main pipeline:
+
+- Render an actual Lambertian grey ball from the corrected HDRI at `sphere_res` resolution.
+- Integrate the 6-direction irradiance map (`+y`, `-y`, `±x`, `±z`).
+- Compute `E_upper`, `E_lower`, `E_sun`, `E_upper_chroma_norm`, etc.
+- Report per-direction predicted card values, sphere-mean RGB, rendered-vs-analytical deviation, and chroma imbalance.
+- Adds ~1–2 s and writes `meta["energy_validation"]` to `report.json` + `08_verify_sphere_final.png`.
+
+Nothing in this suite modifies the saved EXR — it's purely a diagnostic for verifying the math closed.
+
+### 9. What's deliberately absent
+
+| Step | Why we don't do it |
+|---|---|
+| WB sphere blend | Sphere WB is contaminated by the very cast the chart removes. Mixing them makes WB worse on coloured-light scenes. |
+| Final post-balance rescale | Would un-do the chart neutrality we just set. |
+| Chart-neutral guarantee snap | Patch 22 is already exact by construction (steps 2+3). A "guarantee" step that re-samples is just a bug surface — and was empirically tinting the output when the re-sample window landed on swatch borders on the warped ERP. |
+| Patch-confidence gate | Pre-WB chroma is meaningless as a confidence metric. If a chart was found, use it. |
+| Pose-aware exposure for in-HDRI charts | The chart pixels carry their own exposure relationship to the scene; pose correction is only meaningful for separately-exposed reference plates. |
 
 ---
 
