@@ -2441,6 +2441,45 @@ def _run_pipeline(args):
                                  swatch_size=args.swatch_size)
         exposure_scale = solve_exposure_scale(meter_info, args.meter_target)
         exposed = wb_img * exposure_scale
+    # ── 4b. Bias (post-WB+exposure, pre-sun-solve) ────────────────────────
+    # The GUI's "Exposure bias / Temp bias / Tint bias" sliders feed in
+    # here. They multiply the already-calibrated base dome before the
+    # sun-lobe gain solve runs, so:
+    #   - chart-derived WB/exposure define the *zero-bias* baseline
+    #   - +EV bias  → base dome brighter → sun lobe solves to less gain
+    #   - +temp/tint bias → base dome warmer/greener → likewise
+    # Sun solve still targets E=π per channel, so the integrated upper-
+    # hemisphere irradiance ends up correct; the bias only shifts how
+    # the energy is partitioned between sky/dome and the sun.
+    bias_intensity = float(getattr(args, "bias_intensity", 1.0) or 1.0)
+    bias_rgb_str   = getattr(args, "bias_rgb_scale", None)
+    if bias_rgb_str:
+        try:
+            bias_rgb = np.array(parse_rgb_scale(bias_rgb_str), dtype=np.float32)
+            # G-normalise so the bias is colour-only; magnitude lives on
+            # bias_intensity.
+            bias_rgb = bias_rgb / max(float(bias_rgb[1]), 1e-8)
+        except Exception:
+            bias_rgb = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    else:
+        bias_rgb = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    bias_scale = (bias_rgb * bias_intensity).astype(np.float32)
+    bias_applied = (abs(bias_intensity - 1.0) > 1e-6
+                    or float(np.max(np.abs(bias_rgb - 1.0))) > 1e-4)
+    if bias_applied:
+        log(f"Bias (post-WB, pre-sun-solve): "
+            f"R={bias_scale[0]:.4f}  G={bias_scale[1]:.4f}  B={bias_scale[2]:.4f}  "
+            f"(intensity={bias_intensity:.4f}× ≈ {math.log2(max(bias_intensity, 1e-6)):+.2f} EV)")
+        exposed = (exposed * bias_scale[None, None, :]).astype(np.float32)
+    meta["bias"] = {
+        "applied":        bool(bias_applied),
+        "intensity_mult": float(bias_intensity),
+        "intensity_ev":   float(math.log2(max(bias_intensity, 1e-6))),
+        "rgb_scale":      bias_rgb.tolist(),
+        "note": ("Applied to the calibrated base dome before sun solve. "
+                 "Sun solve target (E=π) unchanged; lobe gain adapts."),
+    }
+
     save_png_preview(os.path.join(args.debug_dir, "02_exposed_preview.png"), exposed)
     meta["metering"]       = meter_info
     meta["exposure_scale"] = float(exposure_scale)

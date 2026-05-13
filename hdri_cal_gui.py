@@ -208,6 +208,11 @@ class PipelineConfig:
     base_temperature:   float = 6500.0
     base_tint:          float = 0.0
 
+    # Bias applied post WB+exposure, pre sun solve (see hdri_cal §4b).
+    # Derived from base_intensity / base_temperature / base_tint.
+    bias_intensity:     float = 1.0
+    bias_rgb_scale:     Optional[str] = None
+
     # Hot lobe
     sun_threshold:      float = 0.1
     sun_upper_only:     bool = False
@@ -287,6 +292,9 @@ def config_to_namespace(cfg: PipelineConfig):
         "cc_manual_corners":    None,
         "validate_only":        False,
         "validate_energy":      False,
+        # Post-WB+exposure bias parameters (see hdri_cal._run_pipeline §4b).
+        "bias_intensity":       1.0,
+        "bias_rgb_scale":       None,
     }
     for attr, default in _defaults.items():
         if not hasattr(ns, attr):
@@ -1368,37 +1376,47 @@ class SettingsPanel(QScrollArea):
         self.center_hdri.setChecked(True)
         self.center_hdri.setToolTip("Shift azimuth so the sun sits at the centre column (phi=0)")
 
-        # Exposure compensation in stops (EV). Internally we still drive the
-        # pipeline's base_intensity multiplier (2^EV) so nothing downstream
-        # changes — only the UI shows stops, like a camera EV dial.
-        # Slider int = EV × 10  →  range −8.0..+8.0 in 0.1-EV steps.
+        # Exposure / WB BIAS controls.  Applied to the chart-calibrated base
+        # dome BEFORE the sun-lobe gain solve. With zero bias the chart
+        # calibration is taken as-is (patch 22 → albedo). Non-zero values
+        # shift the base dome; the sun solve still targets E=π so its gain
+        # adapts. Net result: +EV brighter base, sun looks relatively dimmer.
         self.base_intensity = SliderField(
             -80, 80, 0, lambda v: f"{v / 10.0:+.1f} EV",
             decimals=1, scale=10.0, suffix=" EV")
         self.base_intensity.setToolTip(
-            "Exposure compensation in stops (EV). "
-            "+1 EV = 2× brighter, −1 EV = ½× brighter. "
-            "Drives the same base_intensity multiplier the pipeline uses, "
-            "so this is a real exposure offset, not a viewer effect.")
+            "Exposure BIAS (stops, ±8 EV). Applied to the calibrated base "
+            "dome after chart WB+exposure but before the sun solve.\n"
+            "+0.5 EV → base dome brighter; the sun solve targets the same "
+            "E=π and so the sun lobe gets less gain (relatively dimmer).\n"
+            "0 EV = the chart calibration is taken as-is.")
 
         self.base_temperature = SliderField(
             2000, 15000, 6500, lambda v: f"{v:d} K",
             decimals=0, scale=1.0, suffix=" K")
-        self.base_temperature.setToolTip("Photographic white balance temperature")
+        self.base_temperature.setToolTip(
+            "Temperature BIAS. Shifts the chart-derived WB warmer (<6500K) "
+            "or cooler (>6500K). Applied to the base dome before sun solve.\n"
+            "6500 K = no bias.")
 
         self.base_tint = SliderField(
             -100, 100, 0, lambda v: f"{v / 100.0:+.2f}",
             decimals=2, scale=100.0)
-        self.base_tint.setToolTip("Tint adjustment: +1.00 = magenta, −1.00 = green")
+        self.base_tint.setToolTip(
+            "Tint BIAS: +1.00 = magenta, −1.00 = green. Shifts the chart-"
+            "derived WB along the green/magenta axis.\n"
+            "0 = no bias.")
 
         f.addRow("Mode",            self.calibration_mode)
         f.addRow("Input primaries", self.input_colorspace)
-        f.addRow("Exposure",        self.base_intensity)
-        f.addRow("Temperature",     self.base_temperature)
-        f.addRow("Tint",            self.base_tint)
+        f.addRow("Exposure bias",   self.base_intensity)
+        f.addRow("Temp bias",       self.base_temperature)
+        f.addRow("Tint bias",       self.base_tint)
         reset_row = QHBoxLayout()
-        self.reset_base_btn = QPushButton("Reset Photographic")
+        self.reset_base_btn = QPushButton("Reset Bias")
         self.reset_base_btn.setMaximumWidth(140)
+        self.reset_base_btn.setToolTip(
+            "Reset all bias controls to neutral (0 EV / 6500 K / 0.0 tint)")
         self.reset_base_btn.clicked.connect(self._reset_photographic_controls)
         reset_row.addWidget(self.reset_base_btn)
         reset_row.addStretch()
@@ -1716,20 +1734,22 @@ class SettingsPanel(QScrollArea):
             cfg.sphere_solve = self.solver_mode.currentText()
             cfg.final_balance_target = self.final_balance_target.currentText()
 
-        cfg.base_intensity = self._base_intensity_value()
+        # Bias controls live in the same widgets as before, but their
+        # semantics changed: they no longer override WB/exposure when the
+        # chart is in use — they're applied as a post-calibration bias
+        # on the base dome before sun solve (see hdri_cal §4b).
+        cfg.base_intensity   = self._base_intensity_value()
         cfg.base_temperature = self._base_temperature_value()
-        cfg.base_tint = self._base_tint_value()
-
-        if cfg.calibration_mode == "advanced":
-            temp_override = abs(self._base_temperature_value() - 6500.0) > 1e-6
-            tint_override = abs(self._base_tint_value()) > 1e-6
-            intensity_override = abs(self._base_intensity_value() - 1.0) > 1e-6
-            if cfg.wb_source == "none" and (temp_override or tint_override):
-                cfg.wb_source = "manual"
-                cfg.rgb_scale = self._photographic_rgb_scale_string(cfg)
-            if cfg.exposure_source == "none" and intensity_override:
-                cfg.exposure_source = "manual"
-                cfg.exposure_scale = cfg.base_intensity
+        cfg.base_tint        = self._base_tint_value()
+        # New canonical bias fields fed to the pipeline.  Snap exactly-
+        # neutral controls to None / 1.0 so the pipeline can skip the
+        # bias multiply entirely (cleaner logs, no float drift).
+        cfg.bias_intensity = float(cfg.base_intensity)
+        if (abs(cfg.base_temperature - 6500.0) < 0.5
+                and abs(cfg.base_tint) < 1e-4):
+            cfg.bias_rgb_scale = None
+        else:
+            cfg.bias_rgb_scale = self._photographic_rgb_scale_string(cfg)
 
         cfg.albedo = self.albedo.value()
         cfg.sun_threshold = self.sun_threshold.value()
@@ -1929,24 +1949,19 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Ready  ·  Drop EXR / HDR / PNG / WebP into the window to begin")
 
     def _connect_settings_signals(self):
-        # Settings that actually change what the Source preview *looks* like
-        # — colorspace interpretation + the photographic exposure/WB knobs.
-        # Toggling these triggers a re-decode of the HDRI and a new
-        # display-mapped PNG + .f16.npy companion.
-        for signal in [
-            self._settings.input_colorspace.currentTextChanged,
-            self._settings.base_intensity.valueChanged,
-            self._settings.base_temperature.valueChanged,
-            self._settings.base_tint.valueChanged,
-        ]:
-            signal.connect(self._on_preview_setting_changed)
+        # The only setting that changes how the Source preview is decoded
+        # is the input colorspace.  Everything else (including the bias
+        # controls, which now apply post-WB inside the pipeline) is a
+        # config-only change.
+        self._settings.input_colorspace.currentTextChanged.connect(
+            self._on_preview_setting_changed)
 
-        # Everything else only changes pipeline behaviour. We persist the
-        # config but do NOT rebuild the source preview — no disk reload,
-        # no tone-map, no UI lag.
         for signal in [
             self._settings.calibration_mode.currentTextChanged,
             self._settings.center_hdri.toggled,
+            self._settings.base_intensity.valueChanged,
+            self._settings.base_temperature.valueChanged,
+            self._settings.base_tint.valueChanged,
             self._settings.wb_source.currentTextChanged,
             self._settings.exp_source.currentTextChanged,
             self._settings.integration_mode.currentTextChanged,
@@ -2324,10 +2339,11 @@ class MainWindow(QMainWindow):
                 fi.loaded_base_anchor = float(max(
                     np.percentile(_valid, 99.5) if _valid.size else 1.0, 1e-6))
 
-            small = fi.loaded_base_small
-            rgb_scale = self._photographic_rgb_scale(cfg)
-            adjusted = (small * rgb_scale[None, None, :]
-                        * float(cfg.base_intensity)).astype(np.float32)
+            # Source tab shows the input as loaded — no bias applied. The
+            # bias affects the chart-calibrated base dome inside the
+            # pipeline (see hdri_cal §4b), not the raw input the user is
+            # drawing the chart rectangle on.
+            adjusted = fi.loaded_base_small
 
             # Push directly into the PreviewPanel's in-memory caches —
             # bypasses the PNG + .f16.npy + .f16.json round-trip.
@@ -2427,9 +2443,9 @@ class MainWindow(QMainWindow):
                     input_colorspace=input_cs)
                 fi.loaded_base = np.clip(img_load, 0.0, None).astype(np.float32)
                 fi.loaded_colorspace = input_cs
+            # Source preview reflects the raw input — no bias preview.
             base_img = fi.loaded_base
-            rgb_scale = self._photographic_rgb_scale(cfg)
-            img = base_img * rgb_scale[None, None, :] * float(cfg.base_intensity)
+            img = base_img
             h, w = img.shape[:2]
             max_w = 1400
             if w > max_w:
